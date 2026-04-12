@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-4"><i class="bi bi-speedometer2"></i> Dashboard</h4>
+
+    <!-- Connection Info -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-4">
+            <div class="card stat-card">
+                <div class="card-body">
+                    <div class="text-muted" style="font-size:0.75rem;">SMC SERVER</div>
+                    <div class="fw-bold">{{ cfg.smc_url }}</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card stat-card">
+                <div class="card-body">
+                    <div class="text-muted" style="font-size:0.75rem;">ADMIN DOMAIN</div>
+                    <div class="fw-bold">{{ cfg.domain or 'Shared Domain' }}</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-4">
+            <div class="card stat-card">
+                <div class="card-body">
+                    <div class="text-muted" style="font-size:0.75rem;">SSL / TIMEOUT</div>
+                    <div class="fw-bold">
+                        SSL: {{ 'Verified' if cfg.verify_ssl else 'Unverified' }}
+                        &middot; {{ cfg.timeout }}s
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Quick Access Grid -->
+    <h5 class="mb-3">Browse SMC Objects</h5>
+    <div class="row g-3">
+        {% set icons = {
+            'zones': 'layers',
+            'hosts': 'pc-display',
+            'networks': 'diagram-3',
+            'address_ranges': 'arrows-angle-expand',
+            'domain_names': 'globe',
+            'groups': 'collection',
+            'tcp_services': 'plug',
+            'udp_services': 'plug',
+            'ip_services': 'plug',
+            'icmp_services': 'plug',
+            'service_groups': 'folder',
+            'fw_policies': 'file-earmark-ruled',
+            'l3_firewalls': 'bricks'
+        } %}
+        {% for key, info in element_types.items() %}
+        <div class="col-sm-6 col-md-4 col-lg-3">
+            <a href="/browse/{{ key }}" class="card text-decoration-none h-100">
+                <div class="card-body text-center">
+                    <i class="bi bi-{{ icons.get(key, 'box') }} fs-2 text-primary"></i>
+                    <div class="mt-2 fw-semibold">{{ info.label }}</div>
+                </div>
+            </a>
+        </div>
+        {% endfor %}
+
+        <!-- Special cards -->
+        <div class="col-sm-6 col-md-4 col-lg-3">
+            <a href="/policies" class="card text-decoration-none h-100 border-info">
+                <div class="card-body text-center">
+                    <i class="bi bi-shield-check fs-2 text-info"></i>
+                    <div class="mt-2 fw-semibold">Policy Viewer</div>
+                    <div class="text-muted" style="font-size:0.75rem;">View rules by policy</div>
+                </div>
+            </a>
+        </div>
+        <div class="col-sm-6 col-md-4 col-lg-3">
+            <a href="/sandbox" class="card text-decoration-none h-100 border-warning">
+                <div class="card-body text-center">
+                    <i class="bi bi-box fs-2 text-warning"></i>
+                    <div class="mt-2 fw-semibold">Sandbox Mode</div>
+                    <div class="text-muted" style="font-size:0.75rem;">Validate before applying</div>
+                </div>
+            </a>
+        </div>
+    </div>
+</div>
+{% endblock %}

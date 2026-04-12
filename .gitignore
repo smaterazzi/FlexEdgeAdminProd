@@ -1,0 +1,40 @@
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Secrets and local configuration (never commit these)
+config.ini
+tenants.json
+users.json
+smc_config.yml
+.env
+*.db
+encryption.key
+
+# Runtime data
+data/
+projects/
+*.log
+conf-files/

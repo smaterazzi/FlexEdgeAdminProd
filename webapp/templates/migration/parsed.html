@@ -1,0 +1,407 @@
+{% extends "base.html" %}
+{% block title %}Parsed: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex align-items-center justify-content-between">
+    <div>
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+                <li class="breadcrumb-item active">{{ project.name }}</li>
+            </ol>
+        </nav>
+        <small class="text-muted">
+            {{ project.source_file }} | Hostname: {{ project.source_hostname or 'unknown' }}
+        </small>
+    </div>
+    <a href="{{ url_for('migration_target', project_id=project.id) }}" class="btn btn-primary btn-sm">
+        <i class="bi bi-arrow-right"></i> Configure Target
+    </a>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <!-- Stats cards -->
+    <div class="row g-2 mb-3">
+        {% set s = parsed.stats %}
+        {% for label, val in [('Interfaces', s.interfaces), ('Zones', s.zones), ('Addresses', s.addresses_custom), ('Addr Groups', s.address_groups), ('Services', s.services_custom), ('Svc Groups', s.service_groups), ('Policies (on)', s.policies_enabled), ('Policies (off)', s.policies_disabled), ('VIPs', s.vips), ('IP Pools', s.get('ip_pools', 0)), ('NAT Policies', s.get('nat_policies', 0)), ('VPN Tunnels', s.get('vpn_tunnels', 0))] %}
+        <div class="col-6 col-md-3 col-lg">
+            <div class="card bg-dark border-secondary stat-card">
+                <div class="card-body py-2 px-3">
+                    <div class="text-muted" style="font-size:0.7rem;">{{ label }}</div>
+                    <div class="fw-bold">{{ val }}</div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Tabs -->
+    <ul class="nav nav-tabs mb-3">
+        {% for key, label in [('policies', 'Policies'), ('addresses', 'Addresses'), ('services', 'Services'), ('zones', 'Zones & Interfaces'), ('groups', 'Groups'), ('vips', 'VIPs'), ('nat', 'NAT / IP Pools'), ('vpn', 'VPN Tunnels')] %}
+        <li class="nav-item">
+            <a class="nav-link {% if tab == key %}active{% endif %}"
+               href="{{ url_for('migration_parsed', project_id=project.id, tab=key) }}">{{ label }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+
+    <!-- Tab content -->
+    {% if tab == 'policies' %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr>
+                <th>ID</th><th>Name</th><th>Status</th><th>SrcIntf</th><th>DstIntf</th>
+                <th>SrcAddr</th><th>DstAddr</th><th>Service</th><th>Action</th><th>NAT</th><th>Label</th>
+            </tr></thead>
+            <tbody>
+            {% for p in parsed.policies %}
+            <tr class="{% if not p.enabled %}rule-disabled{% endif %}">
+                <td>{{ p.id }}</td>
+                <td>{{ p.name or '-' }}</td>
+                <td>
+                    {% if p.enabled %}
+                    <span class="badge bg-success">ON</span>
+                    {% else %}
+                    <span class="badge bg-secondary">OFF</span>
+                    {% endif %}
+                </td>
+                <td><small>{{ p.srcintf | join(', ') }}</small></td>
+                <td><small>{{ p.dstintf | join(', ') }}</small></td>
+                <td><small>{{ p.srcaddr | join(', ') | truncate(40) }}</small></td>
+                <td>
+                    {% if p.has_internet_service %}
+                    <span class="badge bg-warning text-dark">ISDB</span>
+                    {% else %}
+                    <small>{{ p.dstaddr | join(', ') | truncate(40) }}</small>
+                    {% endif %}
+                </td>
+                <td><small>{{ p.service | join(', ') | truncate(30) }}</small></td>
+                <td>
+                    {% if p.action == 'accept' %}
+                    <span class="badge bg-success">{{ p.action }}</span>
+                    {% else %}
+                    <span class="badge bg-danger">{{ p.action }}</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if p.get('has_snat') %}<span class="badge bg-info text-dark">SNAT</span>{% endif %}
+                    {% if p.get('has_dnat') %}<span class="badge bg-purple text-light" style="background-color:#9b59b6;">DNAT</span>{% endif %}
+                    {% if p.nat and not p.get('has_snat') and not p.get('has_dnat') %}<span class="badge bg-secondary">NAT</span>{% endif %}
+                </td>
+                <td><small class="text-muted">{{ p.global_label }}</small></td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'addresses' %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>Type</th><th>Value</th><th>Built-in</th><th>Comment</th></tr></thead>
+            <tbody>
+            {% for a in parsed.addresses %}
+            <tr>
+                <td>{{ a.name }}</td>
+                <td><span class="badge bg-secondary">{{ a.type }}</span></td>
+                <td>
+                    {% if a.type == 'host' %}{{ a.ip }}
+                    {% elif a.type == 'subnet' %}{{ a.subnet }}/{{ a.cidr }}
+                    {% elif a.type == 'iprange' %}{{ a.start_ip }} - {{ a.end_ip }}
+                    {% elif a.type == 'fqdn' %}{{ a.fqdn }}
+                    {% elif a.type == 'interface-subnet' %}{{ a.get('subnet', '') }}/{{ a.get('cidr', '') }} ({{ a.get('interface', '') }})
+                    {% else %}-{% endif %}
+                </td>
+                <td>{% if a.builtin %}<span class="badge bg-warning text-dark">built-in</span>{% endif %}</td>
+                <td><small class="text-muted">{{ a.comment }}</small></td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'services' %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>Protocol</th><th>Ports</th><th>Built-in</th><th>Category</th></tr></thead>
+            <tbody>
+            {% for s in parsed.services %}
+            <tr>
+                <td>{{ s.name }}</td>
+                <td><span class="badge bg-info text-dark">{{ s.protocol }}</span></td>
+                <td>
+                    {% if s.tcp_ports is defined %}
+                    {% for p in s.tcp_ports %}TCP:{{ p[0] }}{% if p[1] != p[0] %}-{{ p[1] }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+                    {% endif %}
+                    {% if s.udp_ports is defined %}
+                    {% for p in s.udp_ports %} UDP:{{ p[0] }}{% if p[1] != p[0] %}-{{ p[1] }}{% endif %}{% if not loop.last %}, {% endif %}{% endfor %}
+                    {% endif %}
+                    {% if s.protocol == 'IP' %}Proto#{{ s.get('protocol_number', 0) }}{% endif %}
+                </td>
+                <td>{% if s.builtin %}<span class="badge bg-warning text-dark">built-in</span>{% endif %}</td>
+                <td><small class="text-muted">{{ s.category }}</small></td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'zones' %}
+    <h6>Security Zones</h6>
+    <div class="table-responsive mb-4">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Zone Name</th><th>Interfaces</th><th>Intrazone</th></tr></thead>
+            <tbody>
+            {% for z in parsed.zones %}
+            <tr>
+                <td>{{ z.name }}</td>
+                <td>{{ z.interfaces | join(', ') }}</td>
+                <td>{{ z.intrazone }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <h6>Interfaces</h6>
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>IP</th><th>Mask</th><th>Type</th><th>Role</th><th>VDOM</th></tr></thead>
+            <tbody>
+            {% for i in parsed.interfaces %}
+            <tr>
+                <td>{{ i.name }}</td>
+                <td>{{ i.get('ip', '-') }}</td>
+                <td>{{ i.get('mask', '-') }}</td>
+                <td>{{ i.type }}</td>
+                <td>{{ i.role }}</td>
+                <td>{{ i.vdom }}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'groups' %}
+    <h6>Address Groups</h6>
+    <div class="table-responsive mb-4">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>Members</th></tr></thead>
+            <tbody>
+            {% for g in parsed.address_groups %}
+            <tr>
+                <td>{{ g.name }}</td>
+                <td>
+                    {% for m in g.members %}
+                    <span class="badge bg-secondary">{{ m }}</span>
+                    {% endfor %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    <h6>Service Groups</h6>
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>Members</th><th>Built-in</th></tr></thead>
+            <tbody>
+            {% for g in parsed.service_groups %}
+            <tr>
+                <td>{{ g.name }}</td>
+                <td>
+                    {% for m in g.members %}
+                    <span class="badge bg-secondary">{{ m }}</span>
+                    {% endfor %}
+                </td>
+                <td>{% if g.builtin %}<span class="badge bg-warning text-dark">built-in</span>{% endif %}</td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'vips' %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>External IP</th><th>Mapped IP</th><th>Interface</th><th>Port Forward</th></tr></thead>
+            <tbody>
+            {% for v in parsed.vips %}
+            <tr>
+                <td>{{ v.name }}</td>
+                <td>{{ v.extip }}</td>
+                <td>{{ v.mappedip }}</td>
+                <td>{{ v.extintf }}</td>
+                <td>
+                    {% if v.portforward %}
+                    {{ v.get('extport', '') }} &rarr; {{ v.get('mappedport', '') }}
+                    {% else %}-{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% elif tab == 'nat' %}
+    <h6>IP Pools (SNAT)</h6>
+    <div class="table-responsive mb-4">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>Type</th><th>Start IP</th><th>End IP</th><th>Comment</th></tr></thead>
+            <tbody>
+            {% for p in parsed.get('ip_pools', []) %}
+            <tr>
+                <td>{{ p.name }}</td>
+                <td><span class="badge bg-info text-dark">{{ p.type }}</span></td>
+                <td>{{ p.startip }}</td>
+                <td>{{ p.endip }}</td>
+                <td><small class="text-muted">{{ p.comment }}</small></td>
+            </tr>
+            {% endfor %}
+            {% if not parsed.get('ip_pools') %}
+            <tr><td colspan="5" class="text-muted text-center">No IP pools found</td></tr>
+            {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <h6>VIPs (DNAT)</h6>
+    <div class="table-responsive mb-4">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>Name</th><th>External IP</th><th>Mapped IP</th><th>Interface</th><th>Port Forward</th></tr></thead>
+            <tbody>
+            {% for v in parsed.vips %}
+            <tr>
+                <td>{{ v.name }}</td>
+                <td>{{ v.extip }}</td>
+                <td>{{ v.mappedip }}</td>
+                <td>{{ v.extintf }}</td>
+                <td>
+                    {% if v.portforward %}
+                    {{ v.get('extport', '') }} &rarr; {{ v.get('mappedport', '') }}
+                    {% else %}-{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not parsed.vips %}
+            <tr><td colspan="5" class="text-muted text-center">No VIPs found</td></tr>
+            {% endif %}
+            </tbody>
+        </table>
+    </div>
+
+    <h6>NAT Policies</h6>
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Source</th><th>Destination</th><th>Service</th><th>Pool / VIP</th></tr></thead>
+            <tbody>
+            {% for p in parsed.policies if p.nat or p.get('has_dnat') %}
+            <tr class="{% if not p.enabled %}rule-disabled{% endif %}">
+                <td>{{ p.id }}</td>
+                <td>{{ p.name or '-' }}</td>
+                <td>
+                    {% if p.get('has_snat') %}<span class="badge bg-info text-dark">SNAT</span>{% endif %}
+                    {% if p.get('has_dnat') %}<span class="badge bg-purple text-light" style="background-color:#9b59b6;">DNAT</span>{% endif %}
+                    {% if p.nat and not p.get('has_snat') and not p.get('has_dnat') %}<span class="badge bg-secondary">NAT</span>{% endif %}
+                </td>
+                <td><small>{{ p.srcaddr | join(', ') | truncate(30) }}</small></td>
+                <td><small>{{ p.dstaddr | join(', ') | truncate(30) }}</small></td>
+                <td><small>{{ p.service | join(', ') | truncate(20) }}</small></td>
+                <td>
+                    {% if p.get('has_snat') %}<small class="text-info">Pool: {{ p.poolname }}</small>{% endif %}
+                    {% if p.get('has_dnat') %}
+                    {% for v in p.get('vip_refs', []) %}
+                    <small class="text-warning">{{ v.extip }} &rarr; {{ v.mappedip }}</small>
+                    {% endfor %}
+                    {% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% elif tab == 'vpn' %}
+    {% if parsed.vpn_tunnels %}
+    <h6 class="mb-3">IPsec VPN Tunnels ({{ parsed.vpn_tunnels | length }})</h6>
+    {% for tunnel in parsed.vpn_tunnels %}
+    <div class="card bg-dark border-secondary mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <strong>{{ tunnel.name }}</strong>
+            <span class="badge bg-primary">{{ tunnel.phase2_count }} Phase 2 SAs</span>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-md-6">
+                    <h6 class="text-info">Phase 1 (IKE)</h6>
+                    <table class="table table-sm table-dark mb-0">
+                        <tr><td class="text-muted" style="width:40%">Remote Gateway</td><td><code>{{ tunnel.remote_gw }}</code></td></tr>
+                        <tr><td class="text-muted">Local Gateway</td><td><code>{{ tunnel.local_gw }}</code></td></tr>
+                        <tr><td class="text-muted">Encryption</td><td>{{ tunnel.p1_proposal }}</td></tr>
+                        <tr><td class="text-muted">DH Group</td><td>{{ tunnel.p1_dhgrp }}</td></tr>
+                        <tr><td class="text-muted">Keylife</td><td>{{ tunnel.p1_keylife }}s</td></tr>
+                        <tr><td class="text-muted">IKE Version</td><td>v{{ tunnel.ike_version }}</td></tr>
+                        <tr><td class="text-muted">Auth</td><td>{% if tunnel.psk_auth %}Pre-Shared Key{% else %}Certificate{% endif %}</td></tr>
+                        <tr><td class="text-muted">DPD</td><td>{{ tunnel.dpd }}</td></tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <h6 class="text-warning">Phase 2 (IPsec)</h6>
+                    <table class="table table-sm table-dark mb-2">
+                        <tr><td class="text-muted" style="width:40%">Encryption</td><td>{{ tunnel.p2_proposal }}</td></tr>
+                        <tr><td class="text-muted">PFS</td><td>{{ tunnel.p2_pfs }} (DH{{ tunnel.p2_dhgrp or tunnel.p1_dhgrp }})</td></tr>
+                        <tr><td class="text-muted">Keylife</td><td>{{ tunnel.p2_keylife }}s</td></tr>
+                    </table>
+                    <h6 class="text-success mt-2">Local Subnets</h6>
+                    <div class="mb-2">
+                        {% for s in tunnel.local_subnets %}
+                        <span class="badge bg-success me-1 mb-1">{{ s }}</span>
+                        {% endfor %}
+                    </div>
+                    <h6 class="text-danger">Remote Subnets</h6>
+                    <div>
+                        {% for s in tunnel.remote_subnets %}
+                        <span class="badge bg-danger me-1 mb-1">{{ s }}</span>
+                        {% endfor %}
+                    </div>
+                </div>
+            </div>
+            {% if tunnel.phase2_entries %}
+            <details class="mt-3">
+                <summary class="text-muted">Phase 2 SA Details ({{ tunnel.phase2_entries | length }})</summary>
+                <table class="table table-sm table-dark mt-2">
+                    <thead><tr><th>Name</th><th>Source</th><th>Destination</th><th>Auto-negotiate</th></tr></thead>
+                    <tbody>
+                    {% for p2 in tunnel.phase2_entries %}
+                    <tr>
+                        <td>{{ p2.name }}</td>
+                        <td><code>{{ p2.src_subnet }}</code></td>
+                        <td><code>{{ p2.dst_subnet }}</code></td>
+                        <td>{% if p2.auto_negotiate %}<span class="badge bg-success">Yes</span>{% else %}<span class="badge bg-secondary">No</span>{% endif %}</td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </details>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+    {% else %}
+    <div class="alert alert-secondary">No IPsec VPN tunnels found in this configuration.</div>
+    {% endif %}
+
+    {% endif %}
+</div>
+{% endblock %}

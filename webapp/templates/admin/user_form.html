@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if user else 'New' }} User{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.users') }}">Users</a></li>
+            <li class="breadcrumb-item active">{{ 'Edit' if user else 'New' }}</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-7">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }} mb-3">{{ message }}</div>
+            {% endfor %}
+            {% endwith %}
+
+            <div class="card bg-dark border-secondary">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="bi bi-person"></i>
+                        {{ 'Edit User' if user else 'Add User' }}
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label for="email" class="form-label">Email</label>
+                            <input type="email" class="form-control bg-dark border-secondary text-light"
+                                   id="email" name="email" required
+                                   value="{{ user.email if user else '' }}"
+                                   placeholder="user@company.com">
+                            <div class="form-text">Must match the Azure AD email for login to work.</div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="display_name" class="form-label">Display Name</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="display_name" name="display_name"
+                                   value="{{ user.display_name if user else '' }}"
+                                   placeholder="Alice Smith">
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="role" class="form-label">Role</label>
+                            <select class="form-select bg-dark border-secondary text-light" id="role" name="role">
+                                <option value="viewer" {% if not user or user.role == 'viewer' %}selected{% endif %}>Viewer</option>
+                                <option value="admin" {% if user and user.role == 'admin' %}selected{% endif %}>Admin</option>
+                            </select>
+                        </div>
+
+                        <div class="form-check mb-4">
+                            <input class="form-check-input" type="checkbox" id="is_active" name="is_active"
+                                   {% if not user or user.is_active %}checked{% endif %}>
+                            <label class="form-check-label" for="is_active">Active</label>
+                        </div>
+
+                        {% if tenants %}
+                        <h6 class="border-bottom border-secondary pb-2 mb-3">
+                            <i class="bi bi-link-45deg"></i> Tenant Access
+                        </h6>
+                        <p class="text-muted mb-3" style="font-size:0.8rem;">
+                            Assign this user to tenants with a specific API key.
+                        </p>
+
+                        {% set current_accesses = {} %}
+                        {% if user %}
+                            {% for a in user.tenant_accesses %}
+                                {% if current_accesses.update({a.tenant_id: a.api_key_id}) %}{% endif %}
+                            {% endfor %}
+                        {% endif %}
+
+                        {% for t in tenants %}
+                        <div class="card bg-dark border-secondary mb-2">
+                            <div class="card-body py-2 px-3">
+                                <div class="d-flex align-items-center gap-2">
+                                    <strong style="min-width:150px;">{{ t.name }}</strong>
+                                    <select class="form-select form-select-sm bg-dark border-secondary text-light"
+                                            name="access_{{ t.id }}" style="max-width:300px;">
+                                        <option value="">— No access —</option>
+                                        {% for k in api_keys if k.tenant_id == t.id %}
+                                        <option value="{{ k.id }}"
+                                                {% if current_accesses.get(t.id) == k.id %}selected{% endif %}>
+                                            {{ k.name }}
+                                        </option>
+                                        {% endfor %}
+                                    </select>
+                                </div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                        {% else %}
+                        <div class="alert alert-info" style="font-size:0.85rem;">
+                            <i class="bi bi-info-circle me-1"></i>
+                            Create tenants and API keys first, then assign them to users.
+                        </div>
+                        {% endif %}
+
+                        <div class="d-flex gap-2 mt-4">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-circle me-1"></i>{{ 'Save' if user else 'Create' }}
+                            </button>
+                            <a href="{{ url_for('admin.users') }}" class="btn btn-outline-secondary">Cancel</a>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

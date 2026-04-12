@@ -1,0 +1,141 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+
+## [2.0.0] - 2026-04-12
+
+### Added
+
+- **Azure setup automation** (`scripts/azure-setup.sh`) — single command to:
+  - Create Entra ID App Registration with OIDC configuration
+  - Enable ID tokens, set redirect URIs (dev + production)
+  - Create client secret (2-year expiry)
+  - Add Microsoft Graph permissions (openid, email, profile)
+  - Grant admin consent
+  - Generate Flask secret key
+  - Write complete `.env` file
+  - Flags: `--domain`, `--app-name`, `--skip-consent`
+  - Integrated into `deploy.sh` (offers to run automatically)
+- **Admin Portal** (`/admin/`) — web-based CRUD for tenants, users, and API keys
+  - Tenant management: create, edit, soft-delete SMC server connections
+  - User management: create, edit, role assignment (admin/viewer), tenant access mapping
+  - API Key management: Fernet-encrypted storage, one-time plaintext display on creation, revoke
+  - Backup: download ZIP of database + encryption key from Admin Portal
+  - JSON Migration: one-click import from legacy `tenants.json` + `users.json`
+  - Admin dashboard with stats, backup, and migration controls
+- **Encrypted database** — SQLite with Fernet field-level encryption (AES-128-CBC + HMAC-SHA256)
+  - Binary encryption key file (`FXEK` magic header format) auto-generated on first run
+  - Without the key file, encrypted API keys are permanently irrecoverable (by design)
+  - SQLite WAL mode enabled for concurrent read performance
+  - Database schema: `tenants`, `users`, `api_keys`, `user_tenant_access` tables
+- **Setup wizard** — one-time `/setup` page on first run
+  - Requires Azure AD login first (security: only valid Azure AD users can claim admin)
+  - Creates the first admin user, then becomes permanently inaccessible
+- **DB-backed data layer** — user profiles and tenant config read from DB with JSON fallback
+  - `webapp/user_manager.py` queries DB first, falls back to `users.json`
+  - `shared/tenant_config.py` queries DB first, falls back to `tenants.json`
+  - CLI tools automatically use JSON fallback (no Flask context needed)
+- **New files**: `webapp/admin.py`, `webapp/setup.py`, `webapp/models.py`, `webapp/db_init.py`,
+  `shared/encryption.py`, `shared/db.py`, 10 admin templates
+
+### Changed
+
+- **Configuration model** — JSON files replaced by Admin Portal as primary config method
+  - `.env` is the only file to edit before first start (Azure AD credentials)
+  - Tenants, users, and API keys managed via web UI instead of JSON files
+- **Docker volumes** — `config/` directory mounted as a whole (contains DB + key + legacy JSONs)
+- **deploy.sh** — no longer creates `tenants.json` / `users.json`; points users to setup wizard
+- **requirements.txt** — added `flask-sqlalchemy>=3.1`, `cryptography>=42.0`
+- **`.gitignore`** — added `*.db`, `encryption.key`
+- **Sidebar** — admin link visible only to admin-role users
+- **`scripts/pack-release.sh`** — production release packer
+  - Builds a clean `./production/` folder with zero client-specific data
+  - Sanitizes firewall names, IP ranges, server URLs, client references
+  - Automated verification scan — aborts on any leaked secrets
+  - `--no-push` flag to skip pushing (default: commit and push)
+  - `--message "msg"` for custom commit messages
+  - Preserves `production/.git` across rebuilds (remote config, history retained)
+
+### Security
+
+- Removed `__pycache__/connect.cpython-314.pyc` from git tracking
+- Sanitized `scripts/service_mapping.json` (replaced real SMC URL with placeholder)
+- Sanitized `config/smc_config.yml.example` (removed client name)
+- `production/` folder gitignored — clean public release with no git history leak
+
+---
+
+## [1.0.0] - 2026-04-12
+
+### Added
+
+- **FlexEdgeAdmin branding** — unified project identity replacing "SMC Explorer"
+- **Shared tenant configuration** (`shared/tenant_config.py`) — single source of truth
+  for SMC connection definitions, used by both CLI and webapp
+  - `config/tenants.json` defines URL, SSL, timeout, domain per tenant
+  - API keys remain per-user (in `users.json` for web, env var for CLI)
+- **Unified Docker setup** — single image containing webapp + CLI + migration scripts
+  - `docker/Dockerfile` — python:3.12-slim with gunicorn
+  - `docker/docker-compose.yml` — development compose
+  - `docker/docker-compose.prod.yml` — production overlay with nginx + certbot TLS
+  - `docker/nginx.conf` — reverse proxy with security headers
+- **Deployment automation**
+  - `deploy.sh` — one-command VPS setup (installs Docker, creates configs, starts services)
+  - `Makefile` — convenience targets (dev, prod, stop, logs, cli, update)
+  - `docs/deployment-guide.md` — complete operator guide
+- **Configuration templates** — `.example` files for all secrets
+  - `config/tenants.json.example`, `config/users.json.example`
+  - `config/.env.example`, `config/config.ini.example`
+- **APP_TITLE env var** — customizable branding per deployment
+
+### Changed
+
+- **Repository restructured** into `cli/`, `webapp/`, `shared/`, `scripts/`, `config/`, `docker/`, `docs/`
+- **CLI connect.py** — now supports `--tenant` flag + `SMC_API_KEY` env var; falls back to legacy `config.ini`
+- **CLI smc.sh** — passes `--tenant` flag, sets PYTHONPATH, venv at project root
+- **webapp/user_manager.py** — resolves tenant references from `tenants.json`; backward compatible with old embedded `smc_url` format
+- **users.json format** — profiles now reference tenants by ID instead of embedding full connection details
+- Unified `requirements.txt` at project root (merged CLI + webapp deps)
+
+### Security
+
+- Removed `config.ini` from git tracking (contained real API key)
+- All secret files added to `.gitignore`: `config.ini`, `tenants.json`, `users.json`, `.env`, `smc_config.yml`
+- Docker never bakes secrets into images — always volume-mounted
+
+---
+
+## [0.3.0] - 2026-04-11
+
+### Added
+
+- **Microsoft Entra ID OIDC login** — all webapp routes protected
+- **Multi-user support** — per-user SMC API profiles via `users.json`
+- **SMC admin domain selection** per session
+- **ProxyFix** for correct HTTPS redirect URIs behind reverse proxies
+
+---
+
+## [0.2.0] - 2026-03-11
+
+### Added
+
+- **SMC Explorer webapp** — read-only browser for all SMC objects and policies
+- **Migration Manager** — 7-step guided FortiGate-to-Forcepoint migration workflow
+- **NAT rules migration** — SNAT dynamic, DNAT static, combined
+- **IPsec VPN migration** — profiles, gateways, sites, PolicyVPN
+- **Docker deployment** — Dockerfile, docker-compose.yml
+
+---
+
+## [0.1.0] - 2026-01-20
+
+### Added
+
+- Initial CLI tools: `connect.py`, `inquiry.py`, `firewall.py`, `smc.sh`
+- Firewall management: list, show, interfaces, add/delete/update interface, VLAN, policy refresh/upload
+- Object query and inspection with type/name filtering
+- Cluster support: CVI, NDI, multi-node configuration
+- Documentation: guides for each CLI module

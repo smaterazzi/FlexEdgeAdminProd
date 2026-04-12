@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}Sandbox — {{ policy_name }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-4"><i class="bi bi-box text-warning"></i> Sandbox — Dry-Run Validation</h4>
+
+    <!-- Policy selector -->
+    <form class="d-flex gap-2 mb-4" method="get" action="/sandbox">
+        <input type="text" name="policy" class="form-control form-control-sm"
+               value="{{ policy_name }}" placeholder="Policy name..." style="width:350px;">
+        <button type="submit" class="btn btn-sm btn-warning">
+            <i class="bi bi-play-fill"></i> Validate
+        </button>
+    </form>
+
+    {% if error %}
+    <div class="alert alert-danger">
+        <i class="bi bi-exclamation-triangle"></i> <strong>Connection error:</strong> {{ error }}
+    </div>
+    {% elif report %}
+
+    <!-- Summary Cards -->
+    <div class="row g-3 mb-4">
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body text-center">
+                    <div class="fs-2 fw-bold text-primary">{{ report.total_rules }}</div>
+                    <div class="text-muted" style="font-size:0.8rem;">Access Rules</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body text-center">
+                    <div class="fs-2 fw-bold text-info">{{ report.total_sections }}</div>
+                    <div class="text-muted" style="font-size:0.8rem;">Rule Sections</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body text-center">
+                    <div class="fs-2 fw-bold text-secondary">{{ report.disabled_rules }}</div>
+                    <div class="text-muted" style="font-size:0.8rem;">Disabled Rules</div>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body text-center">
+                    <div class="fs-2 fw-bold {% if report.unnamed_rules > 0 %}text-danger{% else %}text-success{% endif %}">
+                        {{ report.unnamed_rules }}
+                    </div>
+                    <div class="text-muted" style="font-size:0.8rem;">Unnamed Rules</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Sections List -->
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-bookmark"></i> Rule Sections ({{ report.total_sections }})</div>
+        <div class="card-body">
+            {% if report.sections %}
+            <ol class="mb-0">
+                {% for s in report.sections %}
+                <li>{{ s }}</li>
+                {% endfor %}
+            </ol>
+            {% else %}
+            <span class="text-muted">No sections found.</span>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Disabled Rules -->
+    {% if report.disabled_list %}
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-pause-circle"></i> Disabled Rules ({{ report.disabled_rules }})</div>
+        <div class="card-body">
+            <ul class="mb-0">
+                {% for r in report.disabled_list %}
+                <li>{{ r }}</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Validation Checks -->
+    <div class="card mb-4">
+        <div class="card-header"><i class="bi bi-check2-circle"></i> Validation Checks</div>
+        <div class="card-body">
+            <table class="table table-sm mb-0">
+                <tbody>
+                    <tr>
+                        <td style="width:40px;">
+                            {% if report.total_sections >= 10 %}
+                            <i class="bi bi-check-circle-fill text-success"></i>
+                            {% else %}
+                            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+                            {% endif %}
+                        </td>
+                        <td>Expected ~16 sections, found {{ report.total_sections }}</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            {% if report.total_rules >= 50 %}
+                            <i class="bi bi-check-circle-fill text-success"></i>
+                            {% else %}
+                            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+                            {% endif %}
+                        </td>
+                        <td>Expected ~90+ rules, found {{ report.total_rules }}</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            {% if report.unnamed_rules == 0 %}
+                            <i class="bi bi-check-circle-fill text-success"></i>
+                            {% else %}
+                            <i class="bi bi-x-circle-fill text-danger"></i>
+                            {% endif %}
+                        </td>
+                        <td>All rules should be named ({{ report.unnamed_rules }} unnamed)</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            {% if report.disabled_rules <= 20 %}
+                            <i class="bi bi-check-circle-fill text-success"></i>
+                            {% else %}
+                            <i class="bi bi-exclamation-triangle-fill text-warning"></i>
+                            {% endif %}
+                        </td>
+                        <td>Disabled rules count ({{ report.disabled_rules }}) within expected range (13-20)</td>
+                    </tr>
+                    <tr>
+                        <td>
+                            {% if report.unresolved_refs|length == 0 %}
+                            <i class="bi bi-check-circle-fill text-success"></i>
+                            {% else %}
+                            <i class="bi bi-x-circle-fill text-danger"></i>
+                            {% endif %}
+                        </td>
+                        <td>Unresolved element references: {{ report.unresolved_refs|length }}</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <!-- Unresolved References -->
+    {% if report.unresolved_refs %}
+    <div class="card mb-4">
+        <div class="card-header text-danger"><i class="bi bi-exclamation-diamond"></i> Unresolved References</div>
+        <div class="card-body p-0">
+            <table class="table table-sm mb-0">
+                <thead><tr><th>Rule</th><th>Field</th><th>Value</th></tr></thead>
+                <tbody>
+                    {% for ref in report.unresolved_refs %}
+                    <tr>
+                        <td>{{ ref.rule }}</td>
+                        <td><span class="badge bg-secondary">{{ ref.field }}</span></td>
+                        <td><code>{{ ref.value }}</code></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Full Rules Table -->
+    <div class="card">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <span><i class="bi bi-table"></i> All Rules</span>
+            <a href="/policy/{{ policy_name }}" class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-eye"></i> Full Policy View
+            </a>
+        </div>
+        <div class="card-body p-0">
+            <div class="table-responsive">
+                <table class="table table-sm table-hover align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width:40px;">#</th>
+                            <th>Name</th>
+                            <th>Action</th>
+                            <th>Disabled</th>
+                            <th>Comment</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% set n = namespace(val=0) %}
+                        {% for r in report.rules %}
+                        {% set n.val = n.val + 1 %}
+                        <tr class="{% if r.is_disabled %}rule-disabled{% endif %}">
+                            <td class="text-muted">{{ n.val }}</td>
+                            <td>{{ r.name }}</td>
+                            <td>
+                                {% if r.action and 'allow' in r.action|lower %}
+                                <span class="badge bg-success">Allow</span>
+                                {% elif r.action and ('discard' in r.action|lower or 'deny' in r.action|lower or 'refuse' in r.action|lower) %}
+                                <span class="badge bg-danger">{{ r.action }}</span>
+                                {% else %}
+                                <span class="badge bg-secondary">{{ r.action }}</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                {% if r.is_disabled %}
+                                <i class="bi bi-pause-circle text-secondary"></i>
+                                {% endif %}
+                            </td>
+                            <td class="text-muted" style="font-size:0.75rem;">{{ r.comment }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    {% else %}
+    <div class="alert alert-info">
+        Enter a policy name and click <strong>Validate</strong> to run the sandbox check.
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

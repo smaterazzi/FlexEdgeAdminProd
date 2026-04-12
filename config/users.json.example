@@ -1,0 +1,41 @@
+{
+  "_comment": "Copy this file to users.json and fill in real values. DO NOT commit users.json to git. Profiles reference tenants defined in tenants.json by their tenant ID.",
+
+  "alice@yourcompany.com": {
+    "role": "admin",
+    "profiles": [
+      {
+        "name": "Production SMC",
+        "tenant": "prod",
+        "api_key": "REPLACE_WITH_ADMIN_API_KEY"
+      }
+    ]
+  },
+
+  "bob@yourcompany.com": {
+    "role": "viewer",
+    "profiles": [
+      {
+        "name": "Production SMC (read-only)",
+        "tenant": "prod",
+        "api_key": "REPLACE_WITH_READONLY_API_KEY"
+      }
+    ]
+  },
+
+  "charlie@yourcompany.com": {
+    "role": "admin",
+    "profiles": [
+      {
+        "name": "Production SMC",
+        "tenant": "prod",
+        "api_key": "REPLACE_WITH_API_KEY"
+      },
+      {
+        "name": "Lab SMC",
+        "tenant": "lab",
+        "api_key": "REPLACE_WITH_LAB_API_KEY"
+      }
+    ]
+  }
+}

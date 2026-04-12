@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}New API Key{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.api_keys') }}">API Keys</a></li>
+            <li class="breadcrumb-item active">New</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }} mb-3">{{ message }}</div>
+            {% endfor %}
+            {% endwith %}
+
+            <div class="card bg-dark border-secondary">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="bi bi-key"></i> Add API Key</h5>
+                </div>
+                <div class="card-body">
+                    <div class="alert alert-info mb-3" style="font-size:0.85rem;">
+                        <i class="bi bi-info-circle me-1"></i>
+                        Paste the API key from your SMC Management Client
+                        (Administration &rarr; Access Rights &rarr; API Clients).
+                        The key will be encrypted and stored securely.
+                    </div>
+
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label for="name" class="form-label">Key Name</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="name" name="name" required
+                                   placeholder="e.g., Production Admin Key">
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="tenant_id" class="form-label">Tenant</label>
+                            <select class="form-select bg-dark border-secondary text-light"
+                                    id="tenant_id" name="tenant_id" required>
+                                <option value="">Select a tenant...</option>
+                                {% for t in tenants %}
+                                <option value="{{ t.id }}">{{ t.name }} ({{ t.slug }})</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+
+                        <div class="mb-4">
+                            <label for="api_key" class="form-label">API Key</label>
+                            <input type="password" class="form-control bg-dark border-secondary text-light"
+                                   id="api_key" name="api_key" required
+                                   placeholder="Paste the SMC API key here">
+                            <div class="form-text">
+                                This will be encrypted before storage. You will see it one more time after creation.
+                            </div>
+                        </div>
+
+                        <div class="d-flex gap-2">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-lock me-1"></i>Create & Encrypt
+                            </button>
+                            <a href="{{ url_for('admin.api_keys') }}" class="btn btn-outline-secondary">Cancel</a>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

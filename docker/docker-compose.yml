@@ -1,0 +1,46 @@
+# FlexEdgeAdmin — Development Docker Compose
+#
+# Quick start:
+#   1. cp config/.env.example .env                         (edit with Azure AD creds)
+#   2. docker compose -f docker/docker-compose.yml up --build
+#   3. Open http://localhost:5000 → setup wizard creates first admin
+#   4. Use Admin Portal to add tenants, API keys, and users
+#
+# Legacy JSON config files (tenants.json, users.json) can be imported
+# via Admin Portal → "Import from JSON" button.
+#
+# CLI usage:
+#   docker compose -f docker/docker-compose.yml exec flexedge-web \
+#     python /app/cli/connect.py --tenant prod --api-key YOUR_KEY
+
+services:
+  flexedge-web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: flexedge-admin
+    restart: unless-stopped
+    ports:
+      - "${PORT:-5000}:5000"
+
+    volumes:
+      # Config directory: database, encryption key, and legacy JSON files
+      - ../config:/config
+      # Migration project data — bind mount for persistence
+      - ../data/projects:/app/data/projects
+      # FortiGate config files (optional — for migration reference)
+      - ../conf-files:/config/conf-files:ro
+
+    env_file:
+      - ../.env
+
+    environment:
+      - FLASK_DEBUG=${FLASK_DEBUG:-0}
+      - PORT=${PORT:-5000}
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

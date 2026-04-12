@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Connection Error{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <div class="alert alert-danger mt-4">
+        <h5><i class="bi bi-exclamation-triangle"></i> SMC Connection Error</h5>
+        <p class="mb-2">{{ message }}</p>
+        <hr>
+        <p class="mb-0" style="font-size:0.85rem;">
+            Check that the SMC server is reachable at <code>{{ cfg.smc_url if cfg else 'N/A' }}</code>
+            and the API key is valid.
+        </p>
+    </div>
+    <a href="/" class="btn btn-outline-primary"><i class="bi bi-arrow-left"></i> Back to Dashboard</a>
+</div>
+{% endblock %}

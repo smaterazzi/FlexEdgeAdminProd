@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}{{ label }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar p-3 d-flex align-items-center gap-3 flex-wrap">
+    <h5 class="mb-0"><i class="bi bi-list-ul"></i> {{ label }}</h5>
+    <span class="badge bg-primary">{{ count }} items</span>
+
+    <form class="d-flex gap-2 ms-auto" method="get" action="/browse/{{ type_key }}">
+        <input type="text" name="q" class="form-control form-control-sm"
+               placeholder="Filter by name..." value="{{ filter_text }}" style="width:200px;">
+        <div class="form-check form-switch d-flex align-items-center ms-2">
+            <input class="form-check-input" type="checkbox" name="fgt" value="1"
+                   id="fgtToggle" {% if fgt_only %}checked{% endif %}
+                   onchange="this.form.submit()">
+            <label class="form-check-label ms-1 text-nowrap" for="fgtToggle"
+                   style="font-size:0.8rem;">FGT- only</label>
+        </div>
+        <button type="submit" class="btn btn-sm btn-outline-primary">
+            <i class="bi bi-search"></i>
+        </button>
+    </form>
+</div>
+
+<div class="p-3">
+    {% if not elements %}
+    <div class="alert alert-secondary">
+        No elements found{% if filter_text %} matching "{{ filter_text }}"{% endif %}.
+    </div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+            <thead>
+                <tr>
+                    <th style="width:40px;">#</th>
+                    <th>Name</th>
+                    {% if type_key == 'hosts' %}
+                    <th>Address</th>
+                    {% elif type_key == 'networks' %}
+                    <th>Subnet</th>
+                    {% elif type_key == 'address_ranges' %}
+                    <th>Range</th>
+                    {% elif type_key in ('tcp_services', 'udp_services') %}
+                    <th>Port(s)</th>
+                    {% elif type_key == 'domain_names' %}
+                    <th>Value</th>
+                    {% endif %}
+                    <th>Comment</th>
+                    <th style="width:60px;"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for elem in elements %}
+                <tr>
+                    <td class="text-muted">{{ loop.index }}</td>
+                    <td>
+                        {% if elem.name.startswith('FGT-') %}
+                        <span class="badge badge-fgt me-1">FGT</span>
+                        {% endif %}
+                        <a href="/detail/{{ type_key }}/{{ elem.name }}" class="text-decoration-none">
+                            {{ elem.name }}
+                        </a>
+                    </td>
+                    {% if type_key == 'hosts' %}
+                    <td><code>{{ elem.address }}</code></td>
+                    {% elif type_key == 'networks' %}
+                    <td><code>{{ elem.ipv4_network }}</code></td>
+                    {% elif type_key == 'address_ranges' %}
+                    <td><code>{{ elem.ip_range }}</code></td>
+                    {% elif type_key in ('tcp_services', 'udp_services') %}
+                    <td>
+                        <code>{{ elem.min_dst_port }}{% if elem.max_dst_port and elem.max_dst_port != elem.min_dst_port %}-{{ elem.max_dst_port }}{% endif %}</code>
+                    </td>
+                    {% elif type_key == 'domain_names' %}
+                    <td><code>{{ elem.value }}</code></td>
+                    {% endif %}
+                    <td class="text-muted" style="font-size:0.8rem;">{{ elem.comment or '' }}</td>
+                    <td>
+                        <a href="/detail/{{ type_key }}/{{ elem.name }}"
+                           class="btn btn-sm btn-outline-secondary" title="View detail">
+                            <i class="bi bi-eye"></i>
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

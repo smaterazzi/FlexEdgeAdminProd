@@ -1,0 +1,324 @@
+{% extends "base.html" %}
+{% block title %}Rules: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex align-items-center justify-content-between">
+    <div>
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+                <li class="breadcrumb-item"><a href="{{ url_for('migration_parsed', project_id=project.id) }}">{{ project.name }}</a></li>
+                <li class="breadcrumb-item active">Rules</li>
+            </ol>
+        </nav>
+        <small class="text-muted">
+            {{ converted.stats.total_rules }} rules in {{ converted.stats.total_sections }} sections |
+            {{ converted.stats.total_disabled }} disabled |
+            {{ converted.stats.total_warnings }} warnings |
+            {{ converted.stats.get('total_nat_rules', 0) }} NAT rules
+        </small>
+    </div>
+    <div class="d-flex gap-2">
+        <button class="btn btn-outline-success btn-sm" onclick="selectAll(true)">
+            <i class="bi bi-check-all"></i> Select All
+        </button>
+        <button class="btn btn-outline-secondary btn-sm" onclick="selectAll(false)">
+            <i class="bi bi-x-lg"></i> Deselect All
+        </button>
+        <button class="btn btn-primary btn-sm" onclick="saveSelections()">
+            <i class="bi bi-save"></i> Save Selections
+        </button>
+        <a href="{{ url_for('migration_import', project_id=project.id) }}"
+           class="btn btn-success btn-sm">
+            <i class="bi bi-arrow-right"></i> Import
+        </a>
+    </div>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead>
+                <tr>
+                    <th style="width:40px;"><input type="checkbox" id="selectAllCb" checked onchange="selectAll(this.checked)"></th>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Sources</th>
+                    <th>Destinations</th>
+                    <th>Services</th>
+                    <th>Action</th>
+                    <th>Warnings</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for section in converted.sections %}
+            <!-- Section header -->
+            <tr class="rule-section-row">
+                <td colspan="8">
+                    <i class="bi bi-folder"></i> {{ section.name }}
+                    <span class="badge bg-secondary ms-2">{{ section.rules | length }} rules</span>
+                </td>
+            </tr>
+            {% for rule in section.rules %}
+            <tr class="{% if rule.is_disabled %}rule-disabled{% endif %}">
+                <td>
+                    <input type="checkbox" class="rule-cb" data-fgt-id="{{ rule.fgt_id }}"
+                           {% if rule.selected %}checked{% endif %}>
+                </td>
+                <td>{{ rule.fgt_id }}</td>
+                <td>
+                    {{ rule.name }}
+                    {% if rule.is_disabled %}<span class="badge bg-secondary ms-1">DISABLED</span>{% endif %}
+                    {% if rule.has_internet_service %}<span class="badge bg-warning text-dark ms-1">ISDB</span>{% endif %}
+                </td>
+                <td>
+                    {% for s in rule.sources %}
+                    <span class="badge bg-dark border border-secondary">{{ s }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% for d in rule.destinations %}
+                    <span class="badge bg-dark border border-secondary">{{ d }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% for s in rule.services %}
+                    <span class="badge bg-dark border border-secondary">{{ s }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% if rule.action == 'allow' %}
+                    <span class="badge bg-success">allow</span>
+                    {% elif rule.action == 'discard' %}
+                    <span class="badge bg-danger">discard</span>
+                    {% elif rule.action == 'refuse' %}
+                    <span class="badge bg-danger">refuse</span>
+                    {% else %}
+                    <span class="badge bg-secondary">{{ rule.action }}</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% for w in rule.warnings %}
+                    <span class="badge bg-warning text-dark" title="{{ w }}">
+                        <i class="bi bi-exclamation-triangle"></i>
+                    </span>
+                    {% endfor %}
+                </td>
+            </tr>
+            {% endfor %}
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+
+    {% if converted.nat_rules %}
+    <h5 class="mt-4 mb-3">
+        <i class="bi bi-shuffle"></i> NAT Rules
+        <span class="badge bg-secondary ms-2">{{ converted.nat_rules | length }}</span>
+    </h5>
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead>
+                <tr>
+                    <th style="width:40px;"><input type="checkbox" id="selectAllNatCb" checked onchange="selectAllNat(this.checked)"></th>
+                    <th>ID</th>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th>Sources</th>
+                    <th>Destinations</th>
+                    <th>Services</th>
+                    <th>SNAT &rarr;</th>
+                    <th>DNAT &rarr;</th>
+                    <th>Warnings</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for rule in converted.nat_rules %}
+            <tr class="{% if rule.is_disabled %}rule-disabled{% endif %}">
+                <td>
+                    <input type="checkbox" class="nat-cb" data-fgt-id="{{ rule.fgt_id }}"
+                           {% if rule.selected %}checked{% endif %}>
+                </td>
+                <td>{{ rule.fgt_id }}</td>
+                <td>
+                    {{ rule.name }}
+                    {% if rule.is_disabled %}<span class="badge bg-secondary ms-1">DISABLED</span>{% endif %}
+                </td>
+                <td>
+                    {% if rule.nat_type == 'snat' %}
+                    <span class="badge bg-info text-dark">SNAT</span>
+                    {% elif rule.nat_type == 'dnat' %}
+                    <span class="badge text-light" style="background-color:#9b59b6;">DNAT</span>
+                    {% else %}
+                    <span class="badge bg-info text-dark">SNAT</span><span class="badge text-light ms-1" style="background-color:#9b59b6;">DNAT</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% for s in rule.sources %}
+                    <span class="badge bg-dark border border-secondary">{{ s }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% for d in rule.destinations %}
+                    <span class="badge bg-dark border border-secondary">{{ d }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% for s in rule.services %}
+                    <span class="badge bg-dark border border-secondary">{{ s }}</span>
+                    {% endfor %}
+                </td>
+                <td>
+                    {% if rule.dynamic_src_nat_ip %}
+                    <span class="badge bg-info text-dark">{{ rule.dynamic_src_nat_ip }}</span>
+                    {% else %}-{% endif %}
+                </td>
+                <td>
+                    {% if rule.static_dst_nat %}
+                    <span class="badge text-light" style="background-color:#9b59b6;">{{ rule.static_dst_nat }}</span>
+                    {% if rule.static_dst_nat_ports %}
+                    <small>:{{ rule.static_dst_nat_ports[0] }}&rarr;{{ rule.static_dst_nat_ports[1] }}</small>
+                    {% endif %}
+                    {% else %}-{% endif %}
+                </td>
+                <td>
+                    {% for w in rule.warnings %}
+                    <span class="badge bg-warning text-dark" title="{{ w }}">
+                        <i class="bi bi-exclamation-triangle"></i>
+                    </span>
+                    {% endfor %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    {% if converted.get('vpn_configs') %}
+    <h5 class="mt-4 mb-3">
+        <i class="bi bi-shield-lock"></i> VPN Tunnels
+        <span class="badge bg-secondary ms-2">{{ converted.vpn_configs | length }}</span>
+    </h5>
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark">
+            <thead><tr>
+                <th style="width:30px;">
+                    <input type="checkbox" class="form-check-input" id="vpnSelectAll"
+                           onchange="document.querySelectorAll('.vpn-select').forEach(c=>c.checked=this.checked)">
+                </th>
+                <th>Tunnel</th>
+                <th>Remote GW</th>
+                <th>Profile</th>
+                <th>Profile Action</th>
+                <th>Local Subnets</th>
+                <th>Remote Subnets</th>
+                <th>P2 SAs</th>
+                <th>Warnings</th>
+            </tr></thead>
+            <tbody>
+            {% for vpn in converted.vpn_configs %}
+            <tr>
+                <td>
+                    <input type="checkbox" class="form-check-input vpn-select"
+                           name="vpn_{{ loop.index0 }}" {% if vpn.selected %}checked{% endif %}>
+                </td>
+                <td><strong>{{ vpn.name }}</strong></td>
+                <td><code>{{ vpn.endpoint_ip }}</code></td>
+                <td><small>{{ vpn.vpn_profile }}</small></td>
+                <td>
+                    {% if vpn.profile_action == 'reuse' %}
+                    <span class="badge bg-success">Reuse</span>
+                    {% else %}
+                    <span class="badge bg-primary">Create</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% for s in vpn.local_subnets[:3] %}
+                    <span class="badge bg-success mb-1">{{ s }}</span>
+                    {% endfor %}
+                    {% if vpn.local_subnets | length > 3 %}
+                    <span class="badge bg-secondary">+{{ vpn.local_subnets | length - 3 }}</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% for s in vpn.remote_subnets[:3] %}
+                    <span class="badge bg-danger mb-1">{{ s }}</span>
+                    {% endfor %}
+                    {% if vpn.remote_subnets | length > 3 %}
+                    <span class="badge bg-secondary">+{{ vpn.remote_subnets | length - 3 }}</span>
+                    {% endif %}
+                </td>
+                <td>{{ vpn.phase2_count }}</td>
+                <td>
+                    {% for w in vpn.warnings %}
+                    <span class="badge bg-warning text-dark mb-1" title="{{ w }}">
+                        <i class="bi bi-exclamation-triangle"></i>
+                    </span>
+                    {% endfor %}
+                </td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function selectAll(checked) {
+    document.querySelectorAll('.rule-cb').forEach(cb => { cb.checked = checked; });
+    document.getElementById('selectAllCb').checked = checked;
+}
+
+function selectAllNat(checked) {
+    document.querySelectorAll('.nat-cb').forEach(cb => { cb.checked = checked; });
+    document.getElementById('selectAllNatCb').checked = checked;
+}
+
+function saveSelections() {
+    // Save access rules
+    const selections = {};
+    document.querySelectorAll('.rule-cb').forEach(cb => {
+        selections[cb.dataset.fgtId] = cb.checked;
+    });
+    const p1 = fetch('{{ url_for("migration_rules_update", project_id=project.id) }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({selections: selections})
+    });
+
+    // Save NAT rules
+    const natSelections = {};
+    document.querySelectorAll('.nat-cb').forEach(cb => {
+        natSelections[cb.dataset.fgtId] = cb.checked;
+    });
+    const p2 = fetch('{{ url_for("migration_nat_rules_update", project_id=project.id) }}', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({selections: natSelections})
+    });
+
+    Promise.all([p1, p2]).then(([r1, r2]) => Promise.all([r1.json(), r2.json()])).then(([d1, d2]) => {
+        if (d1.status === 'ok') {
+            const btn = document.querySelector('.btn-primary.btn-sm[onclick="saveSelections()"]');
+            btn.innerHTML = '<i class="bi bi-check"></i> Saved!';
+            setTimeout(() => { btn.innerHTML = '<i class="bi bi-save"></i> Save Selections'; }, 2000);
+        }
+    });
+}
+</script>
+{% endblock %}

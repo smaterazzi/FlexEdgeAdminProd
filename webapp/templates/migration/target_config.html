@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}Target Config: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_parsed', project_id=project.id) }}">{{ project.name }}</a></li>
+            <li class="breadcrumb-item active">Target Configuration</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-6">
+            <div class="card bg-dark border-secondary">
+                <div class="card-header">
+                    <h5 class="mb-0"><i class="bi bi-gear"></i> Forcepoint SMC Target</h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label for="smc_url" class="form-label">SMC URL</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="smc_url" name="smc_url" required
+                                   value="{{ target.smc_url }}"
+                                   placeholder="https://smc.example.com:8082">
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="api_key" class="form-label">API Key</label>
+                            <input type="password" class="form-control bg-dark border-secondary text-light"
+                                   id="api_key" name="api_key" required
+                                   value="{{ target.api_key }}">
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="domain" class="form-label">Admin Domain</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="domain" name="domain"
+                                   value="{{ target.domain }}"
+                                   placeholder="Shared Domain">
+                            <div class="form-text">Leave empty for default Shared Domain.</div>
+                        </div>
+
+                        <div class="mb-3 form-check">
+                            <input type="checkbox" class="form-check-input" id="verify_ssl"
+                                   name="verify_ssl" {% if target.verify_ssl %}checked{% endif %}>
+                            <label class="form-check-label" for="verify_ssl">Verify SSL certificate</label>
+                        </div>
+
+                        <hr class="border-secondary">
+
+                        <div class="mb-3">
+                            <label for="policy_name" class="form-label">Target Policy Name</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="policy_name" name="policy_name" required
+                                   value="{{ target.policy_name or 'Migration from Fortinet' }}"
+                                   placeholder="Migration from Fortinet">
+                            <div class="form-text">
+                                The firewall policy in SMC where rules will be created.
+                                Must exist or will be created with the Firewall Inspection Template.
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <label for="object_prefix" class="form-label">Object Name Prefix</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="object_prefix" name="object_prefix"
+                                   value="{{ target.object_prefix or 'FGT-' }}"
+                                   placeholder="FGT-">
+                            <div class="form-text">
+                                Prefix added to all migrated objects for traceability (e.g., FGT-).
+                            </div>
+                        </div>
+
+                        <div class="d-flex gap-2">
+                            <button type="submit" class="btn btn-primary">
+                                <i class="bi bi-check-lg"></i> Save & Continue
+                            </button>
+                            <a href="{{ url_for('migration_parsed', project_id=project.id) }}"
+                               class="btn btn-outline-secondary">Back</a>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

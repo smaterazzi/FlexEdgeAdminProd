@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}{{ policy_name }} — Rules{% endblock %}
+
+{% block content %}
+<div class="filter-bar p-3 d-flex align-items-center gap-3 flex-wrap">
+    <h5 class="mb-0"><i class="bi bi-shield-check"></i> {{ policy_name }}</h5>
+    <span class="badge bg-primary">{{ total_rules }} rules</span>
+    <span class="badge bg-info">{{ total_sections }} sections</span>
+    {% if disabled_count %}
+    <span class="badge bg-secondary">{{ disabled_count }} disabled</span>
+    {% endif %}
+    <a href="/sandbox?policy={{ policy_name }}" class="btn btn-sm btn-outline-warning ms-auto">
+        <i class="bi bi-box"></i> Sandbox Report
+    </a>
+</div>
+
+<div class="p-3">
+    <div class="table-responsive">
+        <table class="table table-sm table-hover align-middle">
+            <thead>
+                <tr>
+                    <th style="width:40px;">#</th>
+                    <th>Name</th>
+                    <th>Sources</th>
+                    <th>Destinations</th>
+                    <th>Services</th>
+                    <th style="width:80px;">Action</th>
+                    <th>Comment</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% set rule_num = namespace(val=0) %}
+                {% for rule in rules %}
+                {% if rule.is_section %}
+                <tr class="rule-section-row">
+                    <td colspan="7">
+                        <i class="bi bi-bookmark-fill text-info me-1"></i>
+                        {{ rule.name }}
+                    </td>
+                </tr>
+                {% else %}
+                {% set rule_num.val = rule_num.val + 1 %}
+                <tr class="{% if rule.is_disabled %}rule-disabled{% endif %}">
+                    <td class="text-muted">{{ rule_num.val }}</td>
+                    <td>
+                        {% if rule.is_disabled %}
+                        <i class="bi bi-pause-circle text-secondary me-1" title="Disabled"></i>
+                        {% endif %}
+                        {{ rule.name }}
+                    </td>
+                    <td style="font-size:0.8rem;">
+                        {% for s in rule.sources %}
+                        <span class="badge bg-dark border">{{ s }}</span>
+                        {% endfor %}
+                    </td>
+                    <td style="font-size:0.8rem;">
+                        {% for d in rule.destinations %}
+                        <span class="badge bg-dark border">{{ d }}</span>
+                        {% endfor %}
+                    </td>
+                    <td style="font-size:0.8rem;">
+                        {% for svc in rule.services %}
+                        <span class="badge bg-dark border">{{ svc }}</span>
+                        {% endfor %}
+                    </td>
+                    <td>
+                        {% if rule.action and 'allow' in rule.action|lower %}
+                        <span class="badge bg-success">Allow</span>
+                        {% elif rule.action and 'discard' in rule.action|lower %}
+                        <span class="badge bg-danger">Discard</span>
+                        {% elif rule.action and 'refuse' in rule.action|lower %}
+                        <span class="badge bg-danger">Refuse</span>
+                        {% elif rule.action and 'deny' in rule.action|lower %}
+                        <span class="badge bg-danger">Deny</span>
+                        {% elif rule.action and 'continue' in rule.action|lower %}
+                        <span class="badge bg-warning text-dark">Continue</span>
+                        {% else %}
+                        <span class="badge bg-secondary">{{ rule.action }}</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-muted" style="font-size:0.75rem;">{{ rule.comment }}</td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

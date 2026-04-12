@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}Import: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_parsed', project_id=project.id) }}">{{ project.name }}</a></li>
+            <li class="breadcrumb-item active">Import</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    <div class="row g-3">
+        <!-- Import controls -->
+        <div class="col-md-4">
+            <div class="card bg-dark border-secondary">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="bi bi-play-circle"></i> Import to SMC</h6>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted" style="font-size:0.85rem;">
+                        Target: <strong>{{ project.target.smc_url }}</strong><br>
+                        Domain: <strong>{{ project.target.domain or 'Shared' }}</strong><br>
+                        Policy: <strong>{{ project.target.policy_name }}</strong><br>
+                        Selected rules: <strong>{{ selected_count }}</strong><br>
+                        Selected NAT rules: <strong>{{ nat_selected_count }}</strong><br>
+                        Selected VPN tunnels: <strong>{{ vpn_selected_count }}</strong>
+                    </p>
+
+                    <div class="alert alert-warning py-2" style="font-size:0.8rem;">
+                        <i class="bi bi-exclamation-triangle"></i>
+                        This will create objects and rules in the SMC.
+                        Review all selections before proceeding.
+                    </div>
+
+                    <form method="POST">
+                        <div class="mb-3">
+                            <label class="form-label" style="font-size:0.85rem;">Import scope</label>
+                            <select name="import_type" class="form-select form-select-sm bg-dark border-secondary text-light">
+                                <option value="all">Objects + Rules + NAT + VPN</option>
+                                <option value="objects">Objects Only</option>
+                                <option value="rules">Access Rules Only</option>
+                                <option value="nat">NAT Rules Only</option>
+                                <option value="vpn">VPN Infrastructure Only</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn btn-success w-100"
+                                onclick="return confirm('Start import to SMC? This will create objects and rules.')">
+                            <i class="bi bi-cloud-upload"></i> Execute Import
+                        </button>
+                    </form>
+
+                    <div class="mt-3 d-flex gap-2">
+                        <a href="{{ url_for('migration_rules', project_id=project.id) }}"
+                           class="btn btn-outline-secondary btn-sm flex-fill">
+                            <i class="bi bi-arrow-left"></i> Back to Rules
+                        </a>
+                    </div>
+                </div>
+            </div>
+
+            {% if import_log %}
+            <div class="card bg-dark border-secondary mt-3">
+                <div class="card-header">
+                    <h6 class="mb-0"><i class="bi bi-bar-chart"></i> Import Summary</h6>
+                </div>
+                <div class="card-body">
+                    <div class="mb-2">
+                        Status:
+                        {% if import_log.status == 'done' %}
+                        <span class="badge bg-success">Complete</span>
+                        {% elif import_log.status == 'error' %}
+                        <span class="badge bg-danger">Error</span>
+                        {% elif import_log.status == 'running' %}
+                        <span class="badge bg-warning text-dark">Running</span>
+                        {% endif %}
+                    </div>
+                    <table class="table table-sm table-dark mb-0" style="font-size:0.8rem;">
+                        <tr><td>Objects created</td><td class="text-end fw-bold text-success">{{ import_log.objects_created }}</td></tr>
+                        <tr><td>Objects skipped</td><td class="text-end">{{ import_log.objects_skipped }}</td></tr>
+                        <tr><td>Object errors</td><td class="text-end {% if import_log.objects_errors > 0 %}text-danger{% endif %}">{{ import_log.objects_errors }}</td></tr>
+                        <tr><td>Rules created</td><td class="text-end fw-bold text-success">{{ import_log.rules_created }}</td></tr>
+                        <tr><td>Rule errors</td><td class="text-end {% if import_log.rules_errors > 0 %}text-danger{% endif %}">{{ import_log.rules_errors }}</td></tr>
+                        <tr><td>NAT rules created</td><td class="text-end fw-bold text-info">{{ import_log.get('nat_created', 0) }}</td></tr>
+                        <tr><td>NAT rule errors</td><td class="text-end {% if import_log.get('nat_errors', 0) > 0 %}text-danger{% endif %}">{{ import_log.get('nat_errors', 0) }}</td></tr>
+                    </table>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Import log -->
+        <div class="col-md-8">
+            <div class="card bg-dark border-secondary">
+                <div class="card-header d-flex justify-content-between align-items-center">
+                    <h6 class="mb-0"><i class="bi bi-terminal"></i> Import Log</h6>
+                    {% if import_log %}
+                    <span class="badge bg-secondary">{{ import_log.entries | length }} entries</span>
+                    {% endif %}
+                </div>
+                <div class="card-body p-0">
+                    {% if import_log and import_log.entries %}
+                    <div style="max-height:70vh; overflow-y:auto;">
+                        <table class="table table-sm table-dark mb-0" style="font-size:0.78rem;">
+                            <tbody>
+                            {% for entry in import_log.entries %}
+                            <tr>
+                                <td style="width:60px;">
+                                    {% if entry.level == 'error' %}
+                                    <span class="badge bg-danger">ERR</span>
+                                    {% elif entry.level == 'warning' %}
+                                    <span class="badge bg-warning text-dark">WARN</span>
+                                    {% else %}
+                                    <span class="badge bg-secondary">INFO</span>
+                                    {% endif %}
+                                </td>
+                                <td>{{ entry.msg }}</td>
+                            </tr>
+                            {% endfor %}
+                            </tbody>
+                        </table>
+                    </div>
+                    {% else %}
+                    <div class="text-center py-5 text-muted">
+                        <i class="bi bi-terminal" style="font-size:2rem;"></i>
+                        <p class="mt-2 mb-0">No import has been run yet.</p>
+                    </div>
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

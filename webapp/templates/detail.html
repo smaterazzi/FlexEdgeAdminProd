@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}{{ element.name }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb">
+            <li class="breadcrumb-item"><a href="/">Dashboard</a></li>
+            <li class="breadcrumb-item"><a href="/browse/{{ type_key }}">{{ label }}</a></li>
+            <li class="breadcrumb-item active">{{ element.name }}</li>
+        </ol>
+    </nav>
+
+    <h4>
+        {% if element.name.startswith('FGT-') %}
+        <span class="badge badge-fgt me-2">FGT</span>
+        {% endif %}
+        {{ element.name }}
+    </h4>
+
+    {% if element.error is defined %}
+    <div class="alert alert-danger mt-3">{{ element.error }}</div>
+    {% else %}
+
+    <div class="row mt-4">
+        <div class="col-md-4">
+            <div class="card mb-3">
+                <div class="card-header">Info</div>
+                <div class="card-body">
+                    <dl class="mb-0">
+                        <dt>Type</dt>
+                        <dd>{{ label }}</dd>
+                        <dt>Href</dt>
+                        <dd style="font-size:0.75rem; word-break:break-all;">{{ element.href }}</dd>
+                        {% if element.data.get('comment') %}
+                        <dt>Comment</dt>
+                        <dd>{{ element.data.comment }}</dd>
+                        {% endif %}
+                        {% if element.data.get('address') %}
+                        <dt>Address</dt>
+                        <dd><code>{{ element.data.address }}</code></dd>
+                        {% endif %}
+                        {% if element.data.get('ipv4_network') %}
+                        <dt>Network</dt>
+                        <dd><code>{{ element.data.ipv4_network }}</code></dd>
+                        {% endif %}
+                        {% if element.data.get('ip_range') %}
+                        <dt>Range</dt>
+                        <dd><code>{{ element.data.ip_range }}</code></dd>
+                        {% endif %}
+                        {% if element.data.get('min_dst_port') %}
+                        <dt>Port</dt>
+                        <dd><code>{{ element.data.min_dst_port }}{% if element.data.get('max_dst_port') and element.data.max_dst_port != element.data.min_dst_port %}-{{ element.data.max_dst_port }}{% endif %}</code></dd>
+                        {% endif %}
+                    </dl>
+                </div>
+            </div>
+
+            <!-- Resolved members for groups -->
+            {% if element.data.get('element') and element.data.element is iterable and element.data.element is not string %}
+            <div class="card mb-3">
+                <div class="card-header">Members (resolved)</div>
+                <div class="card-body p-0">
+                    <ul class="list-group list-group-flush">
+                        {% for member in element.data.element %}
+                        <li class="list-group-item" style="font-size:0.85rem;">
+                            {% if member is string and '[' in member %}
+                            {{ member }}
+                            {% else %}
+                            {{ member }}
+                            {% endif %}
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+            {% endif %}
+        </div>
+        <div class="col-md-8">
+            <div class="card">
+                <div class="card-header">Resolved Data</div>
+                <div class="card-body p-0">
+                    <pre class="json-detail mb-0">{{ element.data | tojson(indent=2) }}</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

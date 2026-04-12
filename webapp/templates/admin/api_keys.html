@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+{% block title %}API Keys{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">API Keys</li>
+        </ol>
+    </nav>
+    <a href="{{ url_for('admin.api_key_new') }}" class="btn btn-primary btn-sm">
+        <i class="bi bi-plus-circle me-1"></i>Add API Key
+    </a>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <div class="table-responsive">
+        <table class="table table-dark table-sm table-hover">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Tenant</th>
+                    <th>Created By</th>
+                    <th>Created</th>
+                    <th>Last Used</th>
+                    <th>Status</th>
+                    <th style="width:100px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for k in api_keys %}
+                <tr class="{% if not k.is_active %}opacity-50{% endif %}">
+                    <td>
+                        <i class="bi bi-key text-warning me-1"></i>
+                        {{ k.name }}
+                    </td>
+                    <td>{{ k.tenant.name if k.tenant else '—' }}</td>
+                    <td style="font-size:0.8rem;">{{ k.created_by.email if k.created_by else '—' }}</td>
+                    <td style="font-size:0.8rem;">{{ k.created_at.strftime('%Y-%m-%d %H:%M') if k.created_at else '—' }}</td>
+                    <td style="font-size:0.8rem;">{{ k.last_used_at.strftime('%Y-%m-%d %H:%M') if k.last_used_at else 'Never' }}</td>
+                    <td>
+                        {% if k.is_active %}
+                        <span class="badge bg-success">Active</span>
+                        {% else %}
+                        <span class="badge bg-danger">Revoked</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if k.is_active %}
+                        <form method="POST" action="{{ url_for('admin.api_key_revoke', id=k.id) }}" class="d-inline"
+                              onsubmit="return confirm('Revoke API key &quot;{{ k.name }}&quot;? This cannot be undone.')">
+                            <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
+                                <i class="bi bi-x-circle"></i> Revoke
+                            </button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center text-muted py-4">No API keys yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

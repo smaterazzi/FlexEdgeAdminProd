@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy this file to tenants.json and fill in real values. DO NOT commit tenants.json to git.",
+
+  "prod": {
+    "name": "Production SMC",
+    "smc_url": "https://smc.example.com:8082",
+    "verify_ssl": false,
+    "timeout": 120,
+    "domain": "Shared Domain"
+  },
+
+  "lab": {
+    "name": "Lab SMC",
+    "smc_url": "https://smc-lab.example.com:8082",
+    "verify_ssl": false,
+    "timeout": 60,
+    "domain": "Lab Domain"
+  }
+}

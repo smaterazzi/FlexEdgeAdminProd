@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Users{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">Users</li>
+        </ol>
+    </nav>
+    <a href="{{ url_for('admin.user_new') }}" class="btn btn-primary btn-sm">
+        <i class="bi bi-plus-circle me-1"></i>Add User
+    </a>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <div class="table-responsive">
+        <table class="table table-dark table-sm table-hover">
+            <thead>
+                <tr>
+                    <th>Email</th>
+                    <th>Display Name</th>
+                    <th>Role</th>
+                    <th>Tenant Access</th>
+                    <th>Status</th>
+                    <th style="width:140px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for u in users %}
+                <tr class="{% if not u.is_active %}opacity-50{% endif %}">
+                    <td>{{ u.email }}</td>
+                    <td>{{ u.display_name or '—' }}</td>
+                    <td>
+                        {% if u.role == 'admin' %}
+                        <span class="badge bg-danger">Admin</span>
+                        {% else %}
+                        <span class="badge bg-info">Viewer</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% for access in u.tenant_accesses %}
+                        <span class="badge bg-secondary me-1">{{ access.tenant.name }}</span>
+                        {% else %}
+                        <span class="text-muted" style="font-size:0.8rem;">None</span>
+                        {% endfor %}
+                    </td>
+                    <td>
+                        {% if u.is_active %}
+                        <span class="badge bg-success">Active</span>
+                        {% else %}
+                        <span class="badge bg-danger">Inactive</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.user_edit', id=u.id) }}" class="btn btn-outline-primary btn-sm py-0 px-2">
+                            <i class="bi bi-pencil"></i>
+                        </a>
+                        {% if u.is_active %}
+                        <form method="POST" action="{{ url_for('admin.user_delete', id=u.id) }}" class="d-inline"
+                              onsubmit="return confirm('Deactivate user {{ u.email }}?')">
+                            <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="6" class="text-center text-muted py-4">No users yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

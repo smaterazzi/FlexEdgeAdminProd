@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}Tenants{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">Tenants</li>
+        </ol>
+    </nav>
+    <a href="{{ url_for('admin.tenant_new') }}" class="btn btn-primary btn-sm">
+        <i class="bi bi-plus-circle me-1"></i>Add Tenant
+    </a>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <div class="table-responsive">
+        <table class="table table-dark table-sm table-hover">
+            <thead>
+                <tr>
+                    <th>Slug</th>
+                    <th>Name</th>
+                    <th>SMC URL</th>
+                    <th>Domain</th>
+                    <th>SSL</th>
+                    <th>Status</th>
+                    <th style="width:140px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in tenants %}
+                <tr class="{% if not t.is_active %}opacity-50{% endif %}">
+                    <td><code>{{ t.slug }}</code></td>
+                    <td>{{ t.name }}</td>
+                    <td style="font-size:0.8rem;">{{ t.smc_url }}</td>
+                    <td>{{ t.default_domain or '—' }}</td>
+                    <td>
+                        {% if t.verify_ssl %}
+                        <span class="badge bg-success">Yes</span>
+                        {% else %}
+                        <span class="badge bg-secondary">No</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if t.is_active %}
+                        <span class="badge bg-success">Active</span>
+                        {% else %}
+                        <span class="badge bg-danger">Inactive</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        <a href="{{ url_for('admin.tenant_edit', id=t.id) }}" class="btn btn-outline-primary btn-sm py-0 px-2">
+                            <i class="bi bi-pencil"></i>
+                        </a>
+                        {% if t.is_active %}
+                        <form method="POST" action="{{ url_for('admin.tenant_delete', id=t.id) }}" class="d-inline"
+                              onsubmit="return confirm('Deactivate tenant {{ t.name }}?')">
+                            <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center text-muted py-4">No tenants configured yet.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

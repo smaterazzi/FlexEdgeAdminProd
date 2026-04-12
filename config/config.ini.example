@@ -1,0 +1,19 @@
+[smc]
+# Legacy CLI config format — prefer tenants.json for new setups.
+# Copy to cli/config.ini if you want to use the old config style.
+
+# SMC Server Configuration
+smc_address = smc.example.com
+smc_port = 8082
+smc_apikey = YOUR_API_KEY_HERE
+
+# SSL Configuration
+smc_ssl = True
+verify_ssl = False
+# ssl_cert_file = /path/to/certificate.pem
+
+# Optional: API version (leave empty to auto-detect)
+# api_version = 7.1
+
+# Optional: Admin domain
+domain = Shared Domain

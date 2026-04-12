@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% block title %}Deduplication: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex align-items-center justify-content-between">
+    <div>
+        <nav aria-label="breadcrumb">
+            <ol class="breadcrumb mb-0">
+                <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+                <li class="breadcrumb-item"><a href="{{ url_for('migration_parsed', project_id=project.id) }}">{{ project.name }}</a></li>
+                <li class="breadcrumb-item active">Deduplication</li>
+            </ol>
+        </nav>
+    </div>
+    <div class="d-flex gap-2">
+        <a href="{{ url_for('migration_dedup', project_id=project.id, force=1) }}"
+           class="btn btn-outline-warning btn-sm">
+            <i class="bi bi-arrow-clockwise"></i> Re-run
+        </a>
+        <a href="{{ url_for('migration_rules', project_id=project.id) }}"
+           class="btn btn-primary btn-sm">
+            <i class="bi bi-arrow-right"></i> Convert Rules
+        </a>
+    </div>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% if messages %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endif %}
+    {% endwith %}
+
+    {% if error is defined and error %}
+    <div class="alert alert-danger">{{ error }}</div>
+    {% endif %}
+
+    {% if dedup %}
+    <!-- Stats cards -->
+    <div class="row g-2 mb-3">
+        {% for cat, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles')] %}
+        {% set st = dedup_stats.get(cat, {}) %}
+        <div class="col-md-3">
+            <div class="card bg-dark border-secondary stat-card">
+                <div class="card-body py-2 px-3">
+                    <div class="text-muted" style="font-size:0.7rem;">{{ label }}</div>
+                    <div class="d-flex gap-2 mt-1" style="font-size:0.8rem;">
+                        <span class="badge bg-success">{{ st.create }} create</span>
+                        <span class="badge bg-info">{{ st.reuse }} reuse</span>
+                        <span class="badge bg-secondary">{{ st.skip }} skip</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+
+    <!-- Tabs -->
+    <ul class="nav nav-tabs mb-3">
+        {% for key, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles')] %}
+        <li class="nav-item">
+            <a class="nav-link {% if tab == key %}active{% endif %}"
+               href="{{ url_for('migration_dedup', project_id=project.id, tab=key) }}">{{ label }}
+                <span class="badge bg-secondary">{{ dedup.get(key, []) | length }}</span>
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+
+    <!-- Table -->
+    <div class="table-responsive">
+        <table class="table table-sm table-hover table-dark" id="dedupTable">
+            <thead>
+                <tr>
+                    {% if tab == 'vpn_profiles' %}
+                    <th>Tunnel</th>
+                    <th>Remote GW</th>
+                    <th>Crypto</th>
+                    <th>Warnings</th>
+                    {% elif tab == 'nat_hosts' %}
+                    <th>IP Address</th>
+                    <th>Purpose</th>
+                    <th>Source Object</th>
+                    {% else %}
+                    <th>FortiGate Name</th>
+                    {% if tab in ('addresses', 'services') %}<th>Details</th>{% endif %}
+                    {% if tab in ('address_groups', 'service_groups') %}<th>Members</th>{% endif %}
+                    {% endif %}
+                    <th>SMC Match</th>
+                    <th>Match Type</th>
+                    <th>Action</th>
+                    <th>SMC Name</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for entry in dedup.get(tab, []) %}
+            <tr>
+                {% if tab == 'vpn_profiles' %}
+                <td><strong>{{ entry.tunnel_name }}</strong></td>
+                <td><code>{{ entry.remote_gw }}</code></td>
+                <td><small>{{ entry.proposal }} / DH{{ entry.dhgrp }}</small></td>
+                <td>
+                    {% for w in entry.get('warnings', []) %}
+                    <span class="badge bg-warning text-dark mb-1">{{ w }}</span>
+                    {% endfor %}
+                </td>
+                {% elif tab == 'nat_hosts' %}
+                <td>{{ entry.ip }}</td>
+                <td>
+                    {% if entry.purpose == 'snat_pool' %}<span class="badge bg-info text-dark">SNAT Pool</span>
+                    {% elif entry.purpose == 'vip_extip' %}<span class="badge" style="background-color:#9b59b6;">VIP ExtIP</span>
+                    {% elif entry.purpose == 'vip_mappedip' %}<span class="badge bg-warning text-dark">VIP MappedIP</span>
+                    {% endif %}
+                </td>
+                <td><small>{{ entry.source_name }}</small></td>
+                {% else %}
+                <td>{{ entry.parsed_name }}</td>
+
+                {% if tab == 'addresses' %}
+                <td><small>
+                    {% if entry.type == 'host' %}{{ entry.details.get('ip', '') }}
+                    {% elif entry.type == 'subnet' %}{{ entry.details.get('subnet', '') }}/{{ entry.details.get('cidr', '') }}
+                    {% elif entry.type == 'iprange' %}{{ entry.details.get('start_ip', '') }}-{{ entry.details.get('end_ip', '') }}
+                    {% elif entry.type == 'fqdn' %}{{ entry.details.get('fqdn', '') }}
+                    {% else %}{{ entry.type }}{% endif %}
+                </small></td>
+                {% elif tab == 'services' %}
+                <td><small>
+                    {{ entry.protocol }}
+                    {% if entry.details.get('tcp_ports') %}
+                    {% for p in entry.details.tcp_ports %}:{{ p[0] }}{% if p[1] != p[0] %}-{{ p[1] }}{% endif %}{% endfor %}
+                    {% endif %}
+                    {% if entry.details.get('udp_ports') %}
+                    {% for p in entry.details.udp_ports %}:{{ p[0] }}{% if p[1] != p[0] %}-{{ p[1] }}{% endif %}{% endfor %}
+                    {% endif %}
+                </small></td>
+                {% elif tab in ('address_groups', 'service_groups') %}
+                <td><small>{{ (entry.members if entry.members is sequence and entry.members is not string else []) | join(', ') | truncate(60) }}</small></td>
+                {% endif %}
+                {% endif %}{# end nat_hosts else #}
+
+                <td>
+                    {% if entry.smc_match %}
+                    <span class="text-success">{{ entry.smc_match }}</span>
+                    {% else %}
+                    <span class="text-muted">-</span>
+                    {% endif %}
+                </td>
+                <td>
+                    {% if entry.match_type == 'exact_name' %}<span class="badge bg-success">exact</span>
+                    {% elif entry.match_type == 'fgt_prefix' %}<span class="badge bg-info">FGT- prefix</span>
+                    {% elif entry.match_type == 'ip_match' %}<span class="badge bg-info">IP match</span>
+                    {% elif entry.match_type == 'subnet_match' %}<span class="badge bg-info">subnet</span>
+                    {% elif entry.match_type == 'port_match' %}<span class="badge bg-info">port match</span>
+                    {% elif entry.match_type == 'name_match' %}<span class="badge bg-info">name match</span>
+                    {% elif entry.match_type == 'capability_match' %}<span class="badge bg-success">capabilities</span>
+                    {% elif entry.match_type == 'builtin' %}<span class="badge bg-secondary">built-in</span>
+                    {% else %}<span class="badge bg-secondary">none</span>
+                    {% endif %}
+                </td>
+                <td>
+                    <select class="form-select form-select-sm bg-dark border-secondary text-light dedup-action"
+                            data-category="{{ tab }}" data-name="{{ entry.ip if tab == 'nat_hosts' else (entry.tunnel_name if tab == 'vpn_profiles' else entry.parsed_name) }}"
+                            style="width:100px;">
+                        <option value="create" {% if entry.action == 'create' %}selected{% endif %}>Create</option>
+                        <option value="reuse" {% if entry.action == 'reuse' %}selected{% endif %}>Reuse</option>
+                        <option value="skip" {% if entry.action == 'skip' %}selected{% endif %}>Skip</option>
+                    </select>
+                </td>
+                <td><small>{{ entry.smc_name }}</small></td>
+            </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="text-center py-5 text-muted">
+        <i class="bi bi-search" style="font-size:3rem;"></i>
+        <p class="mt-2">Deduplication not yet run.</p>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.querySelectorAll('.dedup-action').forEach(sel => {
+    sel.addEventListener('change', function() {
+        fetch('{{ url_for("migration_dedup_update", project_id=project.id) }}', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                category: this.dataset.category,
+                parsed_name: this.dataset.name,
+                action: this.value
+            })
+        });
+    });
+});
+</script>
+{% endblock %}
