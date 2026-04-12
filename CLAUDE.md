@@ -267,7 +267,7 @@ The script:
 **First-time setup** (once):
 ```bash
 cd production
-git remote add origin git@github.com:your-org/FlexEdgeAdmin.git
+git remote add origin https://github.com/smaterazzi/production.git
 cd ..
 ```
 

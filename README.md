@@ -17,7 +17,7 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 ### Docker (recommended)
 
 ```bash
-git clone <repo-url> && cd FlexEdgeAdmin
+git clone https://github.com/smaterazzi/production.git FlexEdgeAdmin && cd FlexEdgeAdmin
 
 # 1. Set up Azure AD automatically (requires Azure CLI)
 ./scripts/azure-setup.sh

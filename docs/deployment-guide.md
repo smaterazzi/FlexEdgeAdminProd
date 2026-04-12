@@ -13,7 +13,7 @@ Step-by-step guide to deploy FlexEdgeAdmin on a VPS (Ubuntu 22.04+).
 
 ```bash
 # 1. Clone the repository on your server
-git clone <your-repo-url> /opt/flexedge-admin
+git clone https://github.com/smaterazzi/production.git /opt/flexedge-admin
 cd /opt/flexedge-admin
 
 # 2. Run the deployment script
@@ -317,7 +317,7 @@ The development repository may contain client-specific migration scripts and dat
 ```bash
 # After the first pack, configure the public remote:
 cd production
-git remote add origin git@github.com:your-org/FlexEdgeAdmin.git
+git remote add origin https://github.com/smaterazzi/production.git
 cd ..
 
 # From now on, pack-release.sh will push automatically
