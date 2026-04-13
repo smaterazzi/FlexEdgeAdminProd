@@ -173,6 +173,28 @@ git pull
 
 This pulls the latest code and rebuilds the Docker image. The database and encryption key are preserved (they live in the `config/` volume).
 
+## Uninstalling
+
+```bash
+# Stop and remove containers — preserves database, encryption key, .env
+./deploy.sh --uninstall
+
+# Full clean slate — DELETES all data, requires typing "PURGE" to confirm
+./deploy.sh --uninstall --purge
+```
+
+`--uninstall` is safe and reversible — just run `./deploy.sh` again to restart with all your data intact.
+
+`--purge` is **destructive and irreversible**:
+
+- Deletes `config/flexedge.db` (all tenants, users, encrypted API keys)
+- Deletes `config/encryption.key` (without it, even DB backups are unreadable)
+- Backs up `.env` to `.env.purged-<timestamp>` (in case you need Azure creds)
+- Deletes `data/projects/` (migration project data)
+- Removes Docker images and certbot TLS volumes
+
+Use `--purge` only when you want a true fresh start (e.g., before running a test deployment, or after rotating to a new Azure tenant).
+
 ## CLI Usage via Docker
 
 CLI tools are available inside the running container:

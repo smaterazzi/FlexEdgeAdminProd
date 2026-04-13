@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Uninstall support** in `deploy.sh`:
+  - `--uninstall` — stop/remove containers, preserve all data and config
+  - `--uninstall --purge` — full clean slate: deletes DB, encryption key, .env,
+    Docker images, certbot volumes (requires typing "PURGE" to confirm)
 - **Azure setup automation** (`scripts/azure-setup.sh`) — single command to:
   - Create Entra ID App Registration with OIDC configuration
   - Enable ID tokens, set redirect URIs (dev + production)

@@ -34,20 +34,104 @@ COMPOSE_BASE="-f $PROJECT_DIR/docker/docker-compose.yml"
 COMPOSE_PROD="-f $PROJECT_DIR/docker/docker-compose.prod.yml"
 USE_TLS=true
 UPDATE_ONLY=false
+UNINSTALL=false
+PURGE=false
 
 # Parse arguments
 for arg in "$@"; do
     case $arg in
-        --no-tls)   USE_TLS=false ;;
-        --update)   UPDATE_ONLY=true ;;
+        --no-tls)    USE_TLS=false ;;
+        --update)    UPDATE_ONLY=true ;;
+        --uninstall) UNINSTALL=true ;;
+        --purge)     PURGE=true ;;
         --help|-h)
-            echo "Usage: ./deploy.sh [--no-tls] [--update]"
-            echo "  --no-tls    Skip TLS/nginx setup (dev mode, port 5000 only)"
-            echo "  --update    Pull latest code and rebuild containers"
+            echo "Usage: ./deploy.sh [OPTIONS]"
+            echo ""
+            echo "Install / start:"
+            echo "  (no flags)         Install Docker, configure, build, and start with TLS"
+            echo "  --no-tls           Skip TLS/nginx setup (dev mode, port 5000 only)"
+            echo "  --update           Pull latest code and rebuild containers"
+            echo ""
+            echo "Uninstall:"
+            echo "  --uninstall        Stop and remove containers (preserves data + .env)"
+            echo "  --uninstall --purge  DESTRUCTIVE: also delete DB, encryption key, .env,"
+            echo "                       Docker images, certbot volumes — full clean slate"
             exit 0
             ;;
     esac
 done
+
+# ── Uninstall mode ───────────────────────────────────────────────────────
+if [ "$UNINSTALL" = true ]; then
+    cd "$PROJECT_DIR"
+
+    print_step "Uninstalling FlexEdgeAdmin..."
+
+    # Stop and remove containers (both dev and prod compose files)
+    print_step "Stopping containers..."
+    docker compose $COMPOSE_BASE $COMPOSE_PROD down 2>/dev/null || true
+    docker compose $COMPOSE_BASE down 2>/dev/null || true
+    print_ok "Containers stopped and removed"
+
+    if [ "$PURGE" = true ]; then
+        echo ""
+        print_color "$RED" "    ⚠ PURGE MODE: This will permanently delete:"
+        echo "      - config/flexedge.db          (all tenants, users, API keys)"
+        echo "      - config/encryption.key       (recovery key — IRREVERSIBLE)"
+        echo "      - .env                         (Azure AD credentials)"
+        echo "      - data/projects/              (migration project data)"
+        echo "      - Docker images for this project"
+        echo "      - certbot TLS volumes (if present)"
+        echo ""
+        read -p "    Type 'PURGE' to confirm: " confirm
+        if [ "$confirm" != "PURGE" ]; then
+            print_warn "Purge cancelled. Containers were stopped but data preserved."
+            exit 0
+        fi
+
+        print_step "Purging data..."
+
+        # Remove encrypted DB and key
+        rm -f config/flexedge.db config/flexedge.db-shm config/flexedge.db-wal
+        rm -f config/encryption.key
+        print_ok "Removed database and encryption key"
+
+        # Remove .env (back it up just in case)
+        if [ -f .env ]; then
+            BACKUP=".env.purged-$(date +%Y%m%d%H%M%S)"
+            mv .env "$BACKUP"
+            print_warn "Moved .env to $BACKUP (in case you need Azure creds)"
+        fi
+
+        # Remove migration project data
+        rm -rf data/projects/
+        print_ok "Removed migration project data"
+
+        # Remove Docker images
+        docker rmi $(docker images --format '{{.Repository}}:{{.Tag}}' | grep -i flexedge) 2>/dev/null || true
+        print_ok "Removed Docker images"
+
+        # Remove certbot volumes
+        docker volume rm $(docker volume ls -q | grep -i certbot) 2>/dev/null || true
+        print_ok "Removed certbot volumes"
+
+        echo ""
+        print_color "$GREEN" "    ✓ Full uninstall complete. Project files remain on disk."
+        echo ""
+        echo "    To start fresh: ./deploy.sh"
+    else
+        echo ""
+        print_color "$GREEN" "    ✓ Containers stopped. Your data is preserved:"
+        echo "      - config/flexedge.db          (database)"
+        echo "      - config/encryption.key       (encryption key)"
+        echo "      - .env                         (Azure AD credentials)"
+        echo "      - data/projects/              (migration data)"
+        echo ""
+        echo "    To restart:           ./deploy.sh"
+        echo "    To purge everything:  ./deploy.sh --uninstall --purge"
+    fi
+    exit 0
+fi
 
 # ── Update mode ──────────────────────────────────────────────────────────
 if [ "$UPDATE_ONLY" = true ]; then
