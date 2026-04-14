@@ -12,30 +12,34 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 - **Multi-tenant, multi-user** — Microsoft Entra ID (Azure AD) authentication with per-user SMC profiles
 - **Docker-ready** — single image with nginx reverse proxy and Let's Encrypt TLS
 
+## Deployment Options
+
+Pick the one that fits your infrastructure. Full instructions in [docs/deployment-guide.md](docs/deployment-guide.md).
+
+| Option | Best for | Guide |
+| ------ | -------- | ----- |
+| **Standalone** (no Docker) | Native install on a dedicated VM with system nginx | [Option 1](docs/deployment-guide.md#option-1--standalone-install-no-docker) |
+| **Docker + nginx** | Single-purpose VPS, full stack in compose | [Option 2](docs/deployment-guide.md#option-2--standalone-docker-with-nginx) |
+| **Coolify / Traefik** | Multi-website host, PaaS-style management | [Option 3](docs/deployment-guide.md#option-3--docker-behind-coolify--traefik) |
+
 ## Quick Start
 
-### Docker (recommended)
-
 ```bash
-git clone https://github.com/smaterazzi/production.git FlexEdgeAdmin && cd FlexEdgeAdmin
+git clone https://github.com/smaterazzi/FlexEdgeAdminProd.git FlexEdgeAdmin && cd FlexEdgeAdmin
 
-# 1. Set up Azure AD automatically (requires Azure CLI)
-./scripts/azure-setup.sh
+# Option 1: Standalone (native install + nginx + systemd)
+sudo ./scripts/install-standalone.sh --domain admin.yourcompany.com
 
-# 2. Start
-make dev
+# Option 2: Docker with bundled nginx + certbot
+./deploy.sh                  # Full install (Docker, TLS, Azure setup)
+./deploy.sh --no-tls         # Dev mode on port 5000
 
-# 3. Open http://localhost:5000
-#    → Login with Azure AD → Setup wizard creates your admin account
-#    → Admin Portal: add tenants, create API keys, invite users
+# Option 3: Coolify — use docker/docker-compose.coolify.yml via the Coolify UI
 ```
 
-Or use the automated VPS deployment (offers to run Azure setup):
-
-```bash
-./deploy.sh              # Installs Docker, runs Azure setup, starts services
-./deploy.sh --no-tls     # Development mode (no nginx/TLS)
-```
+First visit:
+1. Log in with Azure AD → Setup wizard creates your admin account
+2. Admin Portal (`/admin/`) → add tenants, create API keys, invite users
 
 ### CLI only (no Docker)
 
@@ -86,7 +90,7 @@ The development repo may contain client-specific data. Use the release packer to
 ./scripts/pack-release.sh --message "v2.1.0"    # Custom commit message
 ```
 
-The script copies product code to `./production/`, strips all client-specific data, runs an automated leak scan, and pushes to the production repo's remote. See [CLAUDE.md](CLAUDE.md#publishing--release) for details.
+The script copies product code to `./FlexEdgeAdminProd/`, strips all client-specific data, runs an automated leak scan, and pushes to the production repo's remote. See [CLAUDE.md](CLAUDE.md#publishing--release) for details.
 
 ## License
 

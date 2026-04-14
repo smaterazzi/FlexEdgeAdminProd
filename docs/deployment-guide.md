@@ -1,142 +1,149 @@
 # FlexEdgeAdmin — Deployment Guide
 
-Step-by-step guide to deploy FlexEdgeAdmin on a VPS (Ubuntu 22.04+).
+Three deployment options depending on your infrastructure. All three deliver the same product; pick the one that fits your setup.
 
-## Prerequisites
+| Option | Best for | nginx/TLS | Complexity |
+| ------ | -------- | --------- | ---------- |
+| [1. Standalone](#option-1--standalone-install-no-docker) | Dedicated VM, no Docker | Managed by you (nginx + certbot on host) | Medium |
+| [2. Docker + nginx](#option-2--standalone-docker-with-nginx) | Single-purpose VPS | Handled by compose (nginx + certbot containers) | Low |
+| [3. Coolify / Traefik](#option-3--docker-behind-coolify--traefik) | Multi-website host | Handled by Coolify automatically | Low |
 
-- A VPS with Ubuntu 22.04+ and SSH access (e.g., Hetzner, DigitalOcean, AWS EC2)
-- A domain name pointed at the server's IP (for HTTPS)
-- A Microsoft Entra ID (Azure AD) App Registration (for user authentication)
+---
+
+## Prerequisites (all options)
+
+- Ubuntu 22.04+ / Debian 12+ server with SSH access
+- A domain name pointed at the server's public IP (optional for dev)
+- A Microsoft Entra ID (Azure AD) App Registration — see [Azure AD setup](#azure-ad-setup)
 - Your Forcepoint SMC server URL and at least one API key
 
-## Quick Start (Automated)
+---
 
-```bash
-# 1. Clone the repository on your server
-git clone https://github.com/smaterazzi/production.git /opt/flexedge-admin
-cd /opt/flexedge-admin
+## Azure AD Setup
 
-# 2. Run the deployment script
-chmod +x deploy.sh
-./deploy.sh
-```
-
-The script will:
-
-1. Install Docker and Docker Compose if not present
-2. Create `.env` from template and generate a Flask secret key
-3. Build and start all services (including nginx with TLS support)
-
-After the script finishes:
-
-1. Edit `.env` with your Azure AD credentials
-2. Restart: `./deploy.sh --update`
-3. Open your browser and log in — the setup wizard will guide you through the rest
-
-## Manual Setup
-
-### 1. Install Docker
-
-```bash
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-# Log out and back in for group membership to take effect
-```
-
-### 2. Clone and Configure
-
-```bash
-cd /opt/flexedge-admin
-
-# Only .env is needed before first start
-cp config/.env.example .env
-```
-
-### 3. Azure AD Setup + .env
+Works the same for all three deployment options.
 
 **Automated (recommended):**
 
 ```bash
+./scripts/azure-setup.sh --domain admin.yourcompany.com
+```
+
+This creates the App Registration, enables ID tokens, creates a client secret, adds `openid`/`email`/`profile` permissions, grants admin consent, and writes `.env`. Requires Azure CLI (`az login`) and Application Administrator role.
+
+**Manual:** see [CLAUDE.md § Azure AD App Registration](../CLAUDE.md#azure-ad-app-registration).
+
+The resulting `.env` must contain `FLASK_SECRET_KEY`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`.
+
+---
+
+## Option 1 — Standalone install (no Docker)
+
+Native Python install behind the system's nginx. Best when Docker isn't an option or you prefer native services.
+
+### What the installer does
+
+1. Installs Python 3.12, nginx, certbot
+2. Creates a `flexedge` system user (no login, no home)
+3. Installs code to `/opt/flexedge/`, creates a venv, installs dependencies
+4. Creates `/etc/flexedge/.env` with a generated Flask secret
+5. Creates a systemd service (`flexedge.service`) binding gunicorn to `127.0.0.1:5000`
+6. Writes nginx site config proxying to gunicorn
+7. Enables and starts both services
+
+### Steps
+
+```bash
+# 1. Clone the production repo
+git clone https://github.com/smaterazzi/FlexEdgeAdminProd.git /opt/flexedge-src
+cd /opt/flexedge-src
+
+# 2. Run the installer (requires sudo)
+sudo ./scripts/install-standalone.sh --domain admin.yourcompany.com
+
+# 3. Configure Azure AD — either via the automation script:
+./scripts/azure-setup.sh --domain admin.yourcompany.com
+# then copy AZURE_* values from ./.env into /etc/flexedge/.env
+
+# 4. Restart the service to pick up credentials
+sudo systemctl restart flexedge.service
+
+# 5. Obtain TLS certificate
+sudo certbot --nginx -d admin.yourcompany.com
+
+# 6. Open https://admin.yourcompany.com → setup wizard
+```
+
+### Service management
+
+```bash
+sudo systemctl status flexedge          # check status
+sudo systemctl restart flexedge         # restart after .env changes
+sudo journalctl -u flexedge -f          # follow logs
+sudo nano /etc/flexedge/.env            # edit config
+```
+
+### File layout
+
+| Path | Purpose |
+| ---- | ------- |
+| `/opt/flexedge/` | Application code, venv, templates |
+| `/etc/flexedge/.env` | Environment variables (chmod 640, owned by `flexedge`) |
+| `/etc/flexedge/flexedge.db` | SQLite database (auto-created on first run) |
+| `/etc/flexedge/encryption.key` | Fernet encryption key (auto-generated) |
+| `/etc/systemd/system/flexedge.service` | systemd unit |
+| `/etc/nginx/sites-available/flexedge` | nginx site config |
+
+### Updating
+
+```bash
+cd /opt/flexedge-src
+git pull
+sudo ./scripts/install-standalone.sh    # idempotent — preserves /etc/flexedge/
+sudo systemctl restart flexedge
+```
+
+### Uninstalling
+
+```bash
+sudo systemctl disable --now flexedge
+sudo rm /etc/systemd/system/flexedge.service
+sudo rm /etc/nginx/sites-enabled/flexedge /etc/nginx/sites-available/flexedge
+sudo systemctl reload nginx
+sudo rm -rf /opt/flexedge
+# Keep /etc/flexedge/ if you want to preserve the DB + key for later restore
+sudo userdel flexedge
+```
+
+---
+
+## Option 2 — Standalone Docker with nginx
+
+Single-purpose server where you run the full stack via docker compose. nginx + certbot are containerised alongside the app.
+
+### Steps
+
+```bash
+# 1. Clone the production repo
+git clone https://github.com/smaterazzi/FlexEdgeAdminProd.git /opt/flexedge-admin
+cd /opt/flexedge-admin
+
+# 2. Automated setup (installs Docker, configures Azure, starts everything)
+./deploy.sh
+
+# Or manually:
+cp config/.env.example .env
 ./scripts/azure-setup.sh
-```
-
-This single command handles everything:
-
-1. Creates a Microsoft Entra ID App Registration ("FlexEdgeAdmin")
-2. Configures redirect URIs (localhost for dev, your domain for prod)
-3. Enables ID tokens (required for OIDC login)
-4. Creates a client secret (2-year expiry)
-5. Adds Microsoft Graph permissions: `openid`, `email`, `profile`
-6. Grants admin consent for the permissions
-7. Generates a Flask session secret key
-8. Writes a complete `.env` file with all values
-
-Prerequisites: Azure CLI (`az login`) + Application Administrator or Global Admin role.
-
-Options:
-```bash
-./scripts/azure-setup.sh --domain admin.yourcompany.com   # Add production redirect URI
-./scripts/azure-setup.sh --app-name "My Admin"            # Custom app name
-./scripts/azure-setup.sh --skip-consent                   # Skip admin consent (do manually)
-```
-
-**Manual (if Azure CLI is not available):**
-
-1. Copy `.env`: `cp config/.env.example .env`
-2. Generate Flask secret: `python3 -c "import secrets; print(secrets.token_hex(32))"`
-3. In Azure Portal → Entra ID → App Registrations → New Registration:
-   - Name: `FlexEdgeAdmin`
-   - Redirect URI: `https://admin.yourcompany.com/auth/callback`
-   - Authentication → enable **ID tokens**
-   - Certificates & Secrets → create a Client Secret
-   - API Permissions → add delegated: `openid`, `email`, `profile` → Grant admin consent
-4. Copy Tenant ID, Client ID, Client Secret to `.env`
-
-### 5. Start Services
-
-**Development (no TLS, port 5000):**
-
-```bash
-make dev
-# or: docker compose -f docker/docker-compose.yml up --build
-```
-
-**Production (with nginx + TLS):**
-
-```bash
 make prod
-# or: docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up -d --build
 ```
 
-### 6. First-Run Setup Wizard
+### Production stack
 
-On first start, the application automatically:
+- `flexedge-web` — gunicorn + Flask on internal port 5000
+- `nginx` — reverse proxy with TLS termination (ports 80, 443)
+- `certbot` — auto-renews Let's Encrypt certificates every 12h
 
-- Creates the SQLite database at `config/flexedge.db`
-- Generates the encryption key at `config/encryption.key`
-
-When you open the browser:
-
-1. You are redirected to Microsoft login (Azure AD)
-2. After authentication, the **Setup Wizard** appears
-3. Click **"Create Admin Account & Start"** — your Azure AD email becomes the first admin
-4. You are redirected to the **Admin Portal** (`/admin/`)
-
-The setup wizard is a one-time page — it becomes permanently inaccessible after the first admin is created.
-
-### 7. Configure via Admin Portal
-
-After setup, use the Admin Portal at `/admin/` to:
-
-1. **Add a Tenant** — your SMC server connection (slug, URL, domain, SSL settings)
-2. **Add an API Key** — paste the SMC API key (it will be encrypted and stored; plaintext shown only once)
-3. **Add Users** — enter their Azure AD email, assign a role (admin/viewer), and link them to a tenant + API key
-
-Users can now log in via Azure AD, select their assigned SMC tenant, choose a domain, and start browsing.
-
-### 8. Set Up TLS (Production Only)
-
-After starting services, obtain a Let's Encrypt certificate:
+### First-time TLS setup
 
 ```bash
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
@@ -144,164 +151,234 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
   -d admin.yourcompany.com --email admin@yourcompany.com \
   --agree-tos --non-interactive
 
-# Restart nginx to load the certificate
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml restart nginx
 ```
 
-Certbot auto-renews certificates every 12 hours via the certbot sidecar container.
-
-## Migrating from JSON Config (v1.x)
-
-If you previously used `config/tenants.json` and `config/users.json`:
-
-1. Place both files in the `config/` directory
-2. Log in as admin and go to `/admin/`
-3. Click **"Import from JSON"** on the dashboard
-4. The migration imports tenants, users, API keys, and access mappings
-5. Existing entries are skipped (safe to run multiple times)
-
-After migration, JSON files are no longer needed. You can remove them or keep them as a backup.
-
-## Updating
+### Updating
 
 ```bash
 cd /opt/flexedge-admin
 git pull
 ./deploy.sh --update
-# or: make update
 ```
 
-This pulls the latest code and rebuilds the Docker image. The database and encryption key are preserved (they live in the `config/` volume).
-
-## Uninstalling
+### Uninstalling
 
 ```bash
-# Stop and remove containers — preserves database, encryption key, .env
-./deploy.sh --uninstall
-
-# Full clean slate — DELETES all data, requires typing "PURGE" to confirm
-./deploy.sh --uninstall --purge
+./deploy.sh --uninstall         # stop containers, keep data
+./deploy.sh --uninstall --purge # also delete DB, key, images (irreversible)
 ```
 
-`--uninstall` is safe and reversible — just run `./deploy.sh` again to restart with all your data intact.
+---
 
-`--purge` is **destructive and irreversible**:
+## Option 3 — Docker behind Coolify / Traefik
 
-- Deletes `config/flexedge.db` (all tenants, users, encrypted API keys)
-- Deletes `config/encryption.key` (without it, even DB backups are unreadable)
-- Backs up `.env` to `.env.purged-<timestamp>` (in case you need Azure creds)
-- Deletes `data/projects/` (migration project data)
-- Removes Docker images and certbot TLS volumes
+Best for multi-website hosts. Coolify (a self-hosted Heroku alternative) uses Traefik under the hood and automates TLS, routing, and deployments across many apps on one server.
 
-Use `--purge` only when you want a true fresh start (e.g., before running a test deployment, or after rotating to a new Azure tenant).
+### 3a. Install Coolify on your server (one-time)
 
-## CLI Usage via Docker
-
-CLI tools are available inside the running container:
+SSH to a fresh Ubuntu 22.04+ VPS and run:
 
 ```bash
-# Test connection
+curl -fsSL https://cdn.coollabs.io/coolify/install.sh | sudo bash
+```
+
+The installer sets up Docker, Traefik, the Coolify dashboard, and a persistent database. After ~2 minutes, it prints a URL like `http://<your-server-ip>:8000` — open it and create the root admin account.
+
+### 3b. Configure a server in Coolify
+
+1. Coolify dashboard → **Servers** → **Add a Server**
+2. If running on the same server as Coolify itself, use the default `localhost` server
+3. Otherwise, add a remote server via SSH key
+
+### 3c. Deploy FlexEdgeAdmin
+
+1. **New Resource** → **Docker Compose Empty** (or **Public Repository**)
+
+2. Choose **Public Repository**:
+   - **Repository URL**: `https://github.com/smaterazzi/FlexEdgeAdminProd.git`
+   - **Branch**: `main`
+   - **Base Directory**: `/`
+   - **Docker Compose Location**: `/docker/docker-compose.coolify.yml`
+
+3. Click **Save** → Coolify parses the compose file
+
+4. In the **Environment Variables** tab, set:
+
+   ```
+   FLASK_SECRET_KEY=<generate: python3 -c "import secrets; print(secrets.token_hex(32))">
+   AZURE_TENANT_ID=<from Entra ID>
+   AZURE_CLIENT_ID=<from App Registration>
+   AZURE_CLIENT_SECRET=<from Certificates & Secrets>
+   APP_TITLE=FlexEdgeAdmin
+   ```
+
+5. In the **Domains** field (under General), set your FQDN:
+
+   ```
+   https://admin.yourcompany.com
+   ```
+
+   Coolify automatically:
+   - Generates Traefik labels on the container
+   - Requests a Let's Encrypt certificate
+   - Configures HTTP→HTTPS redirect
+   - Routes traffic to the container's port 5000
+
+6. In the **Storages** tab, confirm the two persistent volumes are present:
+   - `flexedge-config` → mounted at `/config` (DB + encryption key)
+   - `flexedge-data` → mounted at `/app/data/projects` (migration data)
+
+7. Click **Deploy** — Coolify pulls the repo, builds the image, starts the container, and provisions TLS
+
+8. **Important Azure AD step**: before users can log in, set the redirect URI in your App Registration to `https://admin.yourcompany.com/auth/callback` (if not already configured by `azure-setup.sh --domain`)
+
+### 3d. First-run setup
+
+1. Open `https://admin.yourcompany.com`
+2. Log in with Azure AD → setup wizard creates the first admin
+3. Admin Portal (`/admin/`) → add tenants, API keys, users
+
+### 3e. Updating
+
+- **Automatic**: In Coolify, enable **Auto Deploy** and set a webhook on the GitHub repo → every push triggers a new build
+- **Manual**: Coolify dashboard → the app → click **Redeploy**
+
+### 3f. Backup
+
+- The `flexedge-config` volume contains both the database and the encryption key — back this up regularly
+- Coolify → **Backups** tab → enable automated backups or configure S3 target
+
+### Why this compose file has no nginx
+
+`docker-compose.coolify.yml` intentionally omits nginx and certbot because:
+
+- Coolify runs Traefik on ports 80/443 for *all* apps on the host — only one reverse proxy allowed
+- Coolify injects Traefik routing labels automatically when you set the Domain
+- TLS certificates are managed by Traefik's ACME provider, shared across all your apps
+
+If you try to use `docker-compose.prod.yml` (which has nginx) with Coolify, port 80/443 will conflict with Traefik.
+
+---
+
+## CLI Usage via Docker (options 2 & 3)
+
+```bash
+# In standalone Docker:
 docker compose -f docker/docker-compose.yml exec flexedge-web \
   python /app/cli/connect.py --tenant prod --api-key YOUR_KEY
 
-# List firewalls
-docker compose -f docker/docker-compose.yml exec flexedge-web \
-  python /app/cli/firewall.py --tenant prod --api-key YOUR_KEY list
-
-# Or use the Makefile shortcut
-make cli CMD="--tenant prod --api-key YOUR_KEY"
+# In Coolify — use the "Terminal" button in the app's UI, or:
+docker exec -it flexedge-admin python /app/cli/connect.py --tenant prod --api-key YOUR_KEY
 ```
 
-To avoid passing `--api-key` every time, set `SMC_API_KEY` and `DEFAULT_TENANT` in `.env`:
+For Option 1 (standalone), CLI tools run natively:
 
 ```bash
-# In .env:
-SMC_API_KEY=your-cli-api-key
-DEFAULT_TENANT=prod
-
-# Then:
-docker compose -f docker/docker-compose.yml exec flexedge-web \
-  python /app/cli/connect.py
+sudo -u flexedge /opt/flexedge/cli/smc.sh --tenant prod connect
 ```
+
+---
 
 ## Backup & Restore
 
 ### Critical files
 
-| File | Purpose | Recovery without it |
-| ---- | ------- | ------------------- |
-| `config/flexedge.db` | SQLite database (tenants, users, encrypted API keys) | All admin config lost |
-| `config/encryption.key` | Fernet encryption key (binary FXEK format) | API keys in DB become unreadable |
+| File | Purpose | Without it |
+| ---- | ------- | ---------- |
+| `flexedge.db` | SQLite database | All admin config lost |
+| `encryption.key` | Fernet encryption key | API keys become unreadable |
 | `.env` | Azure AD credentials, Flask secret | Must be recreated manually |
 
-### Backup via Admin Portal
+### Location by deployment
 
-The easiest method: go to `/admin/` and click **"Download Backup"**. This creates a ZIP containing `flexedge.db` and `encryption.key`.
+| Option | Path |
+| ------ | ---- |
+| Standalone | `/etc/flexedge/` |
+| Docker + nginx | `<project>/config/` |
+| Coolify | Persistent volume `flexedge-config` (mounted at `/config` in container) |
 
-### Backup via command line
+### Backup methods
 
-```bash
-#!/bin/bash
-BACKUP_DIR="/opt/backups/flexedge-$(date +%Y%m%d)"
-mkdir -p "$BACKUP_DIR"
-cp config/flexedge.db config/encryption.key .env "$BACKUP_DIR/"
-cp -r data/projects/ "$BACKUP_DIR/projects/" 2>/dev/null
-echo "Backup saved to $BACKUP_DIR"
-```
+- **Admin Portal → Backup**: downloads a ZIP with `flexedge.db` + `encryption.key` (works in all 3 options)
+- **Manual**: copy the files from the location above to secure storage
+- **Coolify**: use the built-in backup feature with S3 target
 
 ### Restore
 
-1. Place `flexedge.db` and `encryption.key` in the `config/` directory
-2. Place `.env` at the project root
-3. Start the application: `make dev` or `make prod`
-4. All tenants, users, and API keys are restored
+Place `flexedge.db`, `encryption.key`, and `.env` in the correct location, then restart. All tenants, users, and API keys are restored.
 
-Without `encryption.key`, the API keys stored in the database are permanently irrecoverable. This is by design.
+Without `encryption.key`, API keys stored in the database are permanently irrecoverable. This is by design.
+
+---
+
+## Publishing a Clean Release
+
+The development repository may contain client-specific migration scripts and data. To publish a sanitized version to the public repo:
+
+```bash
+./scripts/pack-release.sh                       # Build, commit, push (default)
+./scripts/pack-release.sh --no-push             # Build and commit only
+./scripts/pack-release.sh --message "v2.1.0"    # Custom commit message
+```
+
+The script builds a clean `./FlexEdgeAdminProd/` folder, sanitizes client data, runs a leak-detection scan, commits, and pushes to `https://github.com/smaterazzi/FlexEdgeAdminProd.git`. See [CLAUDE.md § Publishing & Release](../CLAUDE.md#publishing--release) for the full workflow.
+
+---
 
 ## Troubleshooting
 
-### Container won't start
+### Container/service won't start
 
 ```bash
-# Check logs
+# Docker (options 2 & 3)
 docker compose -f docker/docker-compose.yml logs -f flexedge-web
 
-# Common issues:
-# - "Encryption key file not found" → first run should auto-generate it;
-#   check that config/ directory is writable and mounted correctly
-# - "FLASK_SECRET_KEY is not set" → generate: python3 -c "import secrets; print(secrets.token_hex(32))"
-# - Azure AD errors → check AZURE_TENANT_ID, CLIENT_ID, CLIENT_SECRET in .env
+# Standalone (option 1)
+sudo journalctl -u flexedge.service -n 50
 ```
+
+Common issues:
+
+- `FLASK_SECRET_KEY is not set` → generate: `python3 -c "import secrets; print(secrets.token_hex(32))"`
+- `Encryption key file not found` → ensure `config/` directory is writable
+- `Azure AD errors` → verify `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET` in `.env`
 
 ### Login redirects to wrong URL
 
-If behind a reverse proxy, ensure the proxy sets `X-Forwarded-Proto: https` and `X-Forwarded-For` headers. The app includes `ProxyFix` middleware for this. The nginx config in `docker/nginx.conf` handles this automatically.
+The app runs behind a reverse proxy in all three options. The proxy must set `X-Forwarded-Proto: https` and `X-Forwarded-For` headers. The app includes `ProxyFix` middleware to handle this — nginx, Traefik/Coolify, and Apache all set these headers by default.
+
+If Azure AD reports "redirect URI mismatch": confirm the exact URL in the App Registration matches what the app generates. For Coolify, it must be `https://<your-domain>/auth/callback`.
 
 ### Setup wizard doesn't appear
 
-The setup wizard only shows when the database has zero users. If you need to re-run setup:
+The setup wizard only shows when the database has zero users. To re-run setup:
 
 ```bash
-# Remove the database (WARNING: deletes all admin config)
-rm config/flexedge.db
-# Restart
-make dev
+# Option 1 — standalone
+sudo systemctl stop flexedge
+sudo rm /etc/flexedge/flexedge.db
+sudo systemctl start flexedge
+
+# Option 2 — docker + nginx
+rm config/flexedge.db; make dev
+
+# Option 3 — Coolify
+# Use the "Terminal" to delete /config/flexedge.db, then redeploy
 ```
 
 ### SMC connection fails
 
+Verify the server can reach your Forcepoint SMC (firewall, VPN, routing). From inside the container (options 2, 3):
+
 ```bash
-# Test from inside the container
-docker compose -f docker/docker-compose.yml exec flexedge-web \
-  python -c "import requests; r = requests.get('https://smc.yourcompany.com:8082', verify=False); print(r.status_code)"
+docker exec flexedge-admin python -c \
+  "import requests; print(requests.get('https://smc.yourcompany.com:8082', verify=False).status_code)"
 ```
 
-Check that the VPS can reach the SMC server (firewall rules, network routing).
-
-### TLS certificate issues
+### TLS certificate issues (option 2 only)
 
 ```bash
-# Check certificate status
 docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
   exec certbot certbot certificates
 
@@ -310,62 +387,18 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml \
   exec certbot certbot renew --force-renewal
 ```
 
-## Publishing a Clean Release
+For Coolify (option 3), TLS is managed automatically by Traefik — check the app's **Logs** tab in Coolify if certificates aren't appearing.
 
-The development repository may contain client-specific migration scripts and data. To publish a sanitized, generic version for public use or distribution:
+---
 
-```bash
-# Build, commit, and push to the public repo (default)
-./scripts/pack-release.sh
+## Architecture Summary
 
-# Build and commit locally without pushing
-./scripts/pack-release.sh --no-push
-
-# Use a custom commit message
-./scripts/pack-release.sh --message "v2.1.0 — admin portal improvements"
-```
-
-### What the release packer does
-
-1. Copies all product code (`cli/`, `webapp/`, `shared/`, `docker/`, `config/*.example`) to `./production/`
-2. Sanitizes client-specific references (firewall names, IP ranges, server URLs)
-3. Removes client-specific files (`scripts/`, `docs/webapp/` archived docs)
-4. Runs an automated verification scan — aborts if any leaked secrets, real server URLs, or client names are found
-5. Commits to the production repo (preserves `.git` and remote config across rebuilds)
-6. Pushes to the configured remote (unless `--no-push`)
-
-### First-time setup
-
-```bash
-# After the first pack, configure the public remote:
-cd production
-git remote add origin https://github.com/smaterazzi/production.git
-cd ..
-
-# From now on, pack-release.sh will push automatically
-./scripts/pack-release.sh
-```
-
-### Updating the public release
-
-```bash
-# Make changes on main, then:
-./scripts/pack-release.sh --message "v2.1.0 — description of changes"
-```
-
-The `production/` folder is gitignored on the main branch and has its own independent git history.
-
-## Architecture Overview
-
-```
-Internet → nginx (TLS) → gunicorn (Flask) → SMC API
-                ↑                  ↑
-         certbot (renew)    SQLite DB (encrypted)
-```
-
-- **nginx**: Reverse proxy, TLS termination, security headers
-- **gunicorn**: WSGI server running the Flask app (2 workers, 120s timeout)
-- **certbot**: Automatic Let's Encrypt certificate renewal
-- **Flask app**: FlexEdgeAdmin — Admin Portal + SMC Explorer + Migration Manager
-- **SQLite**: Tenant, user, and API key storage with Fernet field-level encryption
-- **CLI tools**: Available inside the container via `docker exec`
+| Component | Option 1 (Standalone) | Option 2 (Docker+nginx) | Option 3 (Coolify) |
+| --------- | --------------------- | ----------------------- | ------------------ |
+| Reverse proxy | nginx (host) | nginx container | Traefik (Coolify) |
+| TLS | certbot (host) | certbot container | Traefik + Let's Encrypt |
+| App server | gunicorn (systemd) | gunicorn (container) | gunicorn (container) |
+| Database | SQLite in `/etc/flexedge/` | SQLite in bind mount | SQLite in named volume |
+| Process manager | systemd | Docker `restart: unless-stopped` | Coolify |
+| Logs | `journalctl` | `docker compose logs` | Coolify UI |
+| Updates | `git pull && installer` | `./deploy.sh --update` | Coolify Redeploy / webhook |

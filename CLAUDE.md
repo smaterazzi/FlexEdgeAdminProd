@@ -60,21 +60,21 @@ FlexEdgeAdmin/
 
 ## Quick Start
 
-### Docker (recommended)
+Three deployment options — see [docs/deployment-guide.md](docs/deployment-guide.md):
+
+| Option | When to use | Command |
+| ------ | ----------- | ------- |
+| **Docker + nginx** | Single-purpose VPS | `./deploy.sh` |
+| **Coolify + Traefik** | Multi-website host | Use `docker/docker-compose.coolify.yml` in Coolify UI |
+
+### Azure AD setup (all options)
 
 ```bash
-# 1. Set up Azure AD and generate .env (automated — requires Azure CLI)
-
-# 2. Start
-make dev                 # Development mode (port 5000)
-# or
-./deploy.sh              # Full automated setup on VPS (offers to run azure-setup.sh)
-
-# 3. Open browser → login via Azure AD → setup wizard creates first admin
-# 4. Admin Portal (/admin/) → add tenants, API keys, users
 ```
 
-If you prefer manual setup: `cp config/.env.example .env` and fill in Azure AD credentials by hand.
+Creates App Registration, enables ID tokens, creates client secret, grants admin consent, writes `.env`. Requires `az login`.
+
+First visit → login via Azure AD → setup wizard creates first admin → Admin Portal (`/admin/`) to add tenants, API keys, users.
 
 ### CLI Tools (standalone, no Docker required)
 
@@ -258,7 +258,7 @@ The private repo (`main` branch) contains client-specific migration scripts and 
 ```
 
 The script:
-1. Copies all product code to `./production/` (gitignored on main)
+1. Copies all product code to `./FlexEdgeAdminProd/` (gitignored on main)
 2. Sanitizes client-specific references (firewall names, IPs, URLs)
 4. Runs an automated scan for leaked secrets, server URLs, and client names
 5. Aborts if any sensitive data is detected
@@ -266,12 +266,12 @@ The script:
 
 **First-time setup** (once):
 ```bash
-cd production
-git remote add origin https://github.com/smaterazzi/production.git
+cd FlexEdgeAdminProd
+git remote add origin https://github.com/smaterazzi/FlexEdgeAdminProd.git
 cd ..
 ```
 
-The `production/.git` directory is preserved across rebuilds — remote config and history persist.
+The `FlexEdgeAdminProd/.git` directory is preserved across rebuilds — remote config and history persist.
 
 ## Key Constraints
 

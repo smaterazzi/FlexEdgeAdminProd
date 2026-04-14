@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- **Three deployment options** documented and supported:
+  - **Standalone**: new `scripts/install-standalone.sh` — native install with
+    Python venv at `/opt/flexedge/`, config at `/etc/flexedge/`, systemd service
+    (`flexedge.service`), nginx site config, certbot-ready
+  - **Docker + nginx**: unchanged `./deploy.sh` flow (full stack via compose)
+  - **Coolify / Traefik**: new `docker/docker-compose.coolify.yml` — no bundled
+    nginx/certbot (Coolify handles TLS, routing, Let's Encrypt via Traefik)
+  - Full 3-option comparison table and per-option instructions in
+    `docs/deployment-guide.md`
 - **Uninstall support** in `deploy.sh`:
   - `--uninstall` — stop/remove containers, preserve all data and config
   - `--uninstall --purge` — full clean slate: deletes DB, encryption key, .env,

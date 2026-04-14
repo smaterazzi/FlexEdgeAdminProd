@@ -1,0 +1,65 @@
+# FlexEdgeAdmin — Coolify / Traefik deployment compose
+#
+# Use this file when deploying via Coolify (or any Traefik-based PaaS).
+# TLS, domain routing, and certificates are handled by the platform — the app
+# only exposes port 5000 internally. No nginx, no certbot in this stack.
+#
+# Coolify UI setup:
+#   1. New Resource → Docker Compose (public repository)
+#   2. Repository: https://github.com/smaterazzi/FlexEdgeAdminProd.git
+#   3. Base directory: /
+#   4. Docker Compose Location: /docker/docker-compose.coolify.yml
+#   5. Configure Environment Variables (from .env.example)
+#   6. Set the Domains field to your FQDN (Coolify auto-generates TLS)
+#
+# Coolify automatically:
+#   - Generates Traefik labels for HTTP→HTTPS redirect
+#   - Requests Let's Encrypt certificate for the domain
+#   - Routes traffic from the domain to this service on port 5000
+#
+# Persistent storage:
+#   The ./config volume mount is managed by Coolify as a persistent volume.
+#   Coolify backs it up according to the project's backup schedule.
+
+services:
+  flexedge-web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: flexedge-admin
+    restart: unless-stopped
+
+    # Internal port only — Coolify/Traefik handles external routing + TLS.
+    # Do NOT publish to host with 'ports:' in Coolify deployments.
+    expose:
+      - "5000"
+
+    volumes:
+      # Persistent volume managed by Coolify (set in UI: Storages tab)
+      - flexedge-config:/config
+      - flexedge-data:/app/data/projects
+
+    environment:
+      # Required — set these in the Coolify UI (Environment Variables tab)
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+
+      # Optional overrides
+      - APP_TITLE=${APP_TITLE:-FlexEdgeAdmin}
+      - FLASK_DEBUG=0
+      - PORT=5000
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/login"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  flexedge-config:
+    driver: local
+  flexedge-data:
+    driver: local
