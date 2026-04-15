@@ -5,6 +5,7 @@ LABEL maintainer="Be TakeOff Sagl" \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    certbot \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

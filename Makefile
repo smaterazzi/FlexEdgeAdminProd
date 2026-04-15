@@ -5,14 +5,22 @@
 COMPOSE_BASE = docker compose -f docker/docker-compose.yml
 COMPOSE_PROD = $(COMPOSE_BASE) -f docker/docker-compose.prod.yml
 
-.PHONY: dev prod stop logs restart build cli setup update
+.PHONY: dev prod dev-raw prod-raw stop logs restart build cli setup update
 
-# Development: build and start with port 5000 exposed
+# Development: guided bootstrap (Docker check, .env setup, Azure AD prompt),
+#              then build + run foreground on port 5000 with live logs.
 dev:
+	@./deploy.sh --dev
+
+# Production: guided bootstrap, then build + run detached with nginx + TLS.
+prod:
+	@./deploy.sh
+
+# Raw docker compose start (skips bootstrap — requires .env already present)
+dev-raw:
 	$(COMPOSE_BASE) up --build
 
-# Production: build and start with nginx + TLS
-prod:
+prod-raw:
 	$(COMPOSE_PROD) up -d --build
 
 # Stop all services

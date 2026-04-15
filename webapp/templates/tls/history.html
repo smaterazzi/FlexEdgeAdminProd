@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{% block title %}TLS — History{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-clock-history"></i> Deployment History</h2>
+
+{% if logs %}
+<div class="card">
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>Time</th><th>Service</th><th>Engine</th>
+                    <th>Action</th><th>Status</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in logs %}
+                <tr>
+                    <td class="small">{{ log.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                    <td>{{ log.deployment.service_name if log.deployment else '—' }}</td>
+                    <td>{{ log.deployment.engine_name if log.deployment else '—' }}</td>
+                    <td>
+                        {% if log.action == 'deploy' %}<i class="bi bi-rocket-takeoff"></i>
+                        {% elif log.action == 'renew' %}<i class="bi bi-arrow-repeat"></i>
+                        {% else %}<i class="bi bi-trash"></i>{% endif %} {{ log.action }}
+                    </td>
+                    <td>
+                        {% if log.status == 'success' %}<span class="badge bg-success">{{ log.status }}</span>
+                        {% else %}<span class="badge bg-danger">{{ log.status }}</span>{% endif %}
+                    </td>
+                    <td>
+                        <button class="btn btn-sm btn-outline-secondary" data-bs-toggle="collapse" data-bs-target="#log-{{ log.id }}">
+                            <i class="bi bi-chevron-down"></i>
+                        </button>
+                    </td>
+                </tr>
+                <tr class="collapse" id="log-{{ log.id }}">
+                    <td colspan="6"><pre class="mb-0 small">{{ log.details }}</pre></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-info">No deployment history yet.</div>
+{% endif %}
+</div>
+{% endblock %}

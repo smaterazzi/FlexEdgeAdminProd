@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}TLS — Certificates{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-file-earmark-lock"></i> Certificates</h2>
+
+{% if managed %}
+<div class="card mb-4">
+    <div class="card-header"><h5 class="mb-0">Tracked Certificates</h5></div>
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr><th>Domain</th><th>Lineage Path</th><th>Last Hash</th><th>Deployments</th><th></th></tr>
+            </thead>
+            <tbody>
+                {% for cert in managed %}
+                <tr>
+                    <td><strong>{{ cert.domain }}</strong></td>
+                    <td><code class="small">{{ cert.certbot_lineage }}</code></td>
+                    <td><code class="text-muted small">{{ cert.last_cert_hash[:16] }}...</code></td>
+                    <td><span class="badge bg-secondary">{{ cert.deployments.count() }}</span></td>
+                    <td>
+                        <form method="post" action="{{ url_for('tls.certificates_untrack', cert_id=cert.id) }}" class="d-inline"
+                              onsubmit="return confirm('Stop tracking {{ cert.domain }}?')">
+                            <button class="btn btn-sm btn-outline-warning"><i class="bi bi-eye-slash"></i> Untrack</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header"><h5 class="mb-0">Discovered Certbot Certificates</h5></div>
+    <div class="card-body">
+        {% if discovered %}
+        <div class="table-responsive">
+            <table class="table table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th>Domain</th><th>Subject CN</th><th>Issuer</th>
+                        <th>Valid Until</th><th>SAN</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for cert in discovered %}
+                    <tr>
+                        <td><strong>{{ cert.domain }}</strong></td>
+                        <td>{{ cert.subject_cn or '—' }}</td>
+                        <td>{{ cert.issuer or '—' }}</td>
+                        <td>
+                            {% if cert.valid_to %}
+                                {{ cert.valid_to.strftime('%Y-%m-%d') }}
+                                {% if cert.is_expired %}
+                                    <span class="badge bg-danger">Expired</span>
+                                {% elif cert.days_until_expiry is not none and cert.days_until_expiry < 30 %}
+                                    <span class="badge bg-warning text-dark">{{ cert.days_until_expiry }}d</span>
+                                {% else %}
+                                    <span class="badge bg-success">{{ cert.days_until_expiry }}d</span>
+                                {% endif %}
+                            {% else %}—{% endif %}
+                        </td>
+                        <td>
+                            {% for san in cert.san_domains[:3] %}
+                                <span class="badge bg-secondary">{{ san }}</span>
+                            {% endfor %}
+                            {% if cert.san_domains|length > 3 %}
+                                <span class="text-muted">+{{ cert.san_domains|length - 3 }}</span>
+                            {% endif %}
+                        </td>
+                        <td>
+                            {% if cert.domain in managed_domains %}
+                                <span class="badge bg-success"><i class="bi bi-check"></i> Tracked</span>
+                            {% else %}
+                                <form method="post" action="{{ url_for('tls.certificates_track') }}" class="d-inline">
+                                    <input type="hidden" name="domain" value="{{ cert.domain }}">
+                                    <input type="hidden" name="lineage_path" value="{{ cert.lineage_path }}">
+                                    <button class="btn btn-sm btn-outline-success"><i class="bi bi-plus"></i> Track</button>
+                                </form>
+                            {% endif %}
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <p class="text-muted mb-0">
+            No certificates found in <code>{{ live_dir }}</code>.
+            Install certbot and issue a certificate first — it is available in the container at
+            <code>certbot certonly --standalone -d example.com</code>.
+        </p>
+        {% endif %}
+    </div>
+</div>
+</div>
+{% endblock %}

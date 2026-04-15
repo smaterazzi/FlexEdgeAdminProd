@@ -1,0 +1,174 @@
+{% extends "base.html" %}
+{% block title %}TLS Manager — Dashboard{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-shield-check"></i> TLS Manager</h2>
+
+<div class="row g-3 mb-4">
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ certificates|length }}</h3>
+                <p class="text-muted mb-0 small">Tracked Certificates</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ deployments|length }}</h3>
+                <p class="text-muted mb-0 small">Total Deployments</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ deployments|selectattr('last_status', 'equalto', 'deployed')|list|length }}</h3>
+                <p class="text-muted mb-0 small">Active</p>
+            </div>
+        </div>
+    </div>
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body text-center">
+                <h3>{{ deployments|selectattr('auto_renew')|list|length }}</h3>
+                <p class="text-muted mb-0 small">Auto-Renew</p>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if deployments %}
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0">Deployments</h5>
+        <a href="{{ url_for('tls.deploy_form') }}" class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> New</a>
+    </div>
+    <div class="table-responsive">
+        <table class="table table-hover mb-0">
+            <thead>
+                <tr>
+                    <th>Service</th><th>Tenant</th><th>Engine</th>
+                    <th>Certificate</th><th>Status</th><th>Last Deployed</th>
+                    <th>Auto-Renew</th><th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for dep in deployments %}
+                <tr>
+                    <td><strong>{{ dep.service_name }}</strong></td>
+                    <td>{{ dep.tenant.name if dep.tenant else '—' }}</td>
+                    <td>{{ dep.engine_name }}</td>
+                    <td>{{ dep.certificate.domain if dep.certificate else '—' }}</td>
+                    <td>
+                        {% if dep.last_status == 'deployed' %}
+                            <span class="badge bg-success">deployed</span>
+                        {% elif dep.last_status == 'failed' %}
+                            <span class="badge bg-danger">failed</span>
+                        {% else %}
+                            <span class="badge bg-secondary">{{ dep.last_status }}</span>
+                        {% endif %}
+                    </td>
+                    <td>{{ dep.last_deployed_at.strftime('%Y-%m-%d %H:%M') if dep.last_deployed_at else '—' }}</td>
+                    <td>{{ 'Yes' if dep.auto_renew else 'No' }}</td>
+                    <td>
+                        <a href="{{ url_for('tls.deploy_execute', deployment_id=dep.id) }}" class="btn btn-sm btn-outline-primary">
+                            <i class="bi bi-play-fill"></i>
+                        </a>
+                        <form method="post" action="{{ url_for('tls.deploy_delete', deployment_id=dep.id) }}" class="d-inline"
+                              onsubmit="return confirm('Delete deployment {{ dep.service_name }}?')">
+                            <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% else %}
+<div class="alert alert-info">
+    No deployments yet. <a href="{{ url_for('tls.certificates_list') }}">Track a certificate</a> first,
+    then <a href="{{ url_for('tls.deploy_form') }}">create a deployment</a>.
+</div>
+{% endif %}
+
+<!-- Activity log -->
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <h5 class="mb-0"><i class="bi bi-journal-text"></i> Activity Log</h5>
+        <div>
+            <button class="btn btn-sm btn-outline-secondary" onclick="filterLogs('all')">All</button>
+            <button class="btn btn-sm btn-outline-danger" onclick="filterLogs('error')">Errors</button>
+            <button class="btn btn-sm btn-outline-success" onclick="filterLogs('ok')">Success</button>
+        </div>
+    </div>
+    {% if activity_logs %}
+    <div class="table-responsive">
+        <table class="table table-sm table-hover mb-0">
+            <thead>
+                <tr>
+                    <th style="width:150px">Time</th>
+                    <th style="width:110px">Category</th>
+                    <th style="width:120px">Action</th>
+                    <th style="width:80px">Status</th>
+                    <th>Target</th>
+                    <th style="width:50px"></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for log in activity_logs %}
+                <tr class="log-row" data-status="{{ log.status }}">
+                    <td class="text-nowrap small">{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+                    <td>
+                        {% if log.category == 'deploy' %}<i class="bi bi-rocket-takeoff"></i>
+                        {% elif log.category == 'certificate' %}<i class="bi bi-file-earmark-lock"></i>
+                        {% elif log.category == 'renewal' %}<i class="bi bi-arrow-repeat"></i>
+                        {% else %}<i class="bi bi-gear"></i>{% endif %}
+                        {{ log.category }}
+                    </td>
+                    <td>{{ log.action }}</td>
+                    <td>
+                        {% if log.status == 'ok' %}<span class="badge bg-success">OK</span>
+                        {% elif log.status == 'error' %}<span class="badge bg-danger">ERROR</span>
+                        {% else %}<span class="badge bg-warning text-dark">{{ log.status|upper }}</span>{% endif %}
+                    </td>
+                    <td class="text-truncate" style="max-width:280px;" title="{{ log.target }}">{{ log.target }}</td>
+                    <td>
+                        {% if log.detail %}
+                        <button class="btn btn-sm btn-outline-secondary py-0 px-1"
+                                data-bs-toggle="collapse" data-bs-target="#activity-{{ log.id }}">
+                            <i class="bi bi-chevron-down"></i>
+                        </button>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% if log.detail %}
+                <tr class="collapse log-detail" id="activity-{{ log.id }}">
+                    <td colspan="6">
+                        <pre class="mb-0 small text-wrap" style="white-space:pre-wrap;background:#0d1117;padding:0.75rem;border-radius:0.25rem;">{{ log.detail }}</pre>
+                    </td>
+                </tr>
+                {% endif %}
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="p-3 text-muted small">No activity yet.</div>
+    {% endif %}
+</div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function filterLogs(status) {
+    document.querySelectorAll('.log-row').forEach(row => {
+        row.style.display = (status === 'all' || row.dataset.status === status) ? '' : 'none';
+    });
+}
+</script>
+{% endblock %}

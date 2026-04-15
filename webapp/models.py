@@ -139,6 +139,88 @@ class UserTenantAccess(db.Model):
         return f"<UserTenantAccess user={self.user_id} tenant={self.tenant_id}>"
 
 
+class ManagedCertificate(db.Model):
+    """A certbot-managed certificate tracked for TLS deployment automation."""
+    __tablename__ = "managed_certificates"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain = db.Column(db.String(512), unique=True, nullable=False, index=True)
+    certbot_lineage = db.Column(db.String(1024), nullable=False)
+    last_cert_hash = db.Column(db.String(64), default="", nullable=False)
+    last_checked_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    deployments = db.relationship("TLSDeployment", back_populates="certificate",
+                                  lazy="dynamic", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<ManagedCertificate {self.domain!r}>"
+
+
+class TLSDeployment(db.Model):
+    """Deployment of a managed certificate to a specific Forcepoint engine."""
+    __tablename__ = "tls_deployments"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    certificate_id = db.Column(db.Integer, db.ForeignKey("managed_certificates.id", ondelete="CASCADE"), nullable=False)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+
+    engine_name = db.Column(db.String(256), nullable=False)
+    service_name = db.Column(db.String(256), nullable=False)
+    public_ipv4 = db.Column(db.String(45), nullable=False)
+    private_ipv4 = db.Column(db.String(45), nullable=False)
+
+    # SMC object names (set by the deployer)
+    tls_credential_name = db.Column(db.String(256), default="", nullable=False)
+    host_public_name = db.Column(db.String(256), default="", nullable=False)
+    host_private_name = db.Column(db.String(256), default="", nullable=False)
+    policy_rule_name = db.Column(db.String(256), default="", nullable=False)
+    policy_section_name = db.Column(db.String(256), default="", nullable=False)
+
+    auto_renew = db.Column(db.Boolean, default=True, nullable=False)
+    last_deployed_at = db.Column(db.DateTime, nullable=True)
+    last_status = db.Column(db.String(32), default="pending", nullable=False)  # pending|deployed|failed
+    last_error = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    certificate = db.relationship("ManagedCertificate", back_populates="deployments")
+    tenant = db.relationship("Tenant")
+    api_key = db.relationship("ApiKey")
+    logs = db.relationship("TLSDeploymentLog", back_populates="deployment",
+                           lazy="dynamic", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<TLSDeployment {self.service_name!r} → {self.engine_name!r}>"
+
+
+class TLSDeploymentLog(db.Model):
+    """Audit log for TLS deployment actions."""
+    __tablename__ = "tls_deployment_logs"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    deployment_id = db.Column(db.Integer, db.ForeignKey("tls_deployments.id", ondelete="CASCADE"), nullable=False)
+    action = db.Column(db.String(64), nullable=False)   # deploy|renew|remove
+    status = db.Column(db.String(32), nullable=False)   # success|failed
+    details = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    deployment = db.relationship("TLSDeployment", back_populates="logs")
+
+
+class TLSActivityLog(db.Model):
+    """Application-wide activity log for TLS operations."""
+    __tablename__ = "tls_activity_logs"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    category = db.Column(db.String(32), nullable=False)
+    action = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(16), nullable=False)
+    target = db.Column(db.String(256), default="", nullable=False)
+    detail = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+
 def enable_wal_mode(app):
     """Enable WAL mode for SQLite after db.init_app(). Call from app setup."""
     with app.app_context():

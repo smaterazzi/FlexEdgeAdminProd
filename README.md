@@ -7,6 +7,7 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 - **Admin Portal** — web-based management of tenants, users, and API keys with encrypted database storage
 - **SMC Explorer** — browse SMC objects, policies, and services in a dark-themed Bootstrap 5 UI
 - **Migration Manager** — 7-step guided workflow to import FortiGate configs into Forcepoint SMC
+- **TLS Manager** — automated certbot → Forcepoint TLS credential lifecycle, engine assignment, inspection rules, and auto-renewal on cert renewal ([full guide](docs/tls-manager.md))
 - **CLI Tools** — command-line firewall management, object queries, and connection testing
 - **Encrypted at rest** — API keys stored with Fernet encryption (AES-128-CBC + HMAC-SHA256)
 - **Multi-tenant, multi-user** — Microsoft Entra ID (Azure AD) authentication with per-user SMC profiles
@@ -31,8 +32,9 @@ git clone https://github.com/smaterazzi/FlexEdgeAdminProd.git FlexEdgeAdmin && c
 sudo ./scripts/install-standalone.sh --domain admin.yourcompany.com
 
 # Option 2: Docker with bundled nginx + certbot
-./deploy.sh                  # Full install (Docker, TLS, Azure setup)
-./deploy.sh --no-tls         # Dev mode on port 5000
+./deploy.sh                  # Full production install (Docker, TLS, Azure setup)
+./deploy.sh --dev            # Dev mode: port 5000, foreground, live logs
+make dev                     # Same as --dev, shorter
 
 # Option 3: Coolify — use docker/docker-compose.coolify.yml via the Coolify UI
 ```
@@ -90,7 +92,7 @@ The development repo may contain client-specific data. Use the release packer to
 ./scripts/pack-release.sh --message "v2.1.0"    # Custom commit message
 ```
 
-The script copies product code to `./FlexEdgeAdminProd/`, strips all client-specific data, runs an automated leak scan, and pushes to the production repo's remote. See [CLAUDE.md](CLAUDE.md#publishing--release) for details.
+The script copies product code to `./FlexEdgeAdminProd/`, strips all client-specific data, runs an automated leak scan, and pushes to [github.com/smaterazzi/FlexEdgeAdminProd](https://github.com/smaterazzi/FlexEdgeAdminProd). Never push `main` to a public remote — git history contains historical secrets. See [CLAUDE.md](CLAUDE.md#publishing--release) for full details.
 
 ## License
 

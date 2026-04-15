@@ -132,6 +132,15 @@ app.register_blueprint(setup_bp)
 from admin import admin_bp
 app.register_blueprint(admin_bp)
 
+# ── TLS Manager ──────────────────────────────────────────────────────────
+
+from tls_manager import tls_bp, init_tls_manager
+app.config.setdefault("CONFIG_DIR", str(Path(__file__).resolve().parent.parent / "config"))
+app.config.setdefault("CERTBOT_LIVE_DIR",
+                      os.environ.get("CERTBOT_LIVE_DIR", "/etc/letsencrypt/live"))
+init_tls_manager(app)
+app.register_blueprint(tls_bp)
+
 
 # ── Session-based SMC config ─────────────────────────────────────────────
 

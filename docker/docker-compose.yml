@@ -30,6 +30,8 @@ services:
       - ../data/projects:/app/data/projects
       # FortiGate config files (optional — for migration reference)
       - ../conf-files:/config/conf-files:ro
+      # Let's Encrypt — for TLS Manager feature (certbot-managed certificates)
+      - /etc/letsencrypt:/etc/letsencrypt:ro
 
     env_file:
       - ../.env

@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{% block title %}TLS — Renewal Hook{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-arrow-repeat"></i> Certbot Renewal Hook</h2>
+
+<div class="row">
+    <div class="col-md-8">
+        <div class="card mb-4">
+            <div class="card-header"><h5 class="mb-0">Deploy Hook Script</h5></div>
+            <div class="card-body">
+                <p>This script runs after each successful certbot renewal. Place it in
+                <code>/etc/letsencrypt/renewal-hooks/deploy/</code> or pass via
+                <code>certbot renew --deploy-hook</code>.</p>
+                <pre class="json-detail"><code>{{ hook_script }}</code></pre>
+                <div class="d-flex gap-2 mt-3">
+                    <button class="btn btn-outline-primary" onclick="navigator.clipboard.writeText(document.querySelector('pre code').textContent)">
+                        <i class="bi bi-clipboard"></i> Copy
+                    </button>
+                    <form method="post" action="{{ url_for('tls.hook_install') }}">
+                        <input type="hidden" name="api_url" value="{{ api_url }}">
+                        <button type="submit" class="btn btn-warning"
+                                onclick="return confirm('Install to /etc/letsencrypt/renewal-hooks/deploy/?')">
+                            <i class="bi bi-download"></i> Install Automatically
+                        </button>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card mb-4">
+            <div class="card-header"><h5 class="mb-0">API Details</h5></div>
+            <div class="card-body small">
+                <dl class="mb-0">
+                    <dt>Webhook URL</dt>
+                    <dd><code>{{ api_url }}/tls/api/renew</code></dd>
+                    <dt>API Token</dt>
+                    <dd><code class="text-truncate d-block" title="{{ api_token }}">{{ api_token }}</code></dd>
+                    <dt>Method</dt>
+                    <dd><code>POST</code></dd>
+                    <dt>Payload</dt>
+                    <dd><code>{"domain": "example.com"}</code></dd>
+                </dl>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header"><h5 class="mb-0">Manual Test</h5></div>
+            <div class="card-body small">
+                <pre class="json-detail"><code>curl -X POST {{ api_url }}/tls/api/renew \
+  -H "Authorization: Bearer {{ api_token }}" \
+  -H "Content-Type: application/json" \
+  -d '{"domain": "example.com"}'</code></pre>
+            </div>
+        </div>
+    </div>
+</div>
+</div>
+{% endblock %}

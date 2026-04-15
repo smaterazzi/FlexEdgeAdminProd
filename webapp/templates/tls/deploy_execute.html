@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}TLS — Execute Deployment{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4">Deployment: {{ deployment.service_name }}</h2>
+
+<div class="row">
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header"><h5 class="mb-0">Configuration</h5></div>
+            <div class="card-body">
+                <dl class="row mb-0 small">
+                    <dt class="col-sm-5">Service Name</dt>
+                    <dd class="col-sm-7">{{ deployment.service_name }}</dd>
+                    <dt class="col-sm-5">Tenant</dt>
+                    <dd class="col-sm-7">{{ deployment.tenant.name if deployment.tenant else '—' }}</dd>
+                    <dt class="col-sm-5">API Key</dt>
+                    <dd class="col-sm-7">{{ deployment.api_key.name if deployment.api_key else '—' }}</dd>
+                    <dt class="col-sm-5">Engine</dt>
+                    <dd class="col-sm-7">{{ deployment.engine_name }}</dd>
+                    <dt class="col-sm-5">Certificate</dt>
+                    <dd class="col-sm-7">{{ deployment.certificate.domain if deployment.certificate else '—' }}</dd>
+                    <dt class="col-sm-5">Public IPv4</dt>
+                    <dd class="col-sm-7"><code>{{ deployment.public_ipv4 }}</code></dd>
+                    <dt class="col-sm-5">Private IPv4</dt>
+                    <dd class="col-sm-7"><code>{{ deployment.private_ipv4 }}</code></dd>
+                    <dt class="col-sm-5">Auto-Renew</dt>
+                    <dd class="col-sm-7">{{ 'Yes' if deployment.auto_renew else 'No' }}</dd>
+                    <dt class="col-sm-5">Status</dt>
+                    <dd class="col-sm-7">
+                        {% if deployment.last_status == 'deployed' %}<span class="badge bg-success">deployed</span>
+                        {% elif deployment.last_status == 'failed' %}<span class="badge bg-danger">failed</span>
+                        {% else %}<span class="badge bg-secondary">{{ deployment.last_status }}</span>{% endif %}
+                    </dd>
+                    {% if deployment.last_deployed_at %}
+                    <dt class="col-sm-5">Last Deployed</dt>
+                    <dd class="col-sm-7">{{ deployment.last_deployed_at.strftime('%Y-%m-%d %H:%M UTC') }}</dd>
+                    {% endif %}
+                </dl>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-6">
+        <div class="card mb-4">
+            <div class="card-header"><h5 class="mb-0">Deployment Pipeline</h5></div>
+            <div class="card-body">
+                <ol class="small mb-3">
+                    <li>Import TLS credential <code>LE-{{ deployment.service_name }}</code></li>
+                    <li>Create host objects <code>{{ deployment.service_name }}-PublicIPv4</code> + <code>-PrivateIPv4</code></li>
+                    <li>Assign credential to engine <strong>{{ deployment.engine_name }}</strong></li>
+                    <li>Create/verify access rule with deep inspection + decryption</li>
+                    <li>Upload policy</li>
+                </ol>
+                <form method="post">
+                    <button type="submit" class="btn btn-warning">
+                        <i class="bi bi-rocket-takeoff"></i> Execute Deployment
+                    </button>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+{% if result %}
+<div class="card">
+    <div class="card-header">
+        <h5 class="mb-0">Result:
+            {% if result.success %}<span class="badge bg-success">Success</span>
+            {% else %}<span class="badge bg-danger">Failed</span>{% endif %}
+        </h5>
+    </div>
+    <div class="card-body">
+        {% if result.error %}<div class="alert alert-danger">{{ result.error }}</div>{% endif %}
+        <table class="table table-sm">
+            <thead><tr><th>Step</th><th>Status</th><th>Detail</th></tr></thead>
+            <tbody>
+                {% for step in result.steps %}
+                <tr>
+                    <td>{{ step.name }}</td>
+                    <td>
+                        {% if step.status == 'ok' %}<i class="bi bi-check-circle-fill text-success"></i>
+                        {% elif step.status == 'warning' %}<i class="bi bi-exclamation-triangle-fill text-warning"></i>
+                        {% else %}<i class="bi bi-x-circle-fill text-danger"></i>{% endif %}
+                        {{ step.status }}
+                    </td>
+                    <td><code class="small">{{ step.detail }}</code></td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endif %}
+</div>
+{% endblock %}

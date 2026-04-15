@@ -10,8 +10,9 @@
 #
 #  Usage:
 #    chmod +x deploy.sh
-#    ./deploy.sh              # Interactive setup
-#    ./deploy.sh --no-tls     # Skip TLS/nginx (development)
+#    ./deploy.sh              # Interactive setup (production, with TLS/nginx)
+#    ./deploy.sh --dev        # Dev mode: foreground, port 5000, live logs
+#    ./deploy.sh --no-tls     # Same as --dev but detached (background)
 #    ./deploy.sh --update     # Pull latest code and rebuild
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -33,6 +34,7 @@ PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 COMPOSE_BASE="-f $PROJECT_DIR/docker/docker-compose.yml"
 COMPOSE_PROD="-f $PROJECT_DIR/docker/docker-compose.prod.yml"
 USE_TLS=true
+DEV_MODE=false
 UPDATE_ONLY=false
 UNINSTALL=false
 PURGE=false
@@ -40,6 +42,7 @@ PURGE=false
 # Parse arguments
 for arg in "$@"; do
     case $arg in
+        --dev)       USE_TLS=false; DEV_MODE=true ;;
         --no-tls)    USE_TLS=false ;;
         --update)    UPDATE_ONLY=true ;;
         --uninstall) UNINSTALL=true ;;
@@ -48,8 +51,9 @@ for arg in "$@"; do
             echo "Usage: ./deploy.sh [OPTIONS]"
             echo ""
             echo "Install / start:"
-            echo "  (no flags)         Install Docker, configure, build, and start with TLS"
-            echo "  --no-tls           Skip TLS/nginx setup (dev mode, port 5000 only)"
+            echo "  (no flags)         Production setup: Docker + nginx + TLS, detached"
+            echo "  --dev              Dev mode: port 5000, foreground, live logs"
+            echo "  --no-tls           Dev mode but detached (runs in background)"
             echo "  --update           Pull latest code and rebuild containers"
             echo ""
             echo "Uninstall:"
@@ -272,21 +276,38 @@ if [ "$USE_TLS" = true ]; then
     echo "    3. Restart nginx: docker compose $COMPOSE_BASE $COMPOSE_PROD restart nginx"
     echo "    4. Open https://YOUR_DOMAIN → login with Azure AD → setup wizard"
     echo "    5. Use the Admin Portal to add tenants, API keys, and users"
+    echo ""
+    print_color "$GREEN" "Useful commands:"
+    echo "    docker compose $COMPOSE_BASE logs -f              # View logs"
+    echo "    docker compose $COMPOSE_BASE down                 # Stop"
+    echo "    ./deploy.sh --update                              # Update & rebuild"
+elif [ "$DEV_MODE" = true ]; then
+    # Foreground mode — user sees logs live, Ctrl+C to stop
+    echo ""
+    print_ok "Starting FlexEdgeAdmin in DEV mode (port 5000, live logs)"
+    SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost')
+    echo ""
+    echo "    Access:   http://${SERVER_IP}:${PORT:-5000}"
+    echo "    First visit: login with Azure AD → setup wizard creates your admin account"
+    echo "    Stop:     Ctrl+C"
+    echo ""
+    # Attached mode — blocks until user exits
+    exec docker compose $COMPOSE_BASE up --build
 else
+    # Legacy --no-tls: detached, quiet
     docker compose $COMPOSE_BASE up -d --build
     echo ""
-    print_ok "FlexEdgeAdmin is running (dev mode, no TLS)"
+    print_ok "FlexEdgeAdmin is running (dev mode, no TLS, detached)"
     SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost')
     echo ""
     echo "    Access: http://${SERVER_IP}:${PORT:-5000}"
     echo ""
     echo "    First visit: login with Azure AD → setup wizard creates your admin account"
     echo "    Then:        Admin Portal (/admin/) → add tenants, API keys, users"
+    echo ""
+    print_color "$GREEN" "Useful commands:"
+    echo "    docker compose $COMPOSE_BASE logs -f              # View logs"
+    echo "    docker compose $COMPOSE_BASE down                 # Stop"
+    echo "    ./deploy.sh --update                              # Update & rebuild"
 fi
-
-echo ""
-print_color "$GREEN" "Useful commands:"
-echo "    docker compose $COMPOSE_BASE logs -f              # View logs"
-echo "    docker compose $COMPOSE_BASE down                 # Stop"
-echo "    ./deploy.sh --update                              # Update & rebuild"
 echo ""

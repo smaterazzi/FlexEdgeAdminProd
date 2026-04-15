@@ -4,6 +4,40 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.1.0] - 2026-04-15
+
+### Added
+
+- **TLS Manager** — new admin-only feature (`/tls/*`) that automates TLS certificate lifecycle for Forcepoint NGFW engines, bridging Let's Encrypt (certbot) with the SMC API:
+  - Track certbot-managed certificates (reads `/etc/letsencrypt/live/`)
+  - Deploy pipeline: import cert as `TLSServerCredential`, create host objects, assign to engine TLS inspection, create access rule with deep inspection + file filtering + decryption, upload policy
+  - Reuses existing `Tenant` + `ApiKey` models — no duplicate SMC connection config
+  - Renewal webhook (`POST /tls/api/renew`, Bearer-token auth) callable by certbot's deploy-hook
+  - In-app deploy-hook generator + auto-installer (writes to `/etc/letsencrypt/renewal-hooks/deploy/`)
+  - Activity log on dashboard: every operation, full error details, filterable by status
+  - Supports domain-scoped API keys (keys that can't enumerate admin domains use their API client name as a domain hint)
+- **Certbot in the main Docker image** — `apt install certbot` added to `docker/Dockerfile`
+- **`/etc/letsencrypt` volume mount** added to `docker/docker-compose.yml` (read-only)
+- **New DB tables** (auto-created on first boot): `managed_certificates`, `tls_deployments`, `tls_deployment_logs`, `tls_activity_logs`
+- **Documentation**: new `docs/webapp/TLS-MANAGER.md` with the full workflow
+
+### Changed
+
+- Sidebar nav now includes a "TLS Manager" section (admin-only)
+- `CLAUDE.md` updated with the TLS Manager feature description and DB schema additions
+
+### Removed
+
+- Standalone `FlexEdgeTLSManagement/` folder and its `.gitignore` entry (merged into the main webapp as a Blueprint)
+
+### Changed — developer ergonomics
+
+- `deploy.sh --dev` — new explicit dev flag that runs the guided bootstrap (Docker check, `.env` setup, Azure AD prompt), then `docker compose up --build` in the **foreground** with live logs (Ctrl+C to stop)
+- `make dev` now routes through `./deploy.sh --dev` so first-time setup works without manually creating `.env`. Previously it failed if `.env` was missing.
+- `make prod` now routes through `./deploy.sh` (production with TLS)
+- `make dev-raw` / `make prod-raw` — new escape hatches for the raw `docker compose` commands (CI, debugging) that skip the bootstrap
+- `--no-tls` kept as a detached (background) dev mode for CI/automation
+
 ## [2.0.0] - 2026-04-12
 
 ### Added

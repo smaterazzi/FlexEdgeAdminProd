@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}TLS — New Deployment{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-rocket-takeoff"></i> New TLS Deployment</h2>
+
+<div class="card" style="max-width: 720px;">
+    <div class="card-body">
+        <form method="post" id="deployForm">
+            <div class="mb-3">
+                <label class="form-label">Certificate</label>
+                <select name="certificate_id" class="form-select" required>
+                    <option value="">Select a tracked certificate...</option>
+                    {% for c in certificates %}<option value="{{ c.id }}">{{ c.domain }}</option>{% endfor %}
+                </select>
+                {% if not certificates %}
+                <div class="form-text text-warning">
+                    No tracked certificates. <a href="{{ url_for('tls.certificates_list') }}">Track one</a>.
+                </div>
+                {% endif %}
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">Tenant (SMC connection)</label>
+                <select name="tenant_id" id="tenantSelect" class="form-select" required>
+                    <option value="">Select a tenant...</option>
+                    {% for t in tenants %}<option value="{{ t.id }}">{{ t.name }} ({{ t.smc_url }})</option>{% endfor %}
+                </select>
+                <div class="form-text">Tenants are managed in the
+                    <a href="{{ url_for('admin.tenants') }}">Admin Portal</a>.</div>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">API Key</label>
+                <select name="api_key_id" id="apiKeySelect" class="form-select" required>
+                    <option value="">Select tenant first...</option>
+                </select>
+            </div>
+
+            <div class="mb-3">
+                <label class="form-label">Target Engine</label>
+                <select name="engine_name" id="engineSelect" class="form-select" required>
+                    <option value="">Select API key first...</option>
+                </select>
+                <div id="engineTls" class="form-text"></div>
+            </div>
+
+            <hr>
+            <h5>Service Details</h5>
+            <div class="mb-3">
+                <label class="form-label">Service Name</label>
+                <input type="text" name="service_name" class="form-control" required
+                       placeholder="e.g. FlexEdgeAdmin, WebPortal">
+                <div class="form-text">Used to name the TLS credential, host objects, and policy section.</div>
+            </div>
+
+            <div class="row">
+                <div class="col-md-6 mb-3">
+                    <label class="form-label">Public IPv4</label>
+                    <input type="text" name="public_ipv4" class="form-control" required
+                           placeholder="203.0.113.10" pattern="[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+">
+                </div>
+                <div class="col-md-6 mb-3">
+                    <label class="form-label">Private IPv4</label>
+                    <input type="text" name="private_ipv4" class="form-control" required
+                           placeholder="10.0.1.50" pattern="[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+">
+                </div>
+            </div>
+
+            <div class="mb-3 form-check">
+                <input type="checkbox" name="auto_renew" class="form-check-input" id="autoRenew" checked>
+                <label class="form-check-label" for="autoRenew">Auto-renew on certbot renewal</label>
+            </div>
+
+            <div class="d-flex gap-2">
+                <button type="submit" class="btn btn-primary"><i class="bi bi-rocket-takeoff"></i> Create Deployment</button>
+                <a href="{{ url_for('tls.dashboard') }}" class="btn btn-secondary">Cancel</a>
+            </div>
+        </form>
+    </div>
+</div>
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+const tenantSel = document.getElementById('tenantSelect');
+const keySel = document.getElementById('apiKeySelect');
+const engineSel = document.getElementById('engineSelect');
+const engineTls = document.getElementById('engineTls');
+
+tenantSel.addEventListener('change', async function() {
+    keySel.innerHTML = '<option value="">Loading...</option>';
+    engineSel.innerHTML = '<option value="">Select API key first...</option>';
+    engineTls.textContent = '';
+    if (!this.value) return;
+    try {
+        const r = await fetch(`/tls/api/tenants/${this.value}/api-keys`);
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+        keySel.innerHTML = '<option value="">Select an API key...</option>';
+        data.forEach(k => {
+            const o = document.createElement('option');
+            o.value = k.id; o.textContent = k.name;
+            keySel.appendChild(o);
+        });
+    } catch(e) {
+        keySel.innerHTML = `<option value="">Error: ${e.message}</option>`;
+    }
+});
+
+keySel.addEventListener('change', async function() {
+    engineSel.innerHTML = '<option value="">Loading engines...</option>';
+    engineTls.textContent = '';
+    const tenantId = tenantSel.value, keyId = this.value;
+    if (!tenantId || !keyId) return;
+    try {
+        const r = await fetch(`/tls/api/tenants/${tenantId}/api-keys/${keyId}/engines`);
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+        engineSel.innerHTML = '<option value="">Select an engine...</option>';
+        data.forEach(e => {
+            const o = document.createElement('option');
+            o.value = e.name; o.textContent = `${e.name} (${e.type})`;
+            engineSel.appendChild(o);
+        });
+    } catch(e) {
+        engineSel.innerHTML = `<option value="">Error: ${e.message}</option>`;
+    }
+});
+
+engineSel.addEventListener('change', async function() {
+    const tenantId = tenantSel.value, keyId = keySel.value, eng = this.value;
+    engineTls.textContent = '';
+    if (!tenantId || !keyId || !eng) return;
+    try {
+        const r = await fetch(`/tls/api/tenants/${tenantId}/api-keys/${keyId}/engines/${encodeURIComponent(eng)}/tls`);
+        const data = await r.json();
+        if (data.error) throw new Error(data.error);
+        if (data.length === 0) {
+            engineTls.innerHTML = '<span class="text-muted">No TLS credentials currently assigned.</span>';
+        } else {
+            engineTls.innerHTML = 'Current TLS credentials: ' +
+                data.map(c => `<span class="badge bg-info">${c.name}</span>`).join(' ');
+        }
+    } catch(e) {
+        engineTls.textContent = 'Could not load TLS info: ' + e.message;
+    }
+});
+</script>
+{% endblock %}

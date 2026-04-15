@@ -162,6 +162,18 @@ git pull
 ./deploy.sh --update
 ```
 
+### Local development
+
+For local development on a workstation, skip nginx/TLS and run in foreground with live logs:
+
+```bash
+./deploy.sh --dev     # or: make dev
+```
+
+Same guided bootstrap as production (Docker check, `.env` creation, optional `azure-setup.sh`), then `docker compose up --build` attached — Ctrl+C to stop. Access the app at `http://localhost:5000`.
+
+For CI or background use, `./deploy.sh --no-tls` runs the same stack detached.
+
 ### Uninstalling
 
 ```bash
@@ -309,6 +321,53 @@ sudo -u flexedge /opt/flexedge/cli/smc.sh --tenant prod connect
 Place `flexedge.db`, `encryption.key`, and `.env` in the correct location, then restart. All tenants, users, and API keys are restored.
 
 Without `encryption.key`, API keys stored in the database are permanently irrecoverable. This is by design.
+
+---
+
+## TLS Manager — certbot integration
+
+The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It reads certbot-managed certificates from `/etc/letsencrypt/live/` inside the application container. Depending on your deployment option:
+
+### Option 1 — Standalone
+
+Certbot is already installed on the host (used for the webapp's own TLS). The `/etc/letsencrypt` directory is directly accessible to the Python process.
+
+No extra configuration needed. Issue a certificate for each service you want to protect:
+
+```bash
+sudo certbot certonly --standalone -d service1.yourcompany.com
+sudo certbot certonly --standalone -d service2.yourcompany.com
+```
+
+They appear automatically in **TLS Manager → Certificates**.
+
+### Option 2 — Docker + nginx
+
+The main image now bundles `certbot`. The `docker/docker-compose.yml` mounts `/etc/letsencrypt:/etc/letsencrypt:ro` into the `flexedge-web` container, so certificates managed by the existing `certbot` container are visible to TLS Manager without extra steps.
+
+To issue a certificate for a *target service* (not the webapp itself):
+
+```bash
+docker compose -f docker/docker-compose.yml \
+  run --rm certbot certonly --webroot -w /var/www/certbot \
+  -d service.yourcompany.com
+```
+
+### Option 3 — Coolify / Traefik
+
+The webapp's own TLS is handled by Traefik and does not use certbot. To use TLS Manager, either:
+
+1. Run certbot on the **host** and bind-mount `/etc/letsencrypt:/etc/letsencrypt:ro` into the Coolify container (add under "Persistent Storage" in Coolify UI)
+2. Or run a dedicated certbot sidecar container that writes to a shared volume mounted into the FlexEdgeAdmin container
+
+### Renewal hook
+
+Whichever option you use, wire certbot's deploy-hook to FlexEdgeAdmin so deployments re-execute after each renewal:
+
+1. **TLS Manager → Renewal Hook** — shows the ready-to-install shell script + the API token
+2. Copy the script to `/etc/letsencrypt/renewal-hooks/deploy/flexedge-tls-renew.sh` and `chmod +x`, or click **Install Automatically** (requires write access to the hooks dir from the container — works natively in Options 1 and 2)
+
+The script calls `POST /tls/api/renew` with the renewed domain. All deployments linked to that certificate (and with auto-renew enabled) are re-deployed automatically, including SMC policy upload.
 
 ---
 
