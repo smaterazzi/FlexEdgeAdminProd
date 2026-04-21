@@ -353,51 +353,82 @@ def policy_upload(engine_name: str, policy_name: str = None) -> str:
 # Discovery
 # ---------------------------------------------------------------------------
 
-def list_engines() -> list:
+def list_engines(debug: bool = False) -> list:
     """
     Enumerate every engine visible to the current session, regardless of type
     (Layer3/Layer2 firewalls, clusters, master engines, virtual engines, IPS, etc.).
 
-    Uses the generic Engine class which walks all engine subclasses. This way
-    TLS Manager can target any engine type that supports TLS inspection.
-    """
-    engines = []
-    seen_hrefs = set()
+    Three-stage discovery:
+      1. Generic Engine.objects.all() — smc-python's native cross-type query
+      2. Per-subclass enumeration — belt-and-suspenders for older smc-python
+      3. Raw REST /elements/engine_clusters — catches anything the library
+         abstraction misses. engine_clusters is the SMC API's native
+         entry point that returns ALL engine types in one response.
 
-    # Primary path: generic Engine class enumerates all engine types at once
+    Each engine gets a 'sources' field listing which stages saw it, useful
+    for debugging discovery gaps.
+    """
+    engines_by_href: dict[str, dict] = {}
+
+    def _add(href: str, name: str, typeof: str, source: str):
+        if href not in engines_by_href:
+            engines_by_href[href] = {
+                "name": name, "type": typeof, "href": href, "sources": [],
+            }
+        if source not in engines_by_href[href]["sources"]:
+            engines_by_href[href]["sources"].append(source)
+
+    # Stage 1: Engine.objects.all()
     try:
         from smc.core.engine import Engine
         for eng in Engine.objects.all():
-            if eng.href in seen_hrefs:
-                continue
-            seen_hrefs.add(eng.href)
-            engines.append({"name": eng.name, "type": eng.typeof, "href": eng.href})
+            _add(eng.href, eng.name, eng.typeof, "generic")
     except Exception as e:
-        logger.warning("Engine.objects.all() failed: %s — falling back to subclass enumeration", e)
+        logger.warning("Engine.objects.all() failed: %s", e)
 
-    # Fallback / supplement: enumerate every known subclass in case the generic
-    # query missed anything (older SMC versions, custom engine types)
+    # Stage 2: per-subclass enumeration
     from smc.core import engines as engines_mod
-    subclasses = []
     for cls_name in ("Layer3Firewall", "Layer2Firewall", "FirewallCluster",
                      "Layer2Cluster", "Layer3VirtualEngine",
                      "MasterEngine", "MasterEngineCluster",
                      "IPS", "VirtualIPS", "VirtualLayer2", "CloudSGSingleFW"):
         cls = getattr(engines_mod, cls_name, None)
-        if cls is not None:
-            subclasses.append(cls)
-
-    for cls in subclasses:
+        if cls is None:
+            continue
         try:
             for eng in cls.objects.all():
-                if eng.href in seen_hrefs:
-                    continue
-                seen_hrefs.add(eng.href)
-                engines.append({"name": eng.name, "type": eng.typeof, "href": eng.href})
+                _add(eng.href, eng.name, eng.typeof, cls_name)
         except Exception as e:
-            logger.debug("%s.objects.all() failed: %s", cls.__name__, e)
+            logger.debug("%s.objects.all() failed: %s", cls_name, e)
 
-    return sorted(engines, key=lambda e: e["name"].lower())
+    # Stage 3: raw REST /elements/engine_clusters — catches anything the
+    # library abstractions might miss. This endpoint is a "super-set" in SMC.
+    try:
+        s = session.session
+        base = f"{session.url}/{session.api_version}"
+        for ep in ("engine_clusters", "single_fw", "fw_cluster",
+                   "virtual_fw", "master_engine", "single_layer2",
+                   "layer2_cluster", "single_ips", "virtual_ips",
+                   "virtual_firewall_layer2", "cloud_single_fw"):
+            try:
+                r = s.get(f"{base}/elements/{ep}", verify=False, timeout=30)
+                if r.status_code == 200:
+                    for item in r.json().get("result", []):
+                        href = item.get("href", "")
+                        name = item.get("name", "")
+                        typeof = item.get("type", "")
+                        if href and name:
+                            _add(href, name, typeof, f"rest:{ep}")
+            except Exception as e:
+                logger.debug("REST /%s failed: %s", ep, e)
+    except Exception as e:
+        logger.warning("Raw REST engine enumeration failed: %s", e)
+
+    result = sorted(engines_by_href.values(), key=lambda e: e["name"].lower())
+    if not debug:
+        # Strip the "sources" field for the public API unless debug was requested
+        return [{k: v for k, v in e.items() if k != "sources"} for e in result]
+    return result
 
 
 def list_policies() -> list:

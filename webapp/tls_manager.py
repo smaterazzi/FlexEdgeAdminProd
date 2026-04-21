@@ -270,7 +270,36 @@ def api_tenant_engines(tenant_id, key_id):
     try:
         with smc_session(cfg):
             engines = list_engines()
+        _log_activity("deploy", "fetch_engines", "ok", f"{tenant.name}/{key.name}",
+                      f"Returned {len(engines)} engine(s): " +
+                      ", ".join(f"{e['name']} ({e['type']})" for e in engines))
         return jsonify(engines)
+    except Exception as e:
+        _log_activity("deploy", "fetch_engines", "error",
+                      f"{tenant.name}/{key.name}", str(e))
+        return jsonify({"error": str(e)}), 500
+
+
+@tls_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/debug")
+@admin_required
+def api_tenant_engines_debug(tenant_id, key_id):
+    """Diagnostic: return all engines with per-source attribution so we can
+    see exactly which discovery stage saw each engine (generic / subclass /
+    raw REST). Useful when an engine is expected but not appearing."""
+    tenant = db.session.get(Tenant, tenant_id)
+    key = db.session.get(ApiKey, key_id)
+    if not tenant or not key:
+        return jsonify({"error": "Not found"}), 404
+    cfg = _smc_cfg_from_tenant(tenant, key)
+    try:
+        with smc_session(cfg):
+            engines = list_engines(debug=True)
+        return jsonify({
+            "tenant": tenant.name,
+            "domain": tenant.default_domain,
+            "count": len(engines),
+            "engines": engines,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
