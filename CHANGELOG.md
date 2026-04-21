@@ -19,12 +19,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Certbot in the main Docker image** — `apt install certbot` added to `docker/Dockerfile`
 - **`/etc/letsencrypt` volume mount** added to `docker/docker-compose.yml` (read-only)
 - **New DB tables** (auto-created on first boot): `managed_certificates`, `tls_deployments`, `tls_deployment_logs`, `tls_activity_logs`
-- **Documentation**: new `docs/webapp/TLS-MANAGER.md` with the full workflow
+- **Documentation**: new `docs/tls-manager.md` with the full workflow
 
 ### Changed
 
 - Sidebar nav now includes a "TLS Manager" section (admin-only)
 - `CLAUDE.md` updated with the TLS Manager feature description and DB schema additions
+
+### Fixed
+
+- **Engine discovery in TLS Manager** now covers all SMC engine types via the generic `Engine.objects.all()` call (previously only `Layer3Firewall` and `FirewallCluster`, missing virtual engines, master engines, Layer 2 firewalls, IPS, Layer 2 clusters, and cloud engines). Same fix applied to `validate_domain()` engine count and the "visible engines" hint on the connection form. Fallback to per-subclass enumeration if the generic query fails.
 
 ### Removed
 

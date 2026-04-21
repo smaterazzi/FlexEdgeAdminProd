@@ -116,10 +116,8 @@ def _get_api_client_domain_info() -> dict:
         logger.debug("Could not inspect ApiClient: %s", e)
 
     try:
-        from smc.core.engines import Layer3Firewall, FirewallCluster
-        for cls in (Layer3Firewall, FirewallCluster):
-            for eng in cls.objects.all():
-                info["visible_engines"].append(eng.name)
+        from smc.core.engine import Engine
+        info["visible_engines"] = [e.name for e in Engine.objects.all()]
     except Exception:
         pass
     return info
@@ -185,8 +183,8 @@ def validate_domain(url: str, api_key: str, domain: str, api_version: str = "",
         return {"valid": False, "detail": smc_error_detail(exc), "engines": 0}
 
     try:
-        from smc.core.engines import Layer3Firewall, FirewallCluster
-        count = sum(1 for cls in (Layer3Firewall, FirewallCluster) for _ in cls.objects.all())
+        from smc.core.engine import Engine
+        count = sum(1 for _ in Engine.objects.all())
         return {"valid": True, "detail": f"Logged in, {count} engine(s) visible", "engines": count}
     except Exception as e:
         return {"valid": True, "detail": f"Logged in but engine check failed: {e}", "engines": 0}
@@ -356,12 +354,50 @@ def policy_upload(engine_name: str, policy_name: str = None) -> str:
 # ---------------------------------------------------------------------------
 
 def list_engines() -> list:
-    from smc.core.engines import Layer3Firewall, FirewallCluster
+    """
+    Enumerate every engine visible to the current session, regardless of type
+    (Layer3/Layer2 firewalls, clusters, master engines, virtual engines, IPS, etc.).
+
+    Uses the generic Engine class which walks all engine subclasses. This way
+    TLS Manager can target any engine type that supports TLS inspection.
+    """
     engines = []
-    for cls in (Layer3Firewall, FirewallCluster):
-        for eng in cls.objects.all():
+    seen_hrefs = set()
+
+    # Primary path: generic Engine class enumerates all engine types at once
+    try:
+        from smc.core.engine import Engine
+        for eng in Engine.objects.all():
+            if eng.href in seen_hrefs:
+                continue
+            seen_hrefs.add(eng.href)
             engines.append({"name": eng.name, "type": eng.typeof, "href": eng.href})
-    return engines
+    except Exception as e:
+        logger.warning("Engine.objects.all() failed: %s — falling back to subclass enumeration", e)
+
+    # Fallback / supplement: enumerate every known subclass in case the generic
+    # query missed anything (older SMC versions, custom engine types)
+    from smc.core import engines as engines_mod
+    subclasses = []
+    for cls_name in ("Layer3Firewall", "Layer2Firewall", "FirewallCluster",
+                     "Layer2Cluster", "Layer3VirtualEngine",
+                     "MasterEngine", "MasterEngineCluster",
+                     "IPS", "VirtualIPS", "VirtualLayer2", "CloudSGSingleFW"):
+        cls = getattr(engines_mod, cls_name, None)
+        if cls is not None:
+            subclasses.append(cls)
+
+    for cls in subclasses:
+        try:
+            for eng in cls.objects.all():
+                if eng.href in seen_hrefs:
+                    continue
+                seen_hrefs.add(eng.href)
+                engines.append({"name": eng.name, "type": eng.typeof, "href": eng.href})
+        except Exception as e:
+            logger.debug("%s.objects.all() failed: %s", cls.__name__, e)
+
+    return sorted(engines, key=lambda e: e["name"].lower())
 
 
 def list_policies() -> list:
