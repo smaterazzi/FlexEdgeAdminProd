@@ -186,7 +186,19 @@ def inject_globals():
         "active_domain":    session.get("active_domain"),
         "app_title":        os.environ.get("APP_TITLE", "FlexEdgeAdmin"),
         "setup_required":   app.config.get("SETUP_REQUIRED", False),
+        "build_version":    _build_version,
     }
+
+
+from shared.version import get_version
+_build_version = get_version()
+
+
+@app.route("/version")
+def version_info():
+    """Return JSON build version — safe to hit unauthenticated for health checks."""
+    from flask import jsonify
+    return jsonify(_build_version)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -31,8 +31,11 @@ print_warn()  { print_color "$YELLOW" "    ⚠ $1"; }
 print_err()   { print_color "$RED" "    ✗ $1"; }
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_BASE="-f $PROJECT_DIR/docker/docker-compose.yml"
-COMPOSE_PROD="-f $PROJECT_DIR/docker/docker-compose.prod.yml"
+# Use relative paths to avoid word-splitting issues if PROJECT_DIR contains spaces.
+# Every usage below is preceded by `cd "$PROJECT_DIR"`, so relative is safe.
+COMPOSE_BASE="-f docker/docker-compose.yml"
+COMPOSE_PROD="-f docker/docker-compose.prod.yml"
+cd "$PROJECT_DIR"
 USE_TLS=true
 DEV_MODE=false
 UPDATE_ONLY=false
@@ -257,7 +260,15 @@ if [ "$NEEDS_EDIT" = true ]; then
     fi
 fi
 
-# ── Step 4: Build and start ────────────────────────────────────────────
+# ── Step 4: Compute build version metadata ─────────────────────────────
+# Injected into the image as ENV so the web UI can show the running build
+export FLEXEDGE_VERSION=$(grep -m1 -o '## \[[^]]*\]' CHANGELOG.md 2>/dev/null | head -1 | tr -d '[]#' | xargs || echo "dev")
+export FLEXEDGE_COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+export FLEXEDGE_COMMIT_FULL=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+export FLEXEDGE_BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+print_ok "Build metadata: v${FLEXEDGE_VERSION} (${FLEXEDGE_COMMIT}) ${FLEXEDGE_BUILD_DATE}"
+
+# ── Step 5: Build and start ────────────────────────────────────────────
 print_step "Building and starting FlexEdgeAdmin..."
 
 if [ "$USE_TLS" = true ]; then

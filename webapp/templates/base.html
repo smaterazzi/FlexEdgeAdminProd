@@ -240,8 +240,16 @@
             </div>
             {% endif %}
 
-            <div class="px-3 pb-2 text-muted" style="font-size:0.62rem;">
-                {{ app_title }} &middot; v1.0
+            <div class="px-3 pb-2 text-muted" style="font-size:0.62rem;"
+                 title="Version: {{ build_version.version }}&#10;Commit: {{ build_version.commit_full }}&#10;Built: {{ build_version.build_date }}">
+                {{ app_title }} &middot;
+                <a href="{{ url_for('version_info') }}" class="text-muted text-decoration-none"
+                   target="_blank" rel="noopener">
+                    v{{ build_version.version }}
+                    {% if build_version.commit and build_version.commit != 'unknown' %}
+                        <span class="text-secondary">({{ build_version.commit }})</span>
+                    {% endif %}
+                </a>
             </div>
         </nav>
 

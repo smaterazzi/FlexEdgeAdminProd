@@ -18,6 +18,11 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile
+      args:
+        FLEXEDGE_VERSION:     ${FLEXEDGE_VERSION:-dev}
+        FLEXEDGE_COMMIT:      ${FLEXEDGE_COMMIT:-unknown}
+        FLEXEDGE_COMMIT_FULL: ${FLEXEDGE_COMMIT_FULL:-unknown}
+        FLEXEDGE_BUILD_DATE:  ${FLEXEDGE_BUILD_DATE:-unknown}
     container_name: flexedge-admin
     restart: unless-stopped
     ports:
