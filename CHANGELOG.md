@@ -19,7 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - **Certbot in the main Docker image** — `apt install certbot` added to `docker/Dockerfile`
 - **`/etc/letsencrypt` volume mount** added to `docker/docker-compose.yml` (read-only)
 - **New DB tables** (auto-created on first boot): `managed_certificates`, `tls_deployments`, `tls_deployment_logs`, `tls_activity_logs`
-- **Documentation**: new `docs/tls-manager.md` with the full workflow
+- **Documentation**: TLS Manager feature documented inline in `CLAUDE.md` (developer reference) and `docs/deployment-guide.md` (operator setup + troubleshooting) — same treatment as Admin Portal and Migration Manager
 
 ### Changed
 

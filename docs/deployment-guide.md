@@ -326,7 +326,17 @@ Without `encryption.key`, API keys stored in the database are permanently irreco
 
 ## TLS Manager — certbot integration
 
-The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It reads certbot-managed certificates from `/etc/letsencrypt/live/` inside the application container. Depending on your deployment option:
+The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It reads certbot-managed certificates from `/etc/letsencrypt/live/` inside the application container.
+
+### Workflow
+
+1. **Issue certificates with certbot** for each service behind a firewall (see per-deployment-option setup below)
+2. **Track** — open **TLS Manager → Certificates**; discovered certificates can be tracked with one click
+3. **Deploy** — **TLS Manager → Deploy**: pick the tracked certificate, a tenant (from Admin Portal), an API key, a target engine, then fill the service name + public/private IPv4
+4. **Execute** — the pipeline imports the cert as a `TLSServerCredential`, creates `{service}-PublicIPv4` / `{service}-PrivateIPv4` host objects, assigns the credential to the engine's TLS inspection, creates an HTTPS access rule with deep inspection + file filtering + decryption in section `Service {name} - TLS Protection`, and uploads the policy
+5. **Auto-renewal** — wire the deploy-hook (below) so every certbot renewal re-runs the full pipeline automatically
+
+### Certbot setup per deployment option
 
 ### Option 1 — Standalone
 
@@ -368,6 +378,30 @@ Whichever option you use, wire certbot's deploy-hook to FlexEdgeAdmin so deploym
 2. Copy the script to `/etc/letsencrypt/renewal-hooks/deploy/flexedge-tls-renew.sh` and `chmod +x`, or click **Install Automatically** (requires write access to the hooks dir from the container — works natively in Options 1 and 2)
 
 The script calls `POST /tls/api/renew` with the renewed domain. All deployments linked to that certificate (and with auto-renew enabled) are re-deployed automatically, including SMC policy upload.
+
+### Troubleshooting TLS Manager
+
+**No certificates in "Discovered"** — check the container can read `/etc/letsencrypt/live/`:
+
+```bash
+docker exec flexedge-admin ls /etc/letsencrypt/live/
+```
+
+Permission denied means the volume mount is missing or read-only is blocking access. Verify `docker/docker-compose.yml` has the mount and certbot has issued at least one certificate.
+
+**Deployment fails with "SMC login failed"** — check the TLS dashboard's Activity Log for the full error. Most likely the tenant's Default Domain in Admin Portal doesn't match what the API key can access. For domain-scoped keys, the Admin Portal connection form auto-suggests the domain name from the API client name.
+
+**An engine is missing from the dropdown** — the engine list covers all SMC types (`single_fw`, `fw_cluster`, `single_layer2`, `layer2_cluster`, `virtual_fw`, `master_engine`, `single_ips`, `virtual_ips`, `virtual_firewall_layer2`, `cloud_single_fw`). If an engine is still missing:
+
+- Check the API key has the engine listed as a *granted element* in SMC Management Client → Administration → Access Rights → API Clients → *key* → Permissions
+- Check the engine belongs to the same admin domain as the tenant's configured login domain
+- The Activity Log records every `fetch_engines` query with the full returned list
+
+**"Could not determine active policy" warning** — the engine has no installed policy. Run `firewall policy-upload --name <engine>` via CLI first, or assign a policy in SMC Management Client.
+
+**Renewal webhook returns 401** — the token in the deploy-hook script no longer matches `/config/.tls_api_token`. Regenerate the script from **TLS Manager → Renewal Hook** and re-install it.
+
+**Deployment succeeds but TLS inspection doesn't work** — verify the policy was actually uploaded (check the "Upload" step detail), the engine's TLS inspection is enabled in SMC Management Client (*{engine} → Add-Ons → TLS Inspection*), and the access rule isn't shadowed by a higher-priority rule (new rules are inserted at position 1 by default but the policy may have higher-priority rules above the auto-managed section).
 
 ---
 

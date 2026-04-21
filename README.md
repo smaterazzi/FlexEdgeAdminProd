@@ -7,7 +7,7 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 - **Admin Portal** — web-based management of tenants, users, and API keys with encrypted database storage
 - **SMC Explorer** — browse SMC objects, policies, and services in a dark-themed Bootstrap 5 UI
 - **Migration Manager** — 7-step guided workflow to import FortiGate configs into Forcepoint SMC
-- **TLS Manager** — automated certbot → Forcepoint TLS credential lifecycle, engine assignment, inspection rules, and auto-renewal on cert renewal ([full guide](docs/tls-manager.md))
+- **TLS Manager** — automated certbot → Forcepoint TLS credential lifecycle, engine assignment, inspection rules, and auto-renewal on cert renewal (setup in [deployment guide](docs/deployment-guide.md#tls-manager--certbot-integration))
 - **CLI Tools** — command-line firewall management, object queries, and connection testing
 - **Encrypted at rest** — API keys stored with Fernet encryption (AES-128-CBC + HMAC-SHA256)
 - **Multi-tenant, multi-user** — Microsoft Entra ID (Azure AD) authentication with per-user SMC profiles
