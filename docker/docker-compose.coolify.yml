@@ -24,7 +24,10 @@
 services:
   flexedge-web:
     build:
-      context: ..
+      # Coolify sets --project-directory to the repo root, so build context
+      # is resolved from there (NOT from the compose file's parent folder).
+      # Using "." keeps docker/Dockerfile reachable as docker/Dockerfile.
+      context: .
       dockerfile: docker/Dockerfile
     container_name: flexedge-admin
     restart: unless-stopped
