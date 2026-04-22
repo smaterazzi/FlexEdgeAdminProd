@@ -13,6 +13,7 @@ Used by:
   - Template context processor in webapp/app.py (sidebar footer)
   - `/version` JSON endpoint for external checks
 """
+import json
 import os
 import subprocess
 from datetime import datetime, timezone
@@ -20,6 +21,7 @@ from functools import lru_cache
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+VERSION_FILE = PROJECT_ROOT / ".version.json"
 
 
 def _git(args: list[str]) -> str | None:
@@ -52,23 +54,32 @@ def get_version() -> dict:
         }
     Cached — resolved once per process.
     """
-    # 1. Env vars first (Docker build-time injection)
+    # 1. Env vars first (Docker build-time injection by deploy.sh / make dev)
     version = os.environ.get("FLEXEDGE_VERSION", "").strip()
     commit = os.environ.get("FLEXEDGE_COMMIT", "").strip()
     commit_full = os.environ.get("FLEXEDGE_COMMIT_FULL", "").strip() or commit
     build_date = os.environ.get("FLEXEDGE_BUILD_DATE", "").strip()
 
-    # 2. Git fallback for dev mode (no env vars set)
+    # 2. Committed .version.json (stamped by pack-release.sh → reaches Coolify
+    #    and other CI/CD deploys that build from the public repo directly)
+    if not (version and commit and build_date):
+        file_data = _read_version_file()
+        if file_data:
+            version = version or file_data.get("version", "")
+            commit = commit or file_data.get("commit", "")
+            commit_full = commit_full or file_data.get("commit_full", commit)
+            build_date = build_date or file_data.get("build_date", "")
+
+    # 3. Git fallback for dev mode (env vars + file both missing)
     if not commit:
         commit = _git(["rev-parse", "--short", "HEAD"]) or "unknown"
     if not commit_full:
         commit_full = _git(["rev-parse", "HEAD"]) or commit
     if not build_date:
-        # Last commit date if git available, otherwise current time
         git_date = _git(["log", "-1", "--format=%cI"])
         build_date = git_date or datetime.now(timezone.utc).isoformat()
 
-    # 3. Version: env > CHANGELOG top entry > "dev"
+    # 4. Version: CHANGELOG top entry > "dev"
     if not version:
         version = _read_version_from_changelog() or "dev"
 
@@ -83,6 +94,16 @@ def get_version() -> dict:
         "build_date": build_date,
         "display": display,
     }
+
+
+def _read_version_file() -> dict | None:
+    """Read .version.json if present (stamped by pack-release.sh)."""
+    if not VERSION_FILE.exists():
+        return None
+    try:
+        return json.loads(VERSION_FILE.read_text())
+    except Exception:
+        return None
 
 
 def _read_version_from_changelog() -> str | None:

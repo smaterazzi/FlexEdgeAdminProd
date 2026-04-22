@@ -251,12 +251,49 @@ The installer sets up Docker, Traefik, the Coolify dashboard, and a persistent d
 2. Log in with Azure AD → setup wizard creates the first admin
 3. Admin Portal (`/admin/`) → add tenants, API keys, users
 
-### 3e. Updating
+### 3e. How new releases reach your customers
+
+The release pipeline has two stages:
+
+**Stage 1 — Publisher (you):**
+
+```bash
+# On your dev machine, when you're ready to publish:
+./scripts/pack-release.sh --message "v2.1.1 — bug fix"
+```
+
+This runs the leak scan, stamps `.version.json` into the release with version + commit + build date, then commits and pushes to [github.com/smaterazzi/FlexEdgeAdminProd](https://github.com/smaterazzi/FlexEdgeAdminProd).
+
+**Stage 2 — Customer Coolify pulls the update:**
+
+Two ways, both fine:
+
+- **Manual** — customer clicks **Redeploy** in the app view in Coolify. Coolify pulls the latest commit from the public repo, rebuilds the Docker image, starts a new container. The sidebar then shows the new version.
+- **Automatic (webhook)** — customer enables *"Automatic Deployment"* in the app's Coolify **General** settings, then adds the Coolify-provided webhook URL as a GitHub webhook on the public repo. Every push to `FlexEdgeAdminProd` triggers an immediate redeploy. You can combine this with deploy-on-branch if you want a "staging" vs "main" split.
+
+### Verifying your customers are on the latest version
+
+```bash
+# What you just published:
+grep -m1 -o '## \[[^]]*\]' CHANGELOG.md   # → ## [2.1.1]
+git rev-parse --short HEAD                 # → abc1234
+
+# What a customer's server reports:
+curl -s https://customer.example.com/version | jq
+```
+
+If the customer's `commit` matches what you just pushed, the update landed. If not, it's one of:
+
+- Their Coolify app hasn't been redeployed yet — tell them to click **Redeploy** (or enable auto-deploy)
+- They're pinned to a specific branch/tag in their Coolify config — check the app's *Git Source* settings
+- Their image cache is stale — in Coolify, use **Rebuild** (not just Redeploy) to force a fresh `docker build`
+
+### 3f. Updating
 
 - **Automatic**: In Coolify, enable **Auto Deploy** and set a webhook on the GitHub repo → every push triggers a new build
 - **Manual**: Coolify dashboard → the app → click **Redeploy**
 
-### 3f. Backup
+### 3g. Backup
 
 - The `flexedge-config` volume contains both the database and the encryption key — back this up regularly
 - Coolify → **Backups** tab → enable automated backups or configure S3 target

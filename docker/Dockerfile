@@ -20,6 +20,12 @@ COPY webapp/  ./webapp/
 COPY cli/     ./cli/
 COPY scripts/ ./scripts/
 
+# Optional: .version.json is stamped by pack-release.sh into FlexEdgeAdminProd
+# and serves as the version source for Coolify/CI deploys that don't set
+# FLEXEDGE_* build args. The ./* wildcard ignores it silently when missing.
+COPY CHANGELOG.md ./CHANGELOG.md
+COPY .version.jso[n] ./
+
 # Create runtime directories
 RUN mkdir -p /app/data/projects /config
 
