@@ -28,7 +28,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- **Engine discovery in TLS Manager** now covers all SMC engine types via the generic `Engine.objects.all()` call (previously only `Layer3Firewall` and `FirewallCluster`, missing virtual engines, master engines, Layer 2 firewalls, IPS, Layer 2 clusters, and cloud engines). Same fix applied to `validate_domain()` engine count and the "visible engines" hint on the connection form. Fallback to per-subclass enumeration if the generic query fails.
+- **Engine discovery in TLS Manager** now covers all SMC engine types via a three-stage cascade: (1) generic `Engine.objects.all()`, (2) per-subclass enumeration (Layer 2 / cluster / virtual / master / IPS / cloud), (3) **raw REST fallback** against `/elements/engine_clusters` and every specific-type endpoint. Each engine gets a list of which stages saw it, exposed via the new diagnostic endpoint. Previously only `Layer3Firewall` and `FirewallCluster` were queried.
+- **Deploy.sh path with spaces** — the script now uses relative compose paths with an upfront `cd "$PROJECT_DIR"`, fixing the "unknown docker command" word-splitting bug when the project lives under a folder with spaces (e.g. iCloud Drive).
+
+### Added — developer/operator visibility
+
+- **Running build version in the web UI** — sidebar footer now shows `v{version} ({commit})` with a tooltip containing the full commit SHA and ISO build date. Click the version to open the `/version` JSON endpoint.
+- **New `/version` endpoint** — returns `{version, commit, commit_full, build_date, display}` as JSON. Unauthenticated, safe for monitoring / uptime checks.
+- **Version metadata injection** — `deploy.sh` auto-computes `FLEXEDGE_VERSION` (from CHANGELOG.md top entry), `FLEXEDGE_COMMIT` (short git SHA), `FLEXEDGE_COMMIT_FULL`, `FLEXEDGE_BUILD_DATE` (UTC ISO-8601) before `docker compose build` and passes them as build args. Dockerfile accepts the args and bakes them into `ENV`. `shared/version.py` reads env vars first, falls back to live `git` for dev mode, and to CHANGELOG parsing for the version string.
+- **TLS engine-fetch activity logging** — every `/api/tenants/<id>/api-keys/<id>/engines` call now writes an entry to `tls_activity_logs` with the returned engine list, so you can see from the dashboard what the API returned without re-opening the browser inspector.
+- **New TLS diagnostic endpoint** `/tls/api/tenants/<tid>/api-keys/<kid>/engines/debug` — returns the full engine list with per-source attribution (which discovery stage saw each engine), used for troubleshooting missing-engine cases.
 
 ### Removed
 

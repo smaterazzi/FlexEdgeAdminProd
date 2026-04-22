@@ -43,6 +43,8 @@ First visit:
 1. Log in with Azure AD → Setup wizard creates your admin account
 2. Admin Portal (`/admin/`) → add tenants, create API keys, invite users
 
+**Check the running version:** sidebar footer shows `v{version} ({commit})`, or `curl https://admin.example.com/version` returns JSON. See [CLAUDE.md § Build Version](CLAUDE.md#build-version) for details.
+
 ### CLI only (no Docker)
 
 ```bash

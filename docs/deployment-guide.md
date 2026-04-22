@@ -419,6 +419,50 @@ The script builds a clean `./FlexEdgeAdminProd/` folder, sanitizes client data, 
 
 ---
 
+## Verifying the running version
+
+Three ways to confirm which build is actually live on a given server:
+
+**1. Web UI sidebar** — every page shows `v{version} ({commit})` in the footer. Hover for the full commit SHA and ISO build date. Click to open `/version` JSON.
+
+**2. `/version` endpoint** (unauthenticated, safe for monitoring):
+
+```bash
+curl -s https://admin.example.com/version | jq
+```
+
+Returns:
+
+```json
+{
+  "version":     "2.1.0",
+  "commit":      "ba60b5b",
+  "commit_full": "ba60b5b0abc...",
+  "build_date":  "2026-04-22T01:02:32Z",
+  "display":     "v2.1.0 (ba60b5b) 2026-04-22"
+}
+```
+
+**3. Docker env** — inspect what was baked into the image at build time:
+
+```bash
+docker exec flexedge-admin env | grep FLEXEDGE_
+```
+
+### Compare against the source repo
+
+```bash
+# Short commit of the latest code:
+git log -1 --format="%h %ci %s"
+
+# Latest released version in CHANGELOG:
+grep -m1 -o '## \[[^]]*\]' CHANGELOG.md
+```
+
+If the `/version` `commit` matches your local `git rev-parse --short HEAD`, the deployed build corresponds to your source tree. If it shows `"commit": "unknown"`, the image was built bypassing `deploy.sh` / `make dev` / `make prod` (e.g. raw `docker compose build`), so the metadata wasn't injected. Rebuild via `./deploy.sh` to fix.
+
+---
+
 ## Troubleshooting
 
 ### Container/service won't start
