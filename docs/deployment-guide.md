@@ -285,8 +285,8 @@ Two ways, both fine:
     --verify https://admin.customerA.com \
     --verify https://admin.customerB.com
 
-# Increase timeout per URL (default is 5 minutes)
-./scripts/pack-release.sh --verify-timeout 900 --verify https://admin.customer.com
+# Increase timeout per URL (default is 30 seconds)
+./scripts/pack-release.sh --verify-timeout 120 --verify https://admin.customer.com
 ```
 
 The script polls each URL every 10 seconds. When the `/version` endpoint's `commit` matches the commit you just pushed, it's flagged **OK**. If it never matches within the timeout, it's flagged **FAIL** with the last-seen version for debugging. Summary example:
