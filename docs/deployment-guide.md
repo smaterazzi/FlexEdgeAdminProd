@@ -273,6 +273,32 @@ Two ways, both fine:
 
 ### Verifying your customers are on the latest version
 
+**Automated (recommended)** — pass `--verify <URL>` to `pack-release.sh` and it polls the customer's `/version` endpoint after pushing until the new commit shows up:
+
+```bash
+# Single customer
+./scripts/pack-release.sh --verify https://admin.customer1.com
+
+# Multiple customers in one run
+./scripts/pack-release.sh \
+    --message "v2.1.1 — urgent fix" \
+    --verify https://admin.customerA.com \
+    --verify https://admin.customerB.com
+
+# Increase timeout per URL (default is 5 minutes)
+./scripts/pack-release.sh --verify-timeout 900 --verify https://admin.customer.com
+```
+
+The script polls each URL every 10 seconds. When the `/version` endpoint's `commit` matches the commit you just pushed, it's flagged **OK**. If it never matches within the timeout, it's flagged **FAIL** with the last-seen version for debugging. Summary example:
+
+```
+    Customer verification:
+      OK   https://admin.customerA.com  →  v2.1.1 (abc1234)
+      FAIL https://admin.customerB.com  →  stuck on v2.1.0 (004c724)
+```
+
+**Manual** — if you don't want the script to wait:
+
 ```bash
 # What you just published:
 grep -m1 -o '## \[[^]]*\]' CHANGELOG.md   # → ## [2.1.1]
@@ -282,7 +308,7 @@ git rev-parse --short HEAD                 # → abc1234
 curl -s https://customer.example.com/version | jq
 ```
 
-If the customer's `commit` matches what you just pushed, the update landed. If not, it's one of:
+If the customer's `commit` doesn't match what you pushed, the update hasn't landed yet:
 
 - Their Coolify app hasn't been redeployed yet — tell them to click **Redeploy** (or enable auto-deploy)
 - They're pinned to a specific branch/tag in their Coolify config — check the app's *Git Source* settings
