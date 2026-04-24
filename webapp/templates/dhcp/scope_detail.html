@@ -1,0 +1,186 @@
+{% extends "base.html" %}
+{% block title %}DHCP Scope — {{ scope.subnet_cidr }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scopes_list') }}">Scopes</a></li>
+    <li class="breadcrumb-item active">{{ scope.engine_name }} / {{ scope.interface_id }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2 class="mb-0">
+    <i class="bi bi-diagram-3"></i>
+    <code>{{ scope.subnet_cidr }}</code>
+    <small class="text-muted">on {{ scope.engine_name }} / interface {{ scope.interface_id }}</small>
+  </h2>
+  <div>
+    {% if scope.enabled_in_flexedge %}
+      <span class="badge bg-success align-middle me-2">Enabled</span>
+      <form method="post" action="{{ url_for('dhcp.scope_disable', scope_id=scope.id) }}" class="d-inline">
+        <button class="btn btn-sm btn-outline-secondary">Disable</button>
+      </form>
+    {% else %}
+      <span class="badge bg-secondary align-middle me-2">Disabled</span>
+      <form method="post" action="{{ url_for('dhcp.scope_enable', scope_id=scope.id) }}" class="d-inline">
+        <button class="btn btn-sm btn-success">Enable</button>
+      </form>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="text-muted small">Gateway</div>
+      <div><code>{{ scope.gateway or '—' }}</code></div>
+    </div></div>
+  </div>
+  <div class="col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="text-muted small">Pool range (from SMC)</div>
+      <div class="small">
+        {% if scope.dhcp_pool_start %}{{ scope.dhcp_pool_start }} &mdash; {{ scope.dhcp_pool_end }}{% else %}—{% endif %}
+      </div>
+    </div></div>
+  </div>
+  <div class="col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="text-muted small">Tenant</div>
+      <div>{{ scope.tenant.name if scope.tenant else '—' }}</div>
+    </div></div>
+  </div>
+  <div class="col-md-3">
+    <div class="card"><div class="card-body">
+      <div class="text-muted small">Label</div>
+      <div>{{ scope.label or scope.interface_label or '—' }}</div>
+    </div></div>
+  </div>
+</div>
+
+<div class="d-flex gap-2 mb-3">
+  {% if scope.enabled_in_flexedge %}
+    <a href="{{ url_for('dhcp.reservation_new', scope_id=scope.id) }}" class="btn btn-primary">
+      <i class="bi bi-plus-lg"></i> New reservation
+    </a>
+    <form method="post" action="{{ url_for('dhcp.scope_sync_hosts', scope_id=scope.id) }}" class="d-inline">
+      <button class="btn btn-outline-secondary" title="Reconcile with SMC Host elements">
+        <i class="bi bi-arrow-clockwise"></i> Sync from SMC
+      </button>
+    </form>
+    <form method="post" action="{{ url_for('dhcp.scope_deploy', scope_id=scope.id) }}" class="d-inline">
+      <button class="btn btn-warning" title="Phase 4 pending — logs intent only">
+        <i class="bi bi-rocket-takeoff"></i> Deploy to engine
+      </button>
+    </form>
+    <form method="post" action="{{ url_for('dhcp.scope_resync', scope_id=scope.id) }}" class="d-inline">
+      <button class="btn btn-outline-warning" title="Manual re-sync — Phase 4 pending">
+        <i class="bi bi-arrow-repeat"></i> Re-sync
+      </button>
+    </form>
+  {% else %}
+    <div class="alert alert-warning flex-grow-1 mb-0">
+      Enable this scope to start adding reservations.
+    </div>
+  {% endif %}
+</div>
+
+<div class="card mb-4">
+  <div class="card-header"><h5 class="mb-0">Reservations</h5></div>
+  {% if reservations %}
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Name</th><th>IP</th><th>MAC</th><th>Status</th><th>Last synced</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in reservations %}
+        <tr>
+          <td><strong>{{ r.smc_host_name }}</strong></td>
+          <td><code>{{ r.ip_address }}</code></td>
+          <td><code>{{ r.mac_address }}</code></td>
+          <td>
+            {% if r.status == 'synced' %}
+              <span class="badge bg-success">synced</span>
+            {% elif r.status == 'out_of_sync' %}
+              <span class="badge bg-warning text-dark">out-of-sync</span>
+            {% elif r.status == 'pending' %}
+              <span class="badge bg-info text-dark">pending</span>
+            {% elif r.status == 'error' %}
+              <span class="badge bg-danger" title="{{ r.last_error }}">error</span>
+            {% else %}
+              <span class="badge bg-secondary">{{ r.status }}</span>
+            {% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {{ r.last_synced_at.strftime('%Y-%m-%d %H:%M') if r.last_synced_at else '—' }}
+          </td>
+          <td>
+            <a href="{{ url_for('dhcp.reservation_edit', reservation_id=r.id) }}"
+               class="btn btn-sm btn-outline-primary">
+              <i class="bi bi-pencil"></i>
+            </a>
+            <form method="post" action="{{ url_for('dhcp.reservation_delete', reservation_id=r.id) }}"
+                  class="d-inline"
+                  onsubmit="return confirm('Delete reservation {{ r.smc_host_name }}?\\nNote: this also deletes the Host object in SMC if the checkbox is set.');">
+              <label class="form-check form-check-inline small text-muted me-1">
+                <input type="checkbox" name="delete_host" value="1" class="form-check-input"> delete Host too
+              </label>
+              <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="p-3 text-muted small">
+    No reservations yet. Use <em>New reservation</em> to create one —
+    it creates a Host element in SMC with the MAC stored in the comment.
+    Alternatively, click <em>Sync from SMC</em> to import existing Host
+    elements that already carry a <code>[flexedge:mac=&hellip;]</code> marker.
+  </div>
+  {% endif %}
+</div>
+
+{% if recent_deploys %}
+<div class="card">
+  <div class="card-header"><h5 class="mb-0">Recent deployments</h5></div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Time</th><th>Action</th><th>Node</th><th>Status</th>
+          <th>Count</th><th>Duration</th><th>Error</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for d in recent_deploys %}
+        <tr>
+          <td class="text-nowrap small">{{ d.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td>{{ d.action }}</td>
+          <td>{{ d.node_index }}{% if d.node_hostname %} ({{ d.node_hostname }}){% endif %}</td>
+          <td>
+            {% if d.status == 'ok' %}<span class="badge bg-success">OK</span>
+            {% elif d.status == 'failed' %}<span class="badge bg-danger">FAIL</span>
+            {% else %}<span class="badge bg-warning text-dark">{{ d.status|upper }}</span>{% endif %}
+          </td>
+          <td>{{ d.reservations_count }}</td>
+          <td class="small">{{ d.duration_ms }} ms</td>
+          <td class="small text-truncate" style="max-width:280px" title="{{ d.error }}">{{ d.error }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+</div>
+{% endblock %}

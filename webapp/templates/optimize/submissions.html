@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block title %}Optimizer Queue{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-3"><i class="bi bi-inbox"></i> Optimizer Review Queue</h4>
+
+    <h6 class="text-muted text-uppercase mb-2" style="font-size:0.7rem; letter-spacing:0.05em;">
+        Pending ({{ pending|length }})
+    </h6>
+    {% if not pending %}
+    <div class="text-muted mb-4" style="font-size:0.85rem;">Nothing awaiting review.</div>
+    {% else %}
+    <div class="table-responsive mb-4">
+        <table class="table table-sm table-dark">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Submitted</th>
+                    <th>By</th>
+                    <th>Tenant</th>
+                    <th>Policy</th>
+                    <th>Findings</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in pending %}
+                <tr>
+                    <td>{{ s.id }}</td>
+                    <td>{{ s.submitted_at.strftime('%Y-%m-%d %H:%M') }} UTC</td>
+                    <td>{{ s.submitted_by.email if s.submitted_by else '—' }}</td>
+                    <td>{{ s.tenant.slug if s.tenant else '—' }}</td>
+                    <td>{{ s.policy_name }}</td>
+                    <td>{{ s.finding_count }}</td>
+                    <td>
+                        <a href="{{ url_for('optimize_submission_detail', sub_id=s.id) }}"
+                           class="btn btn-sm btn-primary">
+                            <i class="bi bi-eye"></i> Review
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+
+    <h6 class="text-muted text-uppercase mb-2" style="font-size:0.7rem; letter-spacing:0.05em;">
+        Recently decided
+    </h6>
+    {% if not decided %}
+    <div class="text-muted" style="font-size:0.85rem;">No decided submissions yet.</div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table table-sm table-dark">
+            <thead>
+                <tr>
+                    <th>#</th>
+                    <th>Reviewed</th>
+                    <th>By</th>
+                    <th>Tenant</th>
+                    <th>Policy</th>
+                    <th>Status</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for s in decided %}
+                <tr>
+                    <td>{{ s.id }}</td>
+                    <td>{{ s.reviewed_at.strftime('%Y-%m-%d %H:%M') if s.reviewed_at else '—' }} UTC</td>
+                    <td>{{ s.reviewed_by.email if s.reviewed_by else '—' }}</td>
+                    <td>{{ s.tenant.slug if s.tenant else '—' }}</td>
+                    <td>{{ s.policy_name }}</td>
+                    <td>
+                        <span class="badge
+                            {% if s.status == 'reviewed' %}bg-info text-dark
+                            {% else %}bg-secondary{% endif %}">
+                            {{ s.status }}
+                        </span>
+                    </td>
+                    <td>
+                        <a href="{{ url_for('optimize_submission_detail', sub_id=s.id) }}"
+                           class="btn btn-sm btn-outline-secondary">
+                            <i class="bi bi-eye"></i> Open
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

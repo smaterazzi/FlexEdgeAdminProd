@@ -33,7 +33,7 @@ sudo ./scripts/install-standalone.sh --domain admin.yourcompany.com
 
 # Option 2: Docker with bundled nginx + certbot
 ./deploy.sh                  # Full production install (Docker, TLS, Azure setup)
-./deploy.sh --dev            # Dev mode: port 5000, foreground, live logs
+./deploy.sh --dev            # Dev mode: port 8088, foreground, live logs
 make dev                     # Same as --dev, shorter
 
 # Option 3: Coolify — use docker/docker-compose.coolify.yml via the Coolify UI

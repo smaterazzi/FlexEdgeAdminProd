@@ -3,7 +3,7 @@
 # Quick start:
 #   1. cp config/.env.example .env                         (edit with Azure AD creds)
 #   2. docker compose -f docker/docker-compose.yml up --build
-#   3. Open http://localhost:5000 → setup wizard creates first admin
+#   3. Open http://localhost:8088 → setup wizard creates first admin
 #   4. Use Admin Portal to add tenants, API keys, and users
 #
 # Legacy JSON config files (tenants.json, users.json) can be imported
@@ -26,7 +26,7 @@ services:
     container_name: flexedge-admin
     restart: unless-stopped
     ports:
-      - "${PORT:-5000}:5000"
+      - "${PORT:-8088}:8088"
 
     volumes:
       # Config directory: database, encryption key, and legacy JSON files
@@ -43,10 +43,10 @@ services:
 
     environment:
       - FLASK_DEBUG=${FLASK_DEBUG:-0}
-      - PORT=${PORT:-5000}
+      - PORT=${PORT:-8088}
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/login"]
+      test: ["CMD", "curl", "-f", "http://localhost:8088/login"]
       interval: 30s
       timeout: 5s
       retries: 3

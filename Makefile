@@ -8,7 +8,7 @@ COMPOSE_PROD = $(COMPOSE_BASE) -f docker/docker-compose.prod.yml
 .PHONY: dev prod dev-raw prod-raw stop logs restart build cli setup update
 
 # Development: guided bootstrap (Docker check, .env setup, Azure AD prompt),
-#              then build + run foreground on port 5000 with live logs.
+#              then build + run foreground on port 8088 with live logs.
 dev:
 	@./deploy.sh --dev
 

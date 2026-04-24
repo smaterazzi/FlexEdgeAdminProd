@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}
+  {% if reservation %}Edit{% else %}New{% endif %} DHCP Reservation
+{% endblock %}
+
+{% set form_values = form_values if form_values is defined else {} %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scopes_list') }}">Scopes</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scope_detail', scope_id=scope.id) }}">{{ scope.subnet_cidr }}</a></li>
+    <li class="breadcrumb-item active">{% if reservation %}Edit{% else %}New{% endif %} reservation</li>
+  </ol>
+</nav>
+
+<h2 class="mb-4">
+  <i class="bi bi-pin-angle"></i>
+  {% if reservation %}Edit reservation{% else %}New reservation{% endif %}
+  <small class="text-muted">on {{ scope.subnet_cidr }}</small>
+</h2>
+
+<form method="post" class="row g-3">
+  <div class="col-md-6">
+    <label class="form-label">Name <span class="text-danger">*</span></label>
+    {% if reservation %}
+      <input type="text" class="form-control" value="{{ reservation.smc_host_name }}" disabled>
+      <div class="form-text">Host name is the SMC element key — cannot be renamed here.</div>
+    {% else %}
+      <input type="text" class="form-control" name="name" required
+             value="{{ form_values.get('name', '') }}"
+             placeholder="e.g. printer-finance-01"
+             pattern="[A-Za-z0-9_.\-]+" maxlength="256">
+      <div class="form-text">Used as the SMC Host object name. Must be unique in the domain.</div>
+    {% endif %}
+  </div>
+
+  <div class="col-md-3">
+    <label class="form-label">IPv4 address <span class="text-danger">*</span></label>
+    <input type="text" class="form-control" name="address" required
+           value="{{ form_values.get('address', reservation.ip_address if reservation else '') }}"
+           placeholder="{{ scope.subnet_cidr.split('/')[0] }}…">
+    <div class="form-text">Must be inside <code>{{ scope.subnet_cidr }}</code>, ideally outside the pool.</div>
+  </div>
+
+  <div class="col-md-3">
+    <label class="form-label">MAC address <span class="text-danger">*</span></label>
+    <input type="text" class="form-control" name="mac_address" required
+           value="{{ form_values.get('mac_address', reservation.mac_address if reservation else '') }}"
+           placeholder="aa:bb:cc:dd:ee:ff"
+           pattern="[0-9a-fA-F:.\-]{11,17}">
+    <div class="form-text">Stored in Host comment as <code>[flexedge:mac=…]</code>.</div>
+  </div>
+
+  <div class="col-md-6">
+    <label class="form-label">IPv6 address <small class="text-muted">(optional)</small></label>
+    <input type="text" class="form-control" name="ipv6_address"
+           value="{{ form_values.get('ipv6_address', host_view.ipv6_address if host_view else '') }}">
+  </div>
+
+  <div class="col-md-6">
+    <label class="form-label">Secondary IPv4s <small class="text-muted">(comma-separated)</small></label>
+    <input type="text" class="form-control" name="secondary"
+           value="{{ form_values.get('secondary', host_view.secondary|join(', ') if host_view else '') }}">
+  </div>
+
+  <div class="col-md-6">
+    <label class="form-label">Tools Profile ref <small class="text-muted">(optional)</small></label>
+    <input type="text" class="form-control" name="tools_profile_ref"
+           value="{{ form_values.get('tools_profile_ref', host_view.tools_profile_ref if host_view else '') }}">
+    <div class="form-text">SMC href of a DeviceToolsProfile — right-click menu for the Host in Management Client.</div>
+  </div>
+
+  <div class="col-md-6">
+    <label class="form-label">Operator comment</label>
+    <textarea class="form-control" name="comment" rows="2"
+              placeholder="Free-form notes — the MAC marker is added automatically.">{{ form_values.get('comment', host_view.comment if host_view else '') }}</textarea>
+  </div>
+
+  <div class="col-12 mt-4 d-flex gap-2">
+    <button type="submit" class="btn btn-primary">
+      <i class="bi bi-check-lg"></i>
+      {% if reservation %}Save changes{% else %}Create reservation{% endif %}
+    </button>
+    <a href="{{ url_for('dhcp.scope_detail', scope_id=scope.id) }}" class="btn btn-outline-secondary">
+      Cancel
+    </a>
+  </div>
+</form>
+
+</div>
+{% endblock %}

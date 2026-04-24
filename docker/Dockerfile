@@ -44,7 +44,7 @@ ENV AZURE_TENANT_ID=""
 ENV AZURE_CLIENT_ID=""
 ENV AZURE_CLIENT_SECRET=""
 ENV FLASK_DEBUG=0
-ENV PORT=5000
+ENV PORT=8088
 ENV APP_TITLE=FlexEdgeAdmin
 
 # ── Build version (injected by build args from deploy.sh / Makefile) ─────
@@ -57,11 +57,11 @@ ENV FLEXEDGE_COMMIT=$FLEXEDGE_COMMIT
 ENV FLEXEDGE_COMMIT_FULL=$FLEXEDGE_COMMIT_FULL
 ENV FLEXEDGE_BUILD_DATE=$FLEXEDGE_BUILD_DATE
 
-EXPOSE 5000
+EXPOSE 8088
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${PORT}/login || exit 1
 
 # Default: run the web app via gunicorn
 # CLI tools available via: docker compose exec flexedge-web python -m cli.connect --tenant prod
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:5000", "--timeout", "120", "--chdir", "/app/webapp", "app:app"]
+CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8088", "--timeout", "120", "--chdir", "/app/webapp", "app:app"]

@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}DHCP Manager — Activity Log{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-journal-text"></i> Activity Log</h2>
+
+{% if logs %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span>Last 500 events</span>
+    <div>
+      <button class="btn btn-sm btn-outline-secondary" onclick="filterLogs('all')">All</button>
+      <button class="btn btn-sm btn-outline-danger" onclick="filterLogs('failed')">Failures</button>
+      <button class="btn btn-sm btn-outline-success" onclick="filterLogs('ok')">Success</button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr>
+          <th style="width:150px">Time</th>
+          <th style="width:110px">Category</th>
+          <th style="width:140px">Action</th>
+          <th style="width:80px">Status</th>
+          <th>Target</th>
+          <th style="width:50px"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for log in logs %}
+        <tr class="log-row" data-status="{{ log.status }}">
+          <td class="text-nowrap small">{{ log.created_at.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+          <td>{{ log.category }}</td>
+          <td>{{ log.action }}</td>
+          <td>
+            {% if log.status == 'ok' %}<span class="badge bg-success">OK</span>
+            {% elif log.status == 'failed' %}<span class="badge bg-danger">FAIL</span>
+            {% else %}<span class="badge bg-warning text-dark">{{ log.status|upper }}</span>{% endif %}
+          </td>
+          <td class="text-truncate" style="max-width:420px" title="{{ log.target }}">{{ log.target }}</td>
+          <td>
+            {% if log.detail %}
+            <button class="btn btn-sm btn-outline-secondary py-0 px-1"
+                    data-bs-toggle="collapse" data-bs-target="#log-{{ log.id }}">
+              <i class="bi bi-chevron-down"></i>
+            </button>
+            {% endif %}
+          </td>
+        </tr>
+        {% if log.detail %}
+        <tr class="collapse log-detail" id="log-{{ log.id }}">
+          <td colspan="6">
+            <pre class="mb-0 small text-wrap" style="white-space:pre-wrap;background:#0d1117;padding:0.75rem;border-radius:0.25rem;">{{ log.detail }}</pre>
+          </td>
+        </tr>
+        {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+<div class="alert alert-info">No activity yet.</div>
+{% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function filterLogs(status) {
+  document.querySelectorAll('.log-row').forEach(row => {
+    row.style.display = (status === 'all' || row.dataset.status === status) ? '' : 'none';
+  });
+}
+</script>
+{% endblock %}

@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}Rule Optimizer{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-1"><i class="bi bi-magic"></i> Rule Optimizer</h4>
+    <p class="text-muted" style="font-size:0.85rem;">
+        Pick a policy to analyze. Findings are read-only — submit them to an admin for review
+        before acting on anything in SMC.
+    </p>
+
+    <div class="row g-4 mt-1">
+        <div class="col-lg-7">
+            <h6 class="text-muted text-uppercase" style="font-size:0.7rem; letter-spacing:0.05em;">
+                Policies
+            </h6>
+            {% if not policies %}
+            <div class="alert alert-secondary">No firewall policies found in this domain.</div>
+            {% else %}
+            <div class="list-group">
+                {% for p in policies %}
+                <a href="{{ url_for('optimize_report', policy_name=p.name) }}"
+                   class="list-group-item list-group-item-action d-flex justify-content-between align-items-center">
+                    <span>
+                        <i class="bi bi-shield-check text-primary"></i>
+                        {{ p.name }}
+                    </span>
+                    <span class="badge bg-secondary">
+                        <i class="bi bi-play-circle"></i> Analyze
+                    </span>
+                </a>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+
+        <div class="col-lg-5">
+            <h6 class="text-muted text-uppercase" style="font-size:0.7rem; letter-spacing:0.05em;">
+                My recent submissions
+            </h6>
+            {% if not my_submissions %}
+            <div class="text-muted" style="font-size:0.85rem;">
+                You haven't submitted any findings yet.
+            </div>
+            {% else %}
+            <div class="list-group">
+                {% for s in my_submissions %}
+                <div class="list-group-item d-flex justify-content-between align-items-start">
+                    <div class="me-2" style="min-width:0;">
+                        <div class="text-truncate" title="{{ s.policy_name }}">
+                            <strong>#{{ s.id }}</strong>
+                            <span class="text-muted">·</span>
+                            {{ s.policy_name }}
+                        </div>
+                        <div class="text-muted" style="font-size:0.72rem;">
+                            {{ s.finding_count }} finding(s) ·
+                            {{ s.submitted_at.strftime('%Y-%m-%d %H:%M') }} UTC
+                        </div>
+                    </div>
+                    <span class="badge
+                        {% if s.status == 'pending' %}bg-warning text-dark
+                        {% elif s.status == 'reviewed' %}bg-info text-dark
+                        {% else %}bg-secondary{% endif %}">
+                        {{ s.status }}
+                    </span>
+                </div>
+                {% endfor %}
+            </div>
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

@@ -6,7 +6,7 @@
 #    1. Python 3.12+ virtualenv at /opt/flexedge/venv
 #    2. Application code at /opt/flexedge/
 #    3. Config + DB + encryption key at /etc/flexedge/
-#    4. systemd service running gunicorn on 127.0.0.1:5000
+#    4. systemd service running gunicorn on 127.0.0.1:8088
 #    5. nginx reverse proxy (with optional Let's Encrypt TLS)
 #
 #  Requires: Ubuntu 22.04+ / Debian 12+, sudo privileges.
@@ -30,7 +30,7 @@ INSTALL_DIR="${INSTALL_DIR:-/opt/flexedge}"
 CONFIG_DIR="${CONFIG_DIR:-/etc/flexedge}"
 SERVICE_USER="${SERVICE_USER:-flexedge}"
 DOMAIN="${DOMAIN:-}"
-PORT="${PORT:-5000}"
+PORT="${PORT:-8088}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

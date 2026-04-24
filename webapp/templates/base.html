@@ -154,6 +154,28 @@
                 </li>
             </ul>
 
+            <div class="section-label">Optimizer</div>
+            <ul class="nav flex-column mb-2">
+                <li class="nav-item">
+                    <a class="nav-link {% if request.path == '/optimize' or request.path.startswith('/optimize/') and '/submissions' not in request.path %}active{% endif %}"
+                       href="{{ url_for('optimize_list') }}">
+                        <i class="bi bi-magic"></i> Rule Optimizer
+                    </a>
+                </li>
+                {% if current_user_role == 'admin' %}
+                <li class="nav-item">
+                    <a class="nav-link d-flex justify-content-between align-items-center
+                              {% if '/optimize/submissions' in request.path %}active{% endif %}"
+                       href="{{ url_for('optimize_submissions') }}">
+                        <span><i class="bi bi-inbox"></i> Review Queue</span>
+                        {% if optimizer_pending_count %}
+                        <span class="badge bg-warning text-dark">{{ optimizer_pending_count }}</span>
+                        {% endif %}
+                    </a>
+                </li>
+                {% endif %}
+            </ul>
+
             {% if current_user_role == 'admin' %}
             <div class="section-label">TLS Manager</div>
             <ul class="nav flex-column mb-2">
@@ -175,6 +197,30 @@
                 <li class="nav-item">
                     <a class="nav-link {% if '/tls/hook' in request.path %}active{% endif %}" href="/tls/hook">
                         <i class="bi bi-arrow-repeat"></i> Renewal Hook
+                    </a>
+                </li>
+            </ul>
+
+            <div class="section-label">DHCP Manager</div>
+            <ul class="nav flex-column mb-2">
+                <li class="nav-item">
+                    <a class="nav-link {% if request.path == '/dhcp/' %}active{% endif %}" href="/dhcp/">
+                        <i class="bi bi-router"></i> Dashboard
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/dhcp/scopes' in request.path %}active{% endif %}" href="/dhcp/scopes">
+                        <i class="bi bi-diagram-3"></i> Scopes
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/dhcp/history' in request.path %}active{% endif %}" href="/dhcp/history">
+                        <i class="bi bi-clock-history"></i> History
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/dhcp/activity' in request.path %}active{% endif %}" href="/dhcp/activity">
+                        <i class="bi bi-journal-text"></i> Activity
                     </a>
                 </li>
             </ul>

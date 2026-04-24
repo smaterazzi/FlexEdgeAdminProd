@@ -1,0 +1,128 @@
+{% extends "base.html" %}
+{% block title %}Optimize · {{ policy_name }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h4 class="mb-0"><i class="bi bi-magic"></i> {{ policy_name }}</h4>
+            <div class="text-muted" style="font-size:0.82rem;">
+                {{ result.rule_count }} active rule(s) analyzed ·
+                {{ result.findings|length }} finding(s)
+            </div>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="{{ url_for('optimize_list') }}" class="btn btn-sm btn-outline-secondary">
+                <i class="bi bi-arrow-left"></i> Back
+            </a>
+            <a href="{{ url_for('policy_rules', policy_name=policy_name) }}"
+               class="btn btn-sm btn-outline-primary">
+                <i class="bi bi-list-ol"></i> View policy
+            </a>
+        </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in messages %}
+      <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ msg|safe }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+      {% endfor %}
+    {% endwith %}
+
+    <div class="row g-3 mb-3">
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body py-2">
+                    <div class="text-muted" style="font-size:0.72rem;">Exact duplicates</div>
+                    <h4 class="mb-0">{{ result.summary.exact_duplicate }}</h4>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card stat-card">
+                <div class="card-body py-2">
+                    <div class="text-muted" style="font-size:0.72rem;">Shadowed rules</div>
+                    <h4 class="mb-0">{{ result.summary.shadowed_same_action }}</h4>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    {% if not result.findings %}
+    <div class="alert alert-success">
+        <i class="bi bi-check-circle"></i> No redundancies detected in this policy.
+    </div>
+    {% else %}
+    <div class="mb-3">
+        <form method="post" action="{{ url_for('optimize_submit', policy_name=policy_name) }}"
+              onsubmit="return confirm('Submit these {{ result.findings|length }} finding(s) for admin review?');">
+            <button type="submit" class="btn btn-primary btn-sm">
+                <i class="bi bi-send"></i> Submit for admin review
+            </button>
+            <span class="text-muted ms-2" style="font-size:0.78rem;">
+                A snapshot of these findings will be sent to an admin. The policy is not modified.
+            </span>
+        </form>
+    </div>
+
+    {% for f in result.findings %}
+    <div class="card mb-3">
+        <div class="card-header d-flex justify-content-between align-items-center">
+            <div>
+                <span class="badge
+                    {% if f.kind == 'exact_duplicate' %}bg-danger
+                    {% else %}bg-warning text-dark{% endif %}">
+                    {{ f.kind }}
+                </span>
+                <strong class="ms-2">{{ f.id }}</strong>
+                <span class="text-muted ms-2" style="font-size:0.8rem;">
+                    primary {{ f.primary_pos }} ·
+                    {{ f.redundant_pos|length }} redundant
+                </span>
+            </div>
+            <span class="badge bg-secondary">{{ f.severity }}</span>
+        </div>
+        <div class="card-body py-2">
+            <div class="text-muted mb-2" style="font-size:0.85rem;">{{ f.rationale }}</div>
+            <div class="table-responsive">
+                <table class="table table-sm table-dark mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width:5rem;">Role</th>
+                            <th style="width:4.5rem;">Pos</th>
+                            <th>Name</th>
+                            <th>Action</th>
+                            <th>Sources</th>
+                            <th>Destinations</th>
+                            <th>Services</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for r in f.rule_snippets %}
+                        <tr {% if loop.first %}class="table-primary"{% endif %}>
+                            <td>
+                                {% if loop.first %}
+                                <span class="badge bg-success">keep</span>
+                                {% else %}
+                                <span class="badge bg-danger">dead</span>
+                                {% endif %}
+                            </td>
+                            <td><code>{{ r.pos }}</code></td>
+                            <td>{{ r.name or '—' }}</td>
+                            <td>{{ r.action }}</td>
+                            <td>{{ r.sources|join(', ') }}</td>
+                            <td>{{ r.destinations|join(', ') }}</td>
+                            <td>{{ r.services|join(', ') }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+    {% endif %}
+</div>
+{% endblock %}

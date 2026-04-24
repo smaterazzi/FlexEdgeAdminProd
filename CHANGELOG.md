@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [2.2.0-dev] - 2026-04-24
+
+### Added — DHCP Reservation Manager (in progress — phases 0, 2, 3 landed)
+
+- **Phase 0 lab test procedure** — [docs/DHCP-Phase0-LabTest.md](docs/DHCP-Phase0-LabTest.md): operator-ready procedure that verifies whether `/data/config/base/dhcp-server.conf` survives policy refresh/upload/reboot on a live cluster. Results of this test gate Phase 4.
+- **New DB tables** (auto-created on first boot via `db.create_all()`): `dhcp_scopes`, `dhcp_reservations`, `dhcp_deployments`, `dhcp_activity_logs`.
+- **DHCP Manager Blueprint** at `/dhcp/*` — admin-only, sidebar nav:
+  - Scope discovery (enumerates every DHCP-enabled interface + VLAN child on an engine)
+  - Reservation CRUD — creates SMC Host objects with the MAC packed into `Host.comment` as `[flexedge:mac=aa:bb:cc:dd:ee:ff]`. Full Host-API surface exposed (name, address, ipv6, secondary, tools_profile_ref, comment).
+  - Sync-from-SMC — import pre-existing Host elements with the marker into FlexEdge tracking.
+  - Per-scope Activity log + Deployment history pages.
+  - Bearer-token webhook endpoint stub at `/dhcp/api/*` (token auto-generated at `/config/.dhcp_api_token`, chmod 600).
+- **Deploy / Re-sync buttons are wired but log intent only** — the engine-side SSH push lands with Phase 4.
+
+### Changed — DHCP Reservation Manager
+
+- `webapp/models.py` docstring updated to list the new DHCP tables.
+- Sidebar nav gained a "DHCP Manager" section (admin-only).
+- `docs/DHCP-ResrvationStrategy.md` → `docs/DHCP-ReservationStrategy.md` (filename typo fix via `git mv`).
+
 ## [2.1.0] - 2026-04-15
 
 ### Added

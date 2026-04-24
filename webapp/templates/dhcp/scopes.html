@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}DHCP Manager — Scopes{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<h2 class="mb-4"><i class="bi bi-diagram-3"></i> DHCP Scopes</h2>
+
+<div class="card mb-4">
+  <div class="card-header">
+    <h5 class="mb-0">Discover scopes on an engine</h5>
+  </div>
+  <div class="card-body">
+    <form method="post" action="{{ url_for('dhcp.scopes_discover') }}" class="row g-2">
+      <div class="col-md-3">
+        <label class="form-label">Tenant</label>
+        <select class="form-select" name="tenant_id" id="tenant-select" required>
+          <option value="">Select tenant…</option>
+          {% for t in tenants %}
+            <option value="{{ t.id }}">{{ t.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">API Key</label>
+        <select class="form-select" name="api_key_id" id="apikey-select" required disabled>
+          <option value="">—</option>
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label">Engine</label>
+        <select class="form-select" name="engine_name" id="engine-select" required disabled>
+          <option value="">—</option>
+        </select>
+      </div>
+      <div class="col-md-3 d-flex align-items-end">
+        <button type="submit" class="btn btn-primary w-100" id="discover-btn" disabled>
+          <i class="bi bi-search"></i> Discover
+        </button>
+      </div>
+    </form>
+    <div class="small text-muted mt-2">
+      Discovery reads every DHCP-enabled interface on the selected engine
+      (including VLAN sub-interfaces) and registers each one as a scope.
+      Scopes start in <em>disabled</em> state — enable them from the scope
+      page before adding reservations.
+    </div>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header">
+    <h5 class="mb-0">Tracked scopes</h5>
+  </div>
+  {% if scopes %}
+  <div class="table-responsive">
+    <table class="table table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Engine</th><th>Interface</th><th>Subnet</th>
+          <th>Pool</th><th>Enabled</th><th>Last synced</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in scopes %}
+        <tr>
+          <td>{{ s.engine_name }}</td>
+          <td>{{ s.interface_id }}{% if s.interface_label %} <small class="text-muted">— {{ s.interface_label }}</small>{% endif %}</td>
+          <td><code>{{ s.subnet_cidr }}</code></td>
+          <td class="small">
+            {% if s.dhcp_pool_start %}{{ s.dhcp_pool_start }} — {{ s.dhcp_pool_end }}{% else %}—{% endif %}
+          </td>
+          <td>
+            {% if s.enabled_in_flexedge %}
+              <span class="badge bg-success">Enabled</span>
+            {% else %}
+              <span class="badge bg-secondary">Disabled</span>
+            {% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {{ s.last_synced_from_smc_at.strftime('%Y-%m-%d %H:%M') if s.last_synced_from_smc_at else '—' }}
+          </td>
+          <td>
+            <a href="{{ url_for('dhcp.scope_detail', scope_id=s.id) }}" class="btn btn-sm btn-outline-primary">
+              <i class="bi bi-box-arrow-in-right"></i> Open
+            </a>
+            <form method="post" action="{{ url_for('dhcp.scope_delete', scope_id=s.id) }}"
+                  class="d-inline"
+                  onsubmit="return confirm('Remove this scope from FlexEdge tracking? (SMC is untouched.)');">
+              <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="p-3 text-muted small">No scopes tracked. Use the form above to discover scopes on an engine.</div>
+  {% endif %}
+</div>
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+  const tenantSel = document.getElementById('tenant-select');
+  const keySel    = document.getElementById('apikey-select');
+  const engSel    = document.getElementById('engine-select');
+  const btn       = document.getElementById('discover-btn');
+
+  const reset = (sel, placeholder) => {
+    sel.innerHTML = `<option value="">${placeholder}</option>`;
+    sel.disabled = true;
+  };
+
+  tenantSel.addEventListener('change', async () => {
+    reset(keySel, '—');
+    reset(engSel, '—');
+    btn.disabled = true;
+    if (!tenantSel.value) return;
+    const r = await fetch(`{{ url_for('dhcp.api_tenant_keys', tenant_id=0) }}`.replace('/0/', `/${tenantSel.value}/`));
+    const keys = await r.json();
+    keySel.innerHTML = '<option value="">Select API key…</option>' +
+      keys.map(k => `<option value="${k.id}">${k.name}</option>`).join('');
+    keySel.disabled = false;
+  });
+
+  keySel.addEventListener('change', async () => {
+    reset(engSel, '—');
+    btn.disabled = true;
+    if (!keySel.value) return;
+    engSel.innerHTML = '<option value="">Loading engines…</option>';
+    const url = `/dhcp/api/tenants/${tenantSel.value}/api-keys/${keySel.value}/engines`;
+    try {
+      const r = await fetch(url);
+      const engines = await r.json();
+      if (!Array.isArray(engines)) {
+        engSel.innerHTML = `<option value="">Error: ${engines.error || 'unknown'}</option>`;
+        return;
+      }
+      engSel.innerHTML = '<option value="">Select engine…</option>' +
+        engines.map(e => `<option value="${e.name}">${e.name} (${e.type})</option>`).join('');
+      engSel.disabled = false;
+    } catch (e) {
+      engSel.innerHTML = `<option value="">Error: ${e}</option>`;
+    }
+  });
+
+  engSel.addEventListener('change', () => {
+    btn.disabled = !engSel.value;
+  });
+});
+</script>
+{% endblock %}

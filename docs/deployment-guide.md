@@ -47,7 +47,7 @@ Native Python install behind the system's nginx. Best when Docker isn't an optio
 2. Creates a `flexedge` system user (no login, no home)
 3. Installs code to `/opt/flexedge/`, creates a venv, installs dependencies
 4. Creates `/etc/flexedge/.env` with a generated Flask secret
-5. Creates a systemd service (`flexedge.service`) binding gunicorn to `127.0.0.1:5000`
+5. Creates a systemd service (`flexedge.service`) binding gunicorn to `127.0.0.1:8088`
 6. Writes nginx site config proxying to gunicorn
 7. Enables and starts both services
 
@@ -139,7 +139,7 @@ make prod
 
 ### Production stack
 
-- `flexedge-web` — gunicorn + Flask on internal port 5000
+- `flexedge-web` — gunicorn + Flask on internal port 8088
 - `nginx` — reverse proxy with TLS termination (ports 80, 443)
 - `certbot` — auto-renews Let's Encrypt certificates every 12h
 
@@ -170,7 +170,7 @@ For local development on a workstation, skip nginx/TLS and run in foreground wit
 ./deploy.sh --dev     # or: make dev
 ```
 
-Same guided bootstrap as production (Docker check, `.env` creation, optional `azure-setup.sh`), then `docker compose up --build` attached — Ctrl+C to stop. Access the app at `http://localhost:5000`.
+Same guided bootstrap as production (Docker check, `.env` creation, optional `azure-setup.sh`), then `docker compose up --build` attached — Ctrl+C to stop. Access the app at `http://localhost:8088`.
 
 For CI or background use, `./deploy.sh --no-tls` runs the same stack detached.
 
@@ -235,7 +235,7 @@ The installer sets up Docker, Traefik, the Coolify dashboard, and a persistent d
    - Generates Traefik labels on the container
    - Requests a Let's Encrypt certificate
    - Configures HTTP→HTTPS redirect
-   - Routes traffic to the container's port 5000
+   - Routes traffic to the container's port 8088
 
 6. In the **Storages** tab, confirm the two persistent volumes are present:
    - `flexedge-config` → mounted at `/config` (DB + encryption key)

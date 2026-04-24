@@ -11,7 +11,7 @@
 #  Usage:
 #    chmod +x deploy.sh
 #    ./deploy.sh              # Interactive setup (production, with TLS/nginx)
-#    ./deploy.sh --dev        # Dev mode: foreground, port 5000, live logs
+#    ./deploy.sh --dev        # Dev mode: foreground, port 8088, live logs
 #    ./deploy.sh --no-tls     # Same as --dev but detached (background)
 #    ./deploy.sh --update     # Pull latest code and rebuild
 # ═══════════════════════════════════════════════════════════════════════════
@@ -55,7 +55,7 @@ for arg in "$@"; do
             echo ""
             echo "Install / start:"
             echo "  (no flags)         Production setup: Docker + nginx + TLS, detached"
-            echo "  --dev              Dev mode: port 5000, foreground, live logs"
+            echo "  --dev              Dev mode: port 8088, foreground, live logs"
             echo "  --no-tls           Dev mode but detached (runs in background)"
             echo "  --update           Pull latest code and rebuild containers"
             echo ""
@@ -295,10 +295,10 @@ if [ "$USE_TLS" = true ]; then
 elif [ "$DEV_MODE" = true ]; then
     # Foreground mode — user sees logs live, Ctrl+C to stop
     echo ""
-    print_ok "Starting FlexEdgeAdmin in DEV mode (port 5000, live logs)"
+    print_ok "Starting FlexEdgeAdmin in DEV mode (port 8088, live logs)"
     SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost')
     echo ""
-    echo "    Access:   http://${SERVER_IP}:${PORT:-5000}"
+    echo "    Access:   http://${SERVER_IP}:${PORT:-8088}"
     echo "    First visit: login with Azure AD → setup wizard creates your admin account"
     echo "    Stop:     Ctrl+C"
     echo ""
@@ -311,7 +311,7 @@ else
     print_ok "FlexEdgeAdmin is running (dev mode, no TLS, detached)"
     SERVER_IP=$(hostname -I 2>/dev/null | awk '{print $1}' || echo 'localhost')
     echo ""
-    echo "    Access: http://${SERVER_IP}:${PORT:-5000}"
+    echo "    Access: http://${SERVER_IP}:${PORT:-8088}"
     echo ""
     echo "    First visit: login with Azure AD → setup wizard creates your admin account"
     echo "    Then:        Admin Portal (/admin/) → add tenants, API keys, users"

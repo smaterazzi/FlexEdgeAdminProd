@@ -137,8 +137,8 @@ APP_NAME="${APP_NAME:-FlexEdgeAdmin}"
 ask "App Registration name" "FlexEdgeAdmin" APP_NAME
 
 # Port for dev redirect URI
-PORT="${PORT:-5000}"
-ask "Development port" "5000" PORT
+PORT="${PORT:-8088}"
+ask "Development port" "8088" PORT
 
 # Production domain (optional)
 if [[ -z "$DOMAIN" ]]; then

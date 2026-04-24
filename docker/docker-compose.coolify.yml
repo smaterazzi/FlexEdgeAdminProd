@@ -2,7 +2,7 @@
 #
 # Use this file when deploying via Coolify (or any Traefik-based PaaS).
 # TLS, domain routing, and certificates are handled by the platform — the app
-# only exposes port 5000 internally. No nginx, no certbot in this stack.
+# only exposes port 8088 internally. No nginx, no certbot in this stack.
 #
 # Coolify UI setup:
 #   1. New Resource → Docker Compose (public repository)
@@ -15,7 +15,7 @@
 # Coolify automatically:
 #   - Generates Traefik labels for HTTP→HTTPS redirect
 #   - Requests Let's Encrypt certificate for the domain
-#   - Routes traffic from the domain to this service on port 5000
+#   - Routes traffic from the domain to this service on port 8088
 #
 # Persistent storage:
 #   The ./config volume mount is managed by Coolify as a persistent volume.
@@ -35,7 +35,7 @@ services:
     # Internal port only — Coolify/Traefik handles external routing + TLS.
     # Do NOT publish to host with 'ports:' in Coolify deployments.
     expose:
-      - "5000"
+      - "8088"
 
     volumes:
       # Persistent volume managed by Coolify (set in UI: Storages tab)
@@ -52,10 +52,10 @@ services:
       # Optional overrides
       - APP_TITLE=${APP_TITLE:-FlexEdgeAdmin}
       - FLASK_DEBUG=0
-      - PORT=5000
+      - PORT=8088
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/login"]
+      test: ["CMD", "curl", "-f", "http://localhost:8088/login"]
       interval: 30s
       timeout: 5s
       retries: 3

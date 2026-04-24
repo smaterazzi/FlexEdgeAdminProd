@@ -1,0 +1,162 @@
+{% extends "base.html" %}
+{% block title %}Submission #{{ submission.id }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <div class="d-flex justify-content-between align-items-center mb-3">
+        <div>
+            <h4 class="mb-0">
+                <i class="bi bi-clipboard-check"></i>
+                Submission #{{ submission.id }}
+            </h4>
+            <div class="text-muted" style="font-size:0.82rem;">
+                {{ submission.tenant.slug if submission.tenant else '—' }} ·
+                {{ submission.policy_name }} ·
+                submitted by
+                {{ submission.submitted_by.email if submission.submitted_by else '—' }}
+                on {{ submission.submitted_at.strftime('%Y-%m-%d %H:%M') }} UTC
+                {% if submission.status != 'pending' %}
+                · <span class="badge
+                    {% if submission.status == 'reviewed' %}bg-info text-dark
+                    {% else %}bg-secondary{% endif %}">{{ submission.status }}</span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="d-flex gap-2">
+            <a href="{{ url_for('optimize_submissions') }}" class="btn btn-sm btn-outline-secondary">
+                <i class="bi bi-arrow-left"></i> Queue
+            </a>
+            <a href="{{ url_for('optimize_report', policy_name=submission.policy_name) }}"
+               class="btn btn-sm btn-outline-primary" target="_blank">
+                <i class="bi bi-arrow-clockwise"></i> Re-run analysis (live)
+            </a>
+        </div>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, msg in messages %}
+      <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+          {{ msg }}
+          <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+      </div>
+      {% endfor %}
+    {% endwith %}
+
+    {% if not findings %}
+    <div class="alert alert-secondary">No findings in this submission.</div>
+    {% else %}
+    <form method="post" action="{{ url_for('optimize_submission_decide', sub_id=submission.id) }}">
+        {% for f in findings %}
+        <div class="card mb-3">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <div>
+                    <span class="badge
+                        {% if f.kind == 'exact_duplicate' %}bg-danger
+                        {% else %}bg-warning text-dark{% endif %}">
+                        {{ f.kind }}
+                    </span>
+                    <strong class="ms-2">{{ f.id }}</strong>
+                    <span class="text-muted ms-2" style="font-size:0.8rem;">
+                        primary {{ f.primary_pos }} ·
+                        {{ f.redundant_pos|length }} redundant
+                    </span>
+                </div>
+                <span class="badge bg-secondary">{{ f.severity }}</span>
+            </div>
+            <div class="card-body py-2">
+                <div class="text-muted mb-2" style="font-size:0.85rem;">{{ f.rationale }}</div>
+                <div class="table-responsive">
+                    <table class="table table-sm table-dark mb-2">
+                        <thead>
+                            <tr>
+                                <th style="width:5rem;">Role</th>
+                                <th style="width:4.5rem;">Pos</th>
+                                <th>Name</th>
+                                <th>Action</th>
+                                <th>Sources</th>
+                                <th>Destinations</th>
+                                <th>Services</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for r in f.rule_snippets %}
+                            <tr {% if loop.first %}class="table-primary"{% endif %}>
+                                <td>
+                                    {% if loop.first %}
+                                    <span class="badge bg-success">keep</span>
+                                    {% else %}
+                                    <span class="badge bg-danger">dead</span>
+                                    {% endif %}
+                                </td>
+                                <td><code>{{ r.pos }}</code></td>
+                                <td>{{ r.name or '—' }}</td>
+                                <td>{{ r.action }}</td>
+                                <td>{{ r.sources|join(', ') }}</td>
+                                <td>{{ r.destinations|join(', ') }}</td>
+                                <td>{{ r.services|join(', ') }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="d-flex gap-3 align-items-center flex-wrap">
+                    <div class="btn-group btn-group-sm" role="group" aria-label="Decision">
+                        <input type="radio" class="btn-check" name="decision_{{ f.id }}"
+                               id="dec_{{ f.id }}_approve" value="approved"
+                               {% if f.decision == 'approved' %}checked{% endif %}>
+                        <label class="btn btn-outline-success" for="dec_{{ f.id }}_approve">
+                            <i class="bi bi-check2"></i> Approve
+                        </label>
+
+                        <input type="radio" class="btn-check" name="decision_{{ f.id }}"
+                               id="dec_{{ f.id }}_reject" value="rejected"
+                               {% if f.decision == 'rejected' %}checked{% endif %}>
+                        <label class="btn btn-outline-danger" for="dec_{{ f.id }}_reject">
+                            <i class="bi bi-x"></i> Reject
+                        </label>
+
+                        <input type="radio" class="btn-check" name="decision_{{ f.id }}"
+                               id="dec_{{ f.id }}_skip" value=""
+                               {% if not f.decision %}checked{% endif %}>
+                        <label class="btn btn-outline-secondary" for="dec_{{ f.id }}_skip">
+                            Skip
+                        </label>
+                    </div>
+                    <input type="text" name="note_{{ f.id }}"
+                           class="form-control form-control-sm" style="max-width:480px;"
+                           placeholder="Optional note"
+                           value="{{ f.decision_note or '' }}">
+                </div>
+            </div>
+        </div>
+        {% endfor %}
+
+        <div class="card mb-3">
+            <div class="card-body">
+                <label class="form-label text-muted" style="font-size:0.78rem;">Admin notes</label>
+                <textarea name="admin_notes" class="form-control form-control-sm" rows="2"
+                          placeholder="Context for this review…">{{ submission.admin_notes or '' }}</textarea>
+            </div>
+        </div>
+
+        <div class="d-flex gap-2">
+            <button type="submit" name="action" value="save" class="btn btn-primary btn-sm">
+                <i class="bi bi-save"></i> Save decisions
+            </button>
+            <button type="submit" name="action" value="close" class="btn btn-success btn-sm"
+                    onclick="return confirm('Close this submission? Approved findings become the admin to-do list in SMC.');">
+                <i class="bi bi-lock"></i> Save &amp; close
+            </button>
+        </div>
+    </form>
+
+    {% if submission.status != 'pending' %}
+    <div class="mt-4 text-muted" style="font-size:0.78rem;">
+        <strong>Reminder:</strong> approved findings are not applied automatically.
+        Execute them manually in SMC Management Client.
+    </div>
+    {% endif %}
+    {% endif %}
+</div>
+{% endblock %}

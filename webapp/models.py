@@ -2,10 +2,22 @@
 FlexEdgeAdmin — SQLAlchemy models.
 
 Tables:
-  tenants             SMC server connections
-  users               Authenticated users (from Azure AD)
-  api_keys            Encrypted SMC API keys
-  user_tenant_access  Junction: which users can access which tenants with which keys
+  tenants              SMC server connections
+  users                Authenticated users (from Azure AD)
+  api_keys             Encrypted SMC API keys
+  user_tenant_access   Junction: which users can access which tenants with which keys
+
+  managed_certificates TLS Manager — certbot-tracked certificates
+  tls_deployments      TLS Manager — cert → engine deployments
+  tls_deployment_logs  Per-deployment audit log
+  tls_activity_logs    App-wide TLS activity log
+
+  dhcp_scopes          DHCP Manager — per-engine interfaces with internal DHCP active
+  dhcp_reservations    DHCP Manager — MAC→IP reservations (source of truth is SMC Host)
+  dhcp_deployments     DHCP Manager — per-node push history
+  dhcp_activity_logs   DHCP Manager — app-wide activity log
+
+  optimization_submissions  Rule-optimizer findings submitted for admin review
 """
 
 from datetime import datetime, timezone
@@ -219,6 +231,164 @@ class TLSActivityLog(db.Model):
     target = db.Column(db.String(256), default="", nullable=False)
     detail = db.Column(db.Text, default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+
+# ── DHCP Manager models ─────────────────────────────────────────────────
+
+class DhcpScope(db.Model):
+    """A DHCP subnet managed on a specific engine interface.
+
+    Discovered from SMC (one row per engine interface that has the internal
+    DHCP server enabled). An operator opts a scope into FlexEdge management
+    via `enabled_in_flexedge` before reservations can be deployed.
+    """
+    __tablename__ = "dhcp_scopes"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+
+    engine_name = db.Column(db.String(256), nullable=False)
+    interface_id = db.Column(db.String(32), nullable=False)      # "2" or "2.100" for VLAN
+    interface_label = db.Column(db.String(256), default="", nullable=False)
+
+    subnet_cidr = db.Column(db.String(64), nullable=False)       # "192.168.10.0/24"
+    gateway = db.Column(db.String(45), default="", nullable=False)
+    dhcp_pool_start = db.Column(db.String(45), default="", nullable=False)
+    dhcp_pool_end = db.Column(db.String(45), default="", nullable=False)
+
+    label = db.Column(db.String(256), default="", nullable=False)   # operator-settable display name
+    enabled_in_flexedge = db.Column(db.Boolean, default=False, nullable=False)
+
+    last_synced_from_smc_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("tenant_id", "engine_name", "interface_id", name="uq_dhcp_scope_engine_if"),
+    )
+
+    tenant = db.relationship("Tenant")
+    api_key = db.relationship("ApiKey")
+    reservations = db.relationship("DhcpReservation", back_populates="scope",
+                                   lazy="dynamic", cascade="all, delete-orphan")
+    deployments = db.relationship("DhcpDeployment", back_populates="scope",
+                                  lazy="dynamic", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<DhcpScope {self.engine_name!r}/{self.interface_id} {self.subnet_cidr}>"
+
+
+class DhcpReservation(db.Model):
+    """A single MAC→IP reservation within a scope.
+
+    Authoritative data lives on the SMC Host element: ``Host.name``,
+    ``Host.address``, and the MAC stored inside ``Host.comment`` via a
+    ``[flexedge:mac=aa:bb:cc:dd:ee:ff]`` marker. This row indexes the Host
+    and caches the MAC/IP for fast sync-diff during deployment.
+    """
+    __tablename__ = "dhcp_reservations"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    scope_id = db.Column(db.Integer, db.ForeignKey("dhcp_scopes.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+
+    smc_host_name = db.Column(db.String(256), nullable=False)
+    smc_host_href = db.Column(db.String(512), default="", nullable=False)
+    ip_address = db.Column(db.String(45), nullable=False)
+    mac_address = db.Column(db.String(17), nullable=False)       # aa:bb:cc:dd:ee:ff
+
+    status = db.Column(db.String(32), default="pending", nullable=False)  # pending|synced|out_of_sync|error
+    last_synced_at = db.Column(db.DateTime, nullable=True)
+    last_error = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("scope_id", "mac_address", name="uq_dhcp_res_scope_mac"),
+        db.UniqueConstraint("scope_id", "ip_address", name="uq_dhcp_res_scope_ip"),
+    )
+
+    scope = db.relationship("DhcpScope", back_populates="reservations")
+
+    def __repr__(self):
+        return f"<DhcpReservation {self.mac_address} → {self.ip_address} scope={self.scope_id}>"
+
+
+class DhcpDeployment(db.Model):
+    """One row per reservation-push attempt, per cluster node."""
+    __tablename__ = "dhcp_deployments"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    scope_id = db.Column(db.Integer, db.ForeignKey("dhcp_scopes.id", ondelete="CASCADE"),
+                         nullable=False, index=True)
+
+    engine_name = db.Column(db.String(256), nullable=False)
+    node_index = db.Column(db.Integer, nullable=False)
+    node_hostname = db.Column(db.String(256), default="", nullable=False)
+
+    action = db.Column(db.String(32), nullable=False)            # push|dry_run|verify|rollback|resync
+    status = db.Column(db.String(16), nullable=False)            # ok|partial|failed
+    reservations_count = db.Column(db.Integer, default=0, nullable=False)
+
+    file_sha256_before = db.Column(db.String(64), default="", nullable=False)
+    file_sha256_after = db.Column(db.String(64), default="", nullable=False)
+    diff = db.Column(db.Text, default="", nullable=False)
+    duration_ms = db.Column(db.Integer, default=0, nullable=False)
+    error = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+    scope = db.relationship("DhcpScope", back_populates="deployments")
+
+    def __repr__(self):
+        return f"<DhcpDeployment scope={self.scope_id} node={self.node_index} status={self.status}>"
+
+
+class DhcpActivityLog(db.Model):
+    """App-wide activity log for all DHCP Manager operations."""
+    __tablename__ = "dhcp_activity_logs"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    category = db.Column(db.String(32), nullable=False)          # scope|reservation|ssh|deploy|system
+    action = db.Column(db.String(64), nullable=False)
+    status = db.Column(db.String(16), nullable=False)            # ok|failed|info
+    target = db.Column(db.String(256), default="", nullable=False)
+    detail = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+
+class OptimizationSubmission(db.Model):
+    """
+    Rule-optimizer finding snapshot submitted by an operator for admin review.
+
+    ``findings_json`` holds the serialized list of findings produced by
+    ``rule_optimizer.analyze_rules()``. Once reviewed, each finding inside
+    the JSON blob gains a ``decision`` ("approved"|"rejected") and an
+    optional ``decision_note``.
+    """
+    __tablename__ = "optimization_submissions"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    policy_name = db.Column(db.String(255), nullable=False)
+
+    submitted_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    submitted_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+    findings_json = db.Column(db.Text, nullable=False)
+    finding_count = db.Column(db.Integer, default=0, nullable=False)
+
+    status = db.Column(db.String(20), default="pending", nullable=False, index=True)  # pending|reviewed|closed
+    reviewed_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    reviewed_at = db.Column(db.DateTime, nullable=True)
+    admin_notes = db.Column(db.Text, default="", nullable=False)
+
+    tenant = db.relationship("Tenant")
+    submitted_by = db.relationship("User", foreign_keys=[submitted_by_id])
+    reviewed_by = db.relationship("User", foreign_keys=[reviewed_by_id])
+
+    def __repr__(self):
+        return f"<OptimizationSubmission #{self.id} policy={self.policy_name!r} status={self.status}>"
 
 
 def enable_wal_mode(app):

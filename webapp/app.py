@@ -141,6 +141,12 @@ app.config.setdefault("CERTBOT_LIVE_DIR",
 init_tls_manager(app)
 app.register_blueprint(tls_bp)
 
+# ── DHCP Manager ─────────────────────────────────────────────────────────
+
+from dhcp_manager import dhcp_bp, init_dhcp_manager
+init_dhcp_manager(app)
+app.register_blueprint(dhcp_bp)
+
 
 # ── Session-based SMC config ─────────────────────────────────────────────
 
@@ -807,6 +813,189 @@ def api_migration_import_log(project_id):
     if not log_data:
         return jsonify({"status": "ok", "log": None})
     return jsonify({"status": "ok", "log": log_data})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  RULE OPTIMIZER
+# ═══════════════════════════════════════════════════════════════════════════
+
+import json as _json
+from admin import admin_required
+import rule_optimizer
+from webapp.models import OptimizationSubmission, Tenant, User
+
+
+def _current_user_row():
+    info = session.get("user") or {}
+    email = (info.get("email") or "").lower().strip()
+    if not email:
+        return None
+    return User.query.filter_by(email=email).first()
+
+
+def _current_tenant_row():
+    profile = session.get("active_profile") or {}
+    slug = profile.get("tenant")
+    if not slug:
+        return None
+    return Tenant.query.filter_by(slug=slug).first()
+
+
+@app.route("/optimize")
+@profile_required
+def optimize_list():
+    """Pick a policy to analyze; show this user's own submissions."""
+    try:
+        cfg = get_user_cfg()
+        with smc_client.smc_session(cfg):
+            policy_list = smc_client.list_policies()
+    except Exception as e:
+        return render_template("error.html", message=str(e))
+
+    me = _current_user_row()
+    my_subs = []
+    if me:
+        my_subs = (OptimizationSubmission.query
+                   .filter_by(submitted_by_id=me.id)
+                   .order_by(OptimizationSubmission.submitted_at.desc())
+                   .limit(20).all())
+
+    return render_template("optimize/list.html",
+                           policies=policy_list,
+                           my_submissions=my_subs)
+
+
+@app.route("/optimize/<path:policy_name>")
+@profile_required
+def optimize_report(policy_name):
+    """Run the analyzer live against the selected policy."""
+    try:
+        cfg = get_user_cfg()
+        with smc_client.smc_session(cfg):
+            rules = smc_client.get_policy_rules(policy_name)
+    except Exception as e:
+        return render_template("error.html", message=str(e))
+
+    result = rule_optimizer.analyze_rules(policy_name, rules)
+    return render_template("optimize/report.html",
+                           policy_name=policy_name,
+                           result=result)
+
+
+@app.route("/optimize/<path:policy_name>/submit", methods=["POST"])
+@profile_required
+def optimize_submit(policy_name):
+    """Snapshot current findings and persist them for admin review."""
+    me = _current_user_row()
+    tenant = _current_tenant_row()
+    if not tenant:
+        flash("Cannot resolve the active tenant from your session.", "danger")
+        return redirect(url_for("optimize_report", policy_name=policy_name))
+
+    try:
+        cfg = get_user_cfg()
+        with smc_client.smc_session(cfg):
+            rules = smc_client.get_policy_rules(policy_name)
+    except Exception as e:
+        flash(f"Failed to re-fetch rules for submission: {e}", "danger")
+        return redirect(url_for("optimize_report", policy_name=policy_name))
+
+    result = rule_optimizer.analyze_rules(policy_name, rules)
+    if not result["findings"]:
+        flash("No findings to submit — this policy looks clean.", "info")
+        return redirect(url_for("optimize_report", policy_name=policy_name))
+
+    sub = OptimizationSubmission(
+        tenant_id=tenant.id,
+        policy_name=policy_name,
+        submitted_by_id=me.id if me else None,
+        findings_json=_json.dumps(result["findings"]),
+        finding_count=len(result["findings"]),
+        status="pending",
+    )
+    db.session.add(sub)
+    db.session.commit()
+    log.info("Optimization submission #%s created by %s for policy %s",
+             sub.id, (me.email if me else "?"), policy_name)
+    flash(f"Submitted {sub.finding_count} finding(s) for admin review (#{sub.id}).", "success")
+    return redirect(url_for("optimize_list"))
+
+
+@app.route("/optimize/submissions")
+@admin_required
+def optimize_submissions():
+    """Admin inbox: pending submissions first, then decided ones."""
+    pending = (OptimizationSubmission.query
+               .filter_by(status="pending")
+               .order_by(OptimizationSubmission.submitted_at.desc()).all())
+    decided = (OptimizationSubmission.query
+               .filter(OptimizationSubmission.status != "pending")
+               .order_by(OptimizationSubmission.reviewed_at.desc().nullslast())
+               .limit(50).all())
+    return render_template("optimize/submissions.html",
+                           pending=pending, decided=decided)
+
+
+@app.route("/optimize/submissions/<int:sub_id>")
+@admin_required
+def optimize_submission_detail(sub_id):
+    sub = OptimizationSubmission.query.get_or_404(sub_id)
+    try:
+        findings = _json.loads(sub.findings_json)
+    except Exception:
+        findings = []
+    return render_template("optimize/submission_detail.html",
+                           submission=sub, findings=findings)
+
+
+@app.route("/optimize/submissions/<int:sub_id>/decide", methods=["POST"])
+@admin_required
+def optimize_submission_decide(sub_id):
+    """Record per-finding decisions + close the submission."""
+    sub = OptimizationSubmission.query.get_or_404(sub_id)
+    try:
+        findings = _json.loads(sub.findings_json)
+    except Exception:
+        findings = []
+
+    for f in findings:
+        fid = f.get("id", "")
+        decision = request.form.get(f"decision_{fid}", "").strip().lower()
+        note = request.form.get(f"note_{fid}", "").strip()
+        if decision in ("approved", "rejected"):
+            f["decision"] = decision
+            f["decision_note"] = note
+        else:
+            f["decision"] = None
+            f["decision_note"] = note
+
+    admin_notes = request.form.get("admin_notes", "").strip()
+    close = request.form.get("action") == "close"
+
+    me = _current_user_row()
+    sub.findings_json = _json.dumps(findings)
+    sub.admin_notes = admin_notes
+    sub.reviewed_by_id = me.id if me else None
+    from datetime import datetime, timezone as _tz
+    sub.reviewed_at = datetime.now(_tz.utc)
+    sub.status = "closed" if close else "reviewed"
+    db.session.commit()
+
+    flash(f"Saved decisions for submission #{sub.id}.", "success")
+    return redirect(url_for("optimize_submission_detail", sub_id=sub.id))
+
+
+@app.context_processor
+def inject_optimizer_pending_count():
+    """Expose pending-submission count to the sidebar badge (admin only)."""
+    try:
+        info = session.get("user")
+        if not info or not user_manager.is_admin(info.get("email", "")):
+            return {"optimizer_pending_count": 0}
+        return {"optimizer_pending_count":
+                OptimizationSubmission.query.filter_by(status="pending").count()}
+    except Exception:
+        return {"optimizer_pending_count": 0}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
