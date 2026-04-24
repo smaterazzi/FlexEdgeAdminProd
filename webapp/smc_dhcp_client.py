@@ -33,6 +33,7 @@ __all__ = [
     "pack_mac_into_comment", "unpack_mac_from_comment",
     "normalize_mac", "is_valid_mac",
     "list_scopes_for_engine", "list_cluster_nodes",
+    "dump_engine_interfaces",
     "host_create", "host_update", "host_delete", "host_list_by_scope",
     "host_get",
     "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView",
@@ -115,91 +116,253 @@ class DhcpScopeInfo:
     raw: dict = field(default_factory=dict)
 
 
-def _extract_dhcp_info_from_interface(phys_data: dict, parent_id: str = "") -> list[DhcpScopeInfo]:
-    """Walk a physical_interface payload and pull out scopes for every level
-    (the interface itself + every VLAN child) where the internal DHCP server
-    is enabled.
+def _dhcp_is_active(cfg) -> bool:
+    """Return True iff the given `dhcp_server_on_interface` value represents
+    an *active* internal DHCP server.
 
-    The payload shape used here is the one returned by the SMC API's native
-    JSON for engine elements — see SMC 7.0 API User Guide page 28:
-    `dhcp_server_on_interface`, `default_lease_time`, `dhcp_range_per_node`.
+    Handles every shape we've seen in the wild across SMC versions:
+      - missing / None / "" / False / "none" → inactive
+      - bool True → active
+      - string enum like "dhcp_server" → active (anything not in the inactive set)
+      - dict with `dhcp_server_mode == "server"` → active
+      - dict without a mode key but with pool/range hints → active
+    """
+    if cfg is None or cfg is False or cfg == "" or cfg == "none":
+        return False
+    if cfg is True:
+        return True
+    if isinstance(cfg, dict):
+        mode = cfg.get("dhcp_server_mode")
+        if mode is not None:
+            return str(mode).lower() == "server"
+        return bool(
+            cfg.get("dhcp_address_range")
+            or cfg.get("dhcp_range_per_node")
+            or cfg.get("default_gateway")
+            or cfg.get("primary_dns_server")
+        )
+    if isinstance(cfg, str):
+        return cfg.lower() not in ("none", "off", "disabled", "no", "false")
+    return True
+
+
+def _find_level_dhcp(level_payload: dict) -> tuple[dict, str, str] | None:
+    """Look at a single interface-level payload (either a physical interface
+    or a VLAN child) and see if DHCP is active ON THIS LEVEL.
+
+    DHCP config can live in two places depending on engine type / SMC version:
+      1. At the interface top level — `level_payload["dhcp_server_on_interface"]`
+         (the shape documented in the SMC 7.0 API Guide page 28)
+      2. Inside a node entry — `level_payload["interfaces"][N].single_node_interface.dhcp_server_on_interface`
+         (seen on some cluster configurations)
+
+    Returns `(dhcp_cfg_dict, address, network_value)` if active, else None.
+    The address/network are what we'll use to compute the scope's CIDR.
+    """
+    # Location 1: interface top level
+    cfg = level_payload.get("dhcp_server_on_interface")
+    if _dhcp_is_active(cfg):
+        cfg_dict = cfg if isinstance(cfg, dict) else {}
+        address = level_payload.get("address") or ""
+        network = level_payload.get("network_value") or ""
+        # If the top level has DHCP but no IP on itself, look for a node IP
+        if not (address and network):
+            for node in level_payload.get("interfaces", []) or []:
+                inner = (node.get("single_node_interface")
+                         or node.get("node_interface")
+                         or node.get("cluster_virtual_interface")
+                         or node)
+                if inner.get("address") and inner.get("network_value"):
+                    address = inner["address"]
+                    network = inner["network_value"]
+                    break
+        return cfg_dict, address, network
+
+    # Location 2: node-level
+    for node in level_payload.get("interfaces", []) or []:
+        inner = (node.get("single_node_interface")
+                 or node.get("node_interface")
+                 or node.get("cluster_virtual_interface")
+                 or node)
+        inner_cfg = inner.get("dhcp_server_on_interface")
+        if _dhcp_is_active(inner_cfg):
+            cfg_dict = inner_cfg if isinstance(inner_cfg, dict) else {}
+            return cfg_dict, inner.get("address", ""), inner.get("network_value", "")
+
+    return None
+
+
+def _build_scope(engine_name: str, iface_id: str,
+                 level_payload: dict, dhcp_cfg: dict,
+                 address: str, network: str) -> DhcpScopeInfo:
+    """Construct a DhcpScopeInfo from a resolved DHCP-active interface level."""
+    pool_start = ""
+    pool_end = ""
+    # Pool can be at the top (older shape) or inside dhcp_cfg (newer shape)
+    ranges = (level_payload.get("dhcp_range_per_node")
+              or dhcp_cfg.get("dhcp_range_per_node")
+              or [])
+    single_range = dhcp_cfg.get("dhcp_address_range", "")
+    if ranges:
+        first = ranges[0] if ranges else {}
+        pool_range = first.get("dhcp_address_range", "") if isinstance(first, dict) else str(first)
+        if "-" in pool_range:
+            pool_start, pool_end = [p.strip() for p in pool_range.split("-", 1)]
+    elif "-" in single_range:
+        pool_start, pool_end = [p.strip() for p in single_range.split("-", 1)]
+
+    cidr = ""
+    gateway = ""
+    if address and network:
+        try:
+            net = ipaddress.ip_network(network, strict=False)
+            cidr = str(net)
+            gateway = address
+        except ValueError:
+            cidr = network
+
+    lease = int(
+        level_payload.get("default_lease_time")
+        or dhcp_cfg.get("default_lease_time")
+        or 0
+    )
+    primary_dns = str(dhcp_cfg.get("primary_dns_server", ""))
+
+    return DhcpScopeInfo(
+        engine_name=engine_name,
+        interface_id=iface_id,
+        interface_label=level_payload.get("comment", "") or f"Interface {iface_id}",
+        subnet_cidr=cidr,
+        gateway=gateway,
+        dhcp_pool_start=pool_start,
+        dhcp_pool_end=pool_end,
+        default_lease_time=lease,
+        primary_dns=primary_dns,
+        raw=dict(level_payload),
+    )
+
+
+def _walk_interface(level_payload: dict, engine_name: str,
+                    parent_iface_id: str = "") -> list[DhcpScopeInfo]:
+    """Operator-spec traversal:
+
+      1. If DHCP is active at this level → record a scope.
+      2. If this level has VLAN children → descend into each and apply (1).
+      3. If no DHCP and no VLANs → skip (naturally; no scope is produced).
+
+    A VLAN child can still contribute a scope even if its parent also did
+    (e.g. a physical with a management IP + DHCP, plus VLAN sub-nets each
+    with their own DHCP). Both get recorded.
     """
     scopes: list[DhcpScopeInfo] = []
-    interface_id = str(phys_data.get("interface_id", parent_id))
+    # When recursed with a composed parent id (e.g. "2.100"), that's the
+    # authoritative path — the VLAN's own interface_id is already baked in.
+    iface_id = parent_iface_id or str(level_payload.get("interface_id") or "")
 
-    def _extract(data: dict, iface_id: str):
-        dhcp_cfg = data.get("dhcp_server_on_interface")
-        if not dhcp_cfg or dhcp_cfg == "none":
-            return
-        if isinstance(dhcp_cfg, dict) and dhcp_cfg.get("dhcp_server_mode") != "server":
-            return
+    vlans = (level_payload.get("vlanInterfaces")
+             or level_payload.get("vlan_interfaces")
+             or [])
 
-        pool_start = ""
-        pool_end = ""
-        ranges = data.get("dhcp_range_per_node") or []
-        if ranges:
-            first = ranges[0]
-            if isinstance(first, dict):
-                pool_range = first.get("dhcp_address_range", "")
-            else:
-                pool_range = str(first)
-            if "-" in pool_range:
-                pool_start, pool_end = [p.strip() for p in pool_range.split("-", 1)]
+    # Rule 1: current level
+    found = _find_level_dhcp(level_payload)
+    if found:
+        cfg_dict, address, network = found
+        scope = _build_scope(engine_name, iface_id, level_payload,
+                             cfg_dict, address, network)
+        scopes.append(scope)
 
-        address = data.get("address") or ""
-        network = data.get("network_value") or ""
-        cidr = ""
-        gateway = ""
-        if address and network:
-            try:
-                net = ipaddress.ip_network(network, strict=False)
-                cidr = str(net)
-                gateway = address
-            except ValueError:
-                cidr = network
+    # Rule 3 optimisation: if no DHCP and no VLANs, nothing to do
+    if not found and not vlans:
+        return scopes
 
-        scopes.append(DhcpScopeInfo(
-            engine_name="",  # caller fills
-            interface_id=iface_id,
-            interface_label=data.get("comment", "") or f"Interface {iface_id}",
-            subnet_cidr=cidr,
-            gateway=gateway,
-            dhcp_pool_start=pool_start,
-            dhcp_pool_end=pool_end,
-            default_lease_time=int(data.get("default_lease_time") or 0),
-            primary_dns=str(dhcp_cfg.get("primary_dns_server", "") if isinstance(dhcp_cfg, dict) else ""),
-            raw=dict(data),
-        ))
-
-    for node in phys_data.get("interfaces", []) or []:
-        inner = node.get("single_node_interface") or node.get("node_interface") or node
-        _extract(inner, interface_id)
-
-    for vlan_wrap in phys_data.get("vlanInterfaces", []) or []:
+    # Rule 2: descend into VLANs (regardless of whether parent had DHCP)
+    for vlan_wrap in vlans:
         vlan = vlan_wrap.get("physical_interface") or vlan_wrap
-        vlan_id = str(vlan.get("interface_id", interface_id))
-        full_id = f"{interface_id}.{vlan_id}" if vlan_id and vlan_id != interface_id else interface_id
-        for node in vlan.get("interfaces", []) or []:
-            inner = node.get("single_node_interface") or node.get("node_interface") or node
-            _extract(inner, full_id)
+        vlan_raw_id = vlan.get("interface_id", "")
+        # Compose full VLAN id: "<parent>.<vlan_id>", e.g. "2.100"
+        if vlan_raw_id and str(vlan_raw_id) != iface_id:
+            combined = f"{iface_id}.{vlan_raw_id}"
+        else:
+            combined = iface_id
+        scopes.extend(_walk_interface(vlan, engine_name, combined))
 
     return scopes
 
 
 def list_scopes_for_engine(engine_name: str) -> list[DhcpScopeInfo]:
-    """Return every DHCP-enabled scope on the engine (including VLAN sub-interfaces)."""
+    """Return every DHCP-enabled scope on the engine (physical + VLAN children).
+
+    Traversal (per operator spec):
+      - Check DHCP at the physical-interface level.
+      - If VLANs exist, recurse into each and apply the same rule.
+      - Skip branches with neither DHCP nor VLANs.
+    """
     engine = Engine(engine_name)
     scopes: list[DhcpScopeInfo] = []
+    visited = 0
     for phys in engine.physical_interface:
         try:
             data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
         except Exception:
             data = {}
-        got = _extract_dhcp_info_from_interface(data)
-        for s in got:
-            s.engine_name = engine_name
-            scopes.append(s)
+        visited += 1
+        got = _walk_interface(data, engine_name)
+        vlans = (data.get("vlanInterfaces") or data.get("vlan_interfaces") or [])
+        dhcp_here = _find_level_dhcp(data) is not None
+        logger.info(
+            "DHCP discovery: engine=%s interface_id=%s dhcp_here=%s vlan_count=%d scopes=%d",
+            engine_name,
+            data.get("interface_id"),
+            dhcp_here,
+            len(vlans),
+            len(got),
+        )
+        scopes.extend(got)
+    logger.info("DHCP discovery: engine=%s visited=%d total_scopes=%d",
+                engine_name, visited, len(scopes))
     return scopes
+
+
+def dump_engine_interfaces(engine_name: str) -> dict:
+    """Diagnostic helper: return the raw interface JSON plus the walker's
+    per-level decisions. Use via /dhcp/api/.../engines/<n>/interfaces/debug
+    when a scope you expect is not detected.
+    """
+    engine = Engine(engine_name)
+    payload: dict = {"engine_name": engine_name, "interfaces": []}
+
+    def _annotate(level_payload: dict, iface_id: str) -> dict:
+        found = _find_level_dhcp(level_payload)
+        vlans_raw = (level_payload.get("vlanInterfaces")
+                     or level_payload.get("vlan_interfaces")
+                     or [])
+        annotated_vlans = []
+        for vlan_wrap in vlans_raw:
+            vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+            vlan_raw_id = vlan.get("interface_id", "")
+            combined = f"{iface_id}.{vlan_raw_id}" if vlan_raw_id else iface_id
+            annotated_vlans.append(_annotate(vlan, combined))
+        return {
+            "interface_id": iface_id or level_payload.get("interface_id"),
+            "dhcp_here": found is not None,
+            "dhcp_address": found[1] if found else None,
+            "dhcp_network": found[2] if found else None,
+            "raw_top_level_keys": sorted(level_payload.keys()),
+            "raw_dhcp_value_type": type(level_payload.get("dhcp_server_on_interface")).__name__,
+            "raw_dhcp_value_snippet": str(level_payload.get("dhcp_server_on_interface"))[:120],
+            "vlan_count": len(vlans_raw),
+            "vlan_children": annotated_vlans,
+            "raw": level_payload,
+        }
+
+    for phys in engine.physical_interface:
+        try:
+            data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
+        except Exception:
+            data = {}
+        iface_id = str(data.get("interface_id") or "")
+        payload["interfaces"].append(_annotate(data, iface_id))
+    return payload
 
 
 # ── Cluster nodes ──────────────────────────────────────────────────────────

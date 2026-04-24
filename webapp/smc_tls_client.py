@@ -21,6 +21,17 @@ from smc.elements.service import TCPService
 from smc.policy.layer3 import FirewallPolicy
 from smc.policy.rule_elements import Action, LogOptions
 
+# ── Silence urllib3's InsecureRequestWarning ─────────────────────────────
+# Every SMC call (with verify_ssl=False, the FlexEdge default) emits a
+# warning. In tight loops like interface enumeration this floods the log.
+# Tenants configured with verify_ssl=True are unaffected because urllib3
+# only warns on unverified requests.
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except Exception:
+    pass
+
 logger = logging.getLogger(__name__)
 
 

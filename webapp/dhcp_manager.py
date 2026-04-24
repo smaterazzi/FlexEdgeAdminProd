@@ -37,7 +37,7 @@ from webapp.models import (
 from webapp.smc_dhcp_client import (
     SMCConfig, smc_session,
     DhcpHostView, DhcpScopeInfo,
-    list_scopes_for_engine, list_cluster_nodes,
+    list_scopes_for_engine, list_cluster_nodes, dump_engine_interfaces,
     host_create, host_update, host_delete, host_get, host_list_by_scope,
     is_valid_mac, normalize_mac,
 )
@@ -217,8 +217,16 @@ def scopes_discover():
         db.session.commit()
         _log_activity("scope", "discover", "ok", target,
                       f"Found {len(found)} scope(s); added {added}, updated {updated}.")
-        flash(f"Discovered {len(found)} scope(s) on {engine_name} "
-              f"({added} new, {updated} updated).", "success")
+        if found:
+            flash(f"Discovered {len(found)} scope(s) on {engine_name} "
+                  f"({added} new, {updated} updated).", "success")
+        else:
+            flash(f"No DHCP-enabled scopes found on {engine_name}. "
+                  f"If you expected some, hit the diagnostic endpoint "
+                  f"/dhcp/api/tenants/{tenant.id}/api-keys/{api_key.id}/"
+                  f"engines/{engine_name}/interfaces/debug to inspect the "
+                  f"raw SMC JSON and file an update to the parser.",
+                  "warning")
     except Exception as exc:
         db.session.rollback()
         _log_activity("scope", "discover", "failed", target, smc_error_detail(exc))
@@ -612,6 +620,27 @@ def api_tenant_engines(tenant_id, key_id):
         with smc_session(cfg):
             engines = list_engines()
         return jsonify(engines)
+    except Exception as exc:
+        return jsonify({"error": smc_error_detail(exc)}), 500
+
+
+@dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/interfaces/debug")
+@admin_required
+def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
+    """Return the raw physical_interface JSON plus what the parser extracted.
+
+    Use this when scope discovery returns 0 to inspect the actual shape of
+    the SMC API payload (it varies slightly between engine types / versions).
+    """
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, key_id)
+    if not tenant or not api_key:
+        return jsonify({"error": "Not found"}), 404
+    cfg = _smc_cfg(tenant, api_key)
+    try:
+        with smc_session(cfg):
+            payload = dump_engine_interfaces(engine_name)
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({"error": smc_error_detail(exc)}), 500
 
