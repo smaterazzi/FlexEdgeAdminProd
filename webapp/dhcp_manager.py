@@ -1428,6 +1428,32 @@ def scope_leases(scope_id):
 
     merged = merge_cluster_leases(per_node_results) if per_node_results else []
 
+    # Filter to the leases that belong to THIS scope's subnet.
+    # ``dhcpd.leases`` is a single file shared by every scope on the engine,
+    # so without filtering the operator sees leases from other VLANs too.
+    import ipaddress
+    leases_other_subnets = 0
+    network = None
+    if scope.subnet_cidr:
+        try:
+            network = ipaddress.ip_network(scope.subnet_cidr, strict=False)
+        except (ValueError, TypeError):
+            log.warning("Scope %s has unparseable subnet_cidr %r — showing all leases",
+                        scope.id, scope.subnet_cidr)
+            network = None
+
+    if network is not None:
+        in_scope = []
+        for row in merged:
+            try:
+                if ipaddress.ip_address(row["ip"]) in network:
+                    in_scope.append(row)
+                else:
+                    leases_other_subnets += 1
+            except (ValueError, KeyError):
+                leases_other_subnets += 1
+        merged = in_scope
+
     # Annotate each merged row with reservation cross-check
     for row in merged:
         match = res_by_mac.get(row["mac"])
@@ -1448,6 +1474,8 @@ def scope_leases(scope_id):
         scope=scope, leases=merged,
         nodes=creds, fetch_errors=fetch_errors,
         now=now, lease_file_path=LEASE_FILE,
+        leases_other_subnets=leases_other_subnets,
+        subnet_filter_cidr=str(network) if network is not None else "",
     )
 
 
