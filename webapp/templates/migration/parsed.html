@@ -34,7 +34,7 @@
     <!-- Stats cards -->
     <div class="row g-2 mb-3">
         {% set s = parsed.stats %}
-        {% for label, val in [('Interfaces', s.interfaces), ('Zones', s.zones), ('Addresses', s.addresses_custom), ('Addr Groups', s.address_groups), ('Services', s.services_custom), ('Svc Groups', s.service_groups), ('Policies (on)', s.policies_enabled), ('Policies (off)', s.policies_disabled), ('VIPs', s.vips), ('IP Pools', s.get('ip_pools', 0)), ('NAT Policies', s.get('nat_policies', 0)), ('VPN Tunnels', s.get('vpn_tunnels', 0))] %}
+        {% for label, val in [('Interfaces', s.interfaces), ('Zones', s.zones), ('Addresses', s.addresses_custom), ('Addr Groups', s.address_groups), ('Services', s.services_custom), ('Svc Groups', s.service_groups), ('Policies (on)', s.policies_enabled), ('Policies (off)', s.policies_disabled), ('VIPs', s.vips), ('IP Pools', s.get('ip_pools', 0)), ('NAT Policies', s.get('nat_policies', 0)), ('VPN Tunnels', s.get('vpn_tunnels', 0)), ('DHCP Scopes', s.get('dhcp_servers', 0)), ('DHCP Reservations', s.get('dhcp_reservations', 0))] %}
         <div class="col-6 col-md-3 col-lg">
             <div class="card bg-dark border-secondary stat-card">
                 <div class="card-body py-2 px-3">
@@ -48,7 +48,7 @@
 
     <!-- Tabs -->
     <ul class="nav nav-tabs mb-3">
-        {% for key, label in [('policies', 'Policies'), ('addresses', 'Addresses'), ('services', 'Services'), ('zones', 'Zones & Interfaces'), ('groups', 'Groups'), ('vips', 'VIPs'), ('nat', 'NAT / IP Pools'), ('vpn', 'VPN Tunnels')] %}
+        {% for key, label in [('policies', 'Policies'), ('addresses', 'Addresses'), ('services', 'Services'), ('zones', 'Zones & Interfaces'), ('groups', 'Groups'), ('vips', 'VIPs'), ('nat', 'NAT / IP Pools'), ('vpn', 'VPN Tunnels'), ('dhcp', 'DHCP')] %}
         <li class="nav-item">
             <a class="nav-link {% if tab == key %}active{% endif %}"
                href="{{ url_for('migration_parsed', project_id=project.id, tab=key) }}">{{ label }}</a>
@@ -400,6 +400,142 @@
     {% endfor %}
     {% else %}
     <div class="alert alert-secondary">No IPsec VPN tunnels found in this configuration.</div>
+    {% endif %}
+
+    {% elif tab == 'dhcp' %}
+    {# ───── DHCP servers + reservations (read-only review) ───── #}
+    {% set dhcp_servers = parsed.get('dhcp_servers', []) %}
+    {% if dhcp_servers %}
+    <div class="alert alert-info" style="font-size:0.85rem;">
+        <i class="bi bi-info-circle me-1"></i>
+        <strong>Read-only preview.</strong> The migration importer will populate
+        the existing DHCP Manager data store (scopes + reservations).
+        The actual push to the engine happens from the
+        <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>
+        — see <code>docs/DHCP-ReservationStrategy.md</code>.
+        Target clusters must be DHCP-ready (nodes enrolled, scope
+        opted into FlexEdge management) before the import target step.
+    </div>
+
+    {% for srv in dhcp_servers %}
+    <div class="card bg-dark border-secondary mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between">
+            <div>
+                <i class="bi bi-hdd-network me-1"></i>
+                <strong>DHCP server #{{ srv.id }}</strong>
+                <span class="text-muted ms-2">on interface
+                    <code>{{ srv.interface or '(none)' }}</code>
+                </span>
+                {% if srv.subnet_cidr %}
+                <span class="badge bg-secondary ms-2">{{ srv.subnet_cidr }}</span>
+                {% endif %}
+            </div>
+            <div>
+                <span class="badge bg-info">{{ srv.reservations | length }} reservation(s)</span>
+                {% if srv.unsupported_options %}
+                <span class="badge bg-warning text-dark"
+                      title="{{ srv.unsupported_options | join(', ') }}">
+                    {{ srv.unsupported_options | length }} unsupported
+                </span>
+                {% endif %}
+            </div>
+        </div>
+        <div class="card-body">
+            <div class="row g-3" style="font-size:0.85rem;">
+                <div class="col-md-6">
+                    <strong>Scope</strong>
+                    <table class="table table-sm table-dark mb-0 mt-1">
+                        <tr><td class="text-muted" style="width:40%;">Default gateway</td>
+                            <td><code>{{ srv.default_gateway or '-' }}</code></td></tr>
+                        <tr><td class="text-muted">Netmask</td>
+                            <td><code>{{ srv.netmask or '-' }}</code></td></tr>
+                        <tr><td class="text-muted">Lease time (s)</td>
+                            <td>{{ srv.lease_time or '-' }}</td></tr>
+                        <tr><td class="text-muted">Domain</td>
+                            <td>{{ srv.domain or '-' }}</td></tr>
+                        <tr><td class="text-muted">DNS servers</td>
+                            <td>{{ srv.dns_servers | join(', ') if srv.dns_servers else '-' }}</td></tr>
+                        <tr><td class="text-muted">NTP servers</td>
+                            <td>{{ srv.ntp_servers | join(', ') if srv.ntp_servers else '-' }}</td></tr>
+                        <tr><td class="text-muted">WINS servers</td>
+                            <td>{{ srv.wins_servers | join(', ') if srv.wins_servers else '-' }}</td></tr>
+                    </table>
+                </div>
+                <div class="col-md-6">
+                    <strong>Boot / advanced</strong>
+                    <table class="table table-sm table-dark mb-0 mt-1">
+                        <tr><td class="text-muted" style="width:40%;">TFTP server (opt 66)</td>
+                            <td>{{ srv.tftp_server or '-' }}</td></tr>
+                        <tr><td class="text-muted">Bootfile (opt 67)</td>
+                            <td>{{ srv.bootfile_name or '-' }}</td></tr>
+                        <tr><td class="text-muted">next-server</td>
+                            <td>{{ srv.next_server or '-' }}</td></tr>
+                        <tr><td class="text-muted">VCI match</td>
+                            <td>{% if srv.vci_match %}
+                                <span class="badge bg-success">enable</span>
+                                <code>{{ srv.vci_string }}</code>
+                                {% else %}-{% endif %}</td></tr>
+                        <tr><td class="text-muted">DHCP pool ranges</td>
+                            <td>
+                                {% for r in srv.ranges %}
+                                <code>{{ r.start_ip }} → {{ r.end_ip }}</code><br>
+                                {% else %}-{% endfor %}
+                            </td></tr>
+                    </table>
+                </div>
+            </div>
+
+            {% if srv.unsupported_options %}
+            <div class="mt-3">
+                <details>
+                    <summary class="text-warning" style="font-size:0.85rem;cursor:pointer;">
+                        <i class="bi bi-exclamation-triangle me-1"></i>
+                        {{ srv.unsupported_options | length }} FortiGate option(s) without a
+                        clean ISC dhcpd mapping (will be skipped at import)
+                    </summary>
+                    <pre class="json-detail mt-2" style="max-height:120px;">{{ srv.unsupported_options | join('\n') }}</pre>
+                </details>
+            </div>
+            {% endif %}
+
+            {% if srv.reservations %}
+            <h6 class="mt-3 mb-2">Reservations ({{ srv.reservations | length }})</h6>
+            <div class="table-responsive">
+                <table class="table table-sm table-hover table-dark mb-0">
+                    <thead><tr>
+                        <th style="width:6%;">FG id</th>
+                        <th style="width:18%;">IP</th>
+                        <th style="width:20%;">MAC</th>
+                        <th>Description</th>
+                    </tr></thead>
+                    <tbody>
+                    {% for r in srv.reservations %}
+                    <tr>
+                        <td><small class="text-muted">{{ r.id }}</small></td>
+                        <td><code>{{ r.ip }}</code></td>
+                        <td><code>{{ r.mac }}</code></td>
+                        <td><small>{{ r.description or '-' }}</small></td>
+                    </tr>
+                    {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% else %}
+            <p class="text-muted mb-0 mt-3" style="font-size:0.85rem;">
+                <em>No reservations defined.</em>
+            </p>
+            {% endif %}
+        </div>
+    </div>
+    {% endfor %}
+
+    {% else %}
+    <div class="alert alert-secondary">
+        <i class="bi bi-info-circle me-1"></i>
+        No <code>config system dhcp server</code> blocks found in this FortiGate
+        configuration. If your environment uses an external DHCP server (DHCP
+        relay), nothing to migrate here.
+    </div>
     {% endif %}
 
     {% endif %}

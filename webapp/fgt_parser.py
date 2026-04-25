@@ -87,12 +87,20 @@ def _parse_config_blocks(filepath):
     """Parse a FortiGate config file into a tree of config blocks.
 
     Returns a dict: { "section_path": [ {entry_dict}, ... ], ... }
-    Each entry_dict has 'name' (the edit name/id) and all set key-values.
+    Each entry_dict has '_name' (the edit name/id) and all set key-values.
+
+    Nested `config` blocks (e.g. `config reserved-address` inside a DHCP
+    server edit) are still flattened into their full path, but each
+    nested entry carries a ``_parent_name`` key with the immediate parent
+    edit's name so callers can group them. Sets that appear on the parent
+    edit *after* a nested ``config ... end`` block correctly attach to
+    the parent, not to the synthetic section-settings entry.
     """
     lines = Path(filepath).read_text(encoding="utf-8", errors="replace").splitlines()
 
     result = {}
-    stack = []        # stack of section names
+    stack = []                  # stack of section names
+    entry_stack = []            # parent edits — restored on `end`
     current_entry = None
     current_section = None
 
@@ -106,18 +114,21 @@ def _parse_config_blocks(filepath):
         # Handle 'config <section>' — push onto stack
         if stripped.startswith("config "):
             section_name = stripped[7:].strip()
+            # If we're inside an edit, remember it so we can restore on `end`
+            entry_stack.append(current_entry)
+            current_entry = None
             stack.append(section_name)
             current_section = " > ".join(stack)
             if current_section not in result:
                 result[current_section] = []
             continue
 
-        # Handle 'end' — pop from stack
+        # Handle 'end' — pop from stack and restore parent edit (if any)
         if stripped == "end":
-            current_entry = None
             if stack:
                 stack.pop()
             current_section = " > ".join(stack) if stack else None
+            current_entry = entry_stack.pop() if entry_stack else None
             continue
 
         # Handle 'edit <name>' — start a new entry
@@ -129,6 +140,9 @@ def _parse_config_blocks(filepath):
             else:
                 entry_name = entry_name_raw
             current_entry = {"_name": entry_name}
+            # If we're inside a nested config, link to the immediate parent
+            if entry_stack and entry_stack[-1] is not None:
+                current_entry["_parent_name"] = entry_stack[-1].get("_name", "")
             if current_section and current_section in result:
                 result[current_section].append(current_entry)
             continue
@@ -536,6 +550,246 @@ def _extract_ip_pools(tree):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  DHCP EXTRACTION
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# FortiGate `config system dhcp server` example:
+#
+#   config system dhcp server
+#       edit 1
+#           set default-gateway 192.168.10.1
+#           set netmask 255.255.255.0
+#           set interface "internal"
+#           set lease-time 86400
+#           set domain "example.local"
+#           set dns-server1 8.8.8.8
+#           set dns-server2 1.1.1.1
+#           set ntp-server1 192.168.10.1
+#           set tftp-server "10.0.0.5"
+#           set bootfile-name "pxelinux.0"
+#           set vci-match enable
+#           set vci-string "Lenovo"
+#           config ip-range
+#               edit 1
+#                   set start-ip 192.168.10.50
+#                   set end-ip 192.168.10.150
+#               next
+#           end
+#           config reserved-address
+#               edit 1
+#                   set ip 192.168.10.10
+#                   set mac aa:bb:cc:dd:ee:01
+#                   set description "printer"
+#               next
+#           end
+#       next
+#   end
+#
+# The parser flattens nested `config ip-range` and `config reserved-address`
+# into separate sections (`system dhcp server > ip-range`, etc.) and tags
+# each nested entry with `_parent_name` so we can group them back here.
+
+# Known FG fields that have a clean ISC dhcpd equivalent — used both for
+# extraction and to know what we WILL push (anything else lands in
+# `unsupported_options` so the operator sees what's lossy at import time).
+_DHCP_KNOWN_FIELDS = {
+    "default-gateway", "netmask", "interface", "lease-time", "domain",
+    "dns-server1", "dns-server2", "dns-server3", "dns-server4",
+    "ntp-server1", "ntp-server2", "ntp-server3",
+    "wins-server1", "wins-server2",
+    "tftp-server", "next-server", "bootfile-name",
+    "vci-match", "vci-string",
+    # Mode flags we record but don't need to map:
+    "status", "dns-service", "wifi-ac-service", "ipsec-lease-hold",
+    "auto-configuration",
+}
+
+
+def _extract_dhcp_servers(tree):
+    """Extract `config system dhcp server` entries with their nested
+    ip-range and reserved-address children grouped under each parent.
+
+    Each returned dict is shaped like::
+
+        {
+            "id": "1",                      # FG edit id (str)
+            "interface": "internal",
+            "subnet": "192.168.10.0",       # derived (range start ANDed with netmask)
+            "netmask": "255.255.255.0",
+            "subnet_cidr": "192.168.10.0/24",
+            "default_gateway": "192.168.10.1",
+            "domain": "example.local",
+            "lease_time": "86400",
+            "dns_servers": ["8.8.8.8", "1.1.1.1"],
+            "ntp_servers": [...],
+            "wins_servers": [...],
+            "tftp_server": "10.0.0.5",
+            "next_server": "",
+            "bootfile_name": "pxelinux.0",
+            "vci_match": True/False,
+            "vci_string": "Lenovo",
+            "ranges": [{"start_ip": "...", "end_ip": "..."}, ...],
+            "reservations": [
+                {"id": "1", "ip": "192.168.10.10",
+                 "mac": "aa:bb:cc:dd:ee:01",
+                 "description": "printer"},
+                ...
+            ],
+            "unsupported_options": ["foo-bar=enable", ...],
+            "raw": { ... },                 # full FG entry dict for debugging
+        }
+    """
+    servers = []
+    fg_servers = tree.get("system dhcp server", [])
+    fg_ranges = tree.get("system dhcp server > ip-range", [])
+    fg_resv = tree.get("system dhcp server > reserved-address", [])
+
+    # Group nested entries by their parent server's _name
+    ranges_by_parent: dict[str, list[dict]] = {}
+    for r in fg_ranges:
+        parent = r.get("_parent_name", "")
+        ranges_by_parent.setdefault(parent, []).append(r)
+
+    resv_by_parent: dict[str, list[dict]] = {}
+    for r in fg_resv:
+        parent = r.get("_parent_name", "")
+        resv_by_parent.setdefault(parent, []).append(r)
+
+    for entry in fg_servers:
+        if entry.get("_name", "").startswith("_"):
+            continue   # skip _section_settings synthetic entries
+        srv_id = entry["_name"]
+
+        # Coerce list-shaped values (FG sometimes wraps single values in lists)
+        def _scalar(key, default=""):
+            v = entry.get(key, default)
+            if isinstance(v, list):
+                return v[0] if v else default
+            if isinstance(v, bool):
+                return v
+            return v
+
+        def _flag(key):
+            v = entry.get(key, "disable")
+            if isinstance(v, bool):
+                return v
+            return str(v).lower() == "enable"
+
+        dns = [_scalar("dns-server1"), _scalar("dns-server2"),
+               _scalar("dns-server3"), _scalar("dns-server4")]
+        dns = [d for d in dns if d]
+
+        ntp = [_scalar("ntp-server1"), _scalar("ntp-server2"),
+               _scalar("ntp-server3")]
+        ntp = [n for n in ntp if n]
+
+        wins = [_scalar("wins-server1"), _scalar("wins-server2")]
+        wins = [w for w in wins if w]
+
+        ranges = []
+        for r in ranges_by_parent.get(srv_id, []):
+            ranges.append({
+                "id": r.get("_name", ""),
+                "start_ip": _scalar_of(r, "start-ip"),
+                "end_ip": _scalar_of(r, "end-ip"),
+            })
+
+        reservations = []
+        for r in resv_by_parent.get(srv_id, []):
+            reservations.append({
+                "id": r.get("_name", ""),
+                "ip": _scalar_of(r, "ip"),
+                "mac": _normalize_mac(_scalar_of(r, "mac")),
+                "description": _scalar_of(r, "description"),
+            })
+
+        # Compute subnet for matching against target SMC scopes
+        netmask = _scalar("netmask")
+        subnet_ip = ""
+        subnet_cidr = ""
+        if ranges and netmask:
+            subnet_ip = _subnet_from_range(ranges[0]["start_ip"], netmask)
+            cidr_bits = _netmask_to_prefix(netmask)
+            if subnet_ip and cidr_bits is not None:
+                subnet_cidr = f"{subnet_ip}/{cidr_bits}"
+
+        # Flag any keys we don't know how to translate
+        unsupported = []
+        for k, v in entry.items():
+            if k in _DHCP_KNOWN_FIELDS or k.startswith("_"):
+                continue
+            unsupported.append(f"{k}={v}")
+
+        servers.append({
+            "id": srv_id,
+            "interface": _scalar("interface"),
+            "subnet": subnet_ip,
+            "netmask": netmask,
+            "subnet_cidr": subnet_cidr,
+            "default_gateway": _scalar("default-gateway"),
+            "domain": _scalar("domain"),
+            "lease_time": _scalar("lease-time"),
+            "dns_servers": dns,
+            "ntp_servers": ntp,
+            "wins_servers": wins,
+            "tftp_server": _scalar("tftp-server"),
+            "next_server": _scalar("next-server"),
+            "bootfile_name": _scalar("bootfile-name"),
+            "vci_match": _flag("vci-match"),
+            "vci_string": _scalar("vci-string"),
+            "ranges": ranges,
+            "reservations": reservations,
+            "unsupported_options": unsupported,
+        })
+
+    return servers
+
+
+def _scalar_of(entry: dict, key: str, default: str = "") -> str:
+    """Local helper: read a key from an FG entry, unwrap list, return string."""
+    v = entry.get(key, default)
+    if isinstance(v, list):
+        return v[0] if v else default
+    if isinstance(v, bool):
+        return "enable" if v else "disable"
+    return v if isinstance(v, str) else str(v)
+
+
+def _normalize_mac(mac: str) -> str:
+    """Lowercase colon form: aa:bb:cc:dd:ee:ff (FG sometimes uses dashes)."""
+    if not mac:
+        return ""
+    return mac.strip().lower().replace("-", ":")
+
+
+def _netmask_to_prefix(netmask: str) -> int | None:
+    """255.255.255.0 → 24. Returns None on malformed input."""
+    try:
+        parts = [int(p) for p in netmask.split(".")]
+        if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+            return None
+        bits = "".join(format(p, "08b") for p in parts)
+        # Must be contiguous 1s followed by contiguous 0s
+        if "01" in bits:
+            return None
+        return bits.count("1")
+    except (ValueError, AttributeError):
+        return None
+
+
+def _subnet_from_range(ip: str, netmask: str) -> str:
+    """Derive the network address from any IP in the subnet + the netmask."""
+    try:
+        ip_parts = [int(p) for p in ip.split(".")]
+        mask_parts = [int(p) for p in netmask.split(".")]
+        if len(ip_parts) != 4 or len(mask_parts) != 4:
+            return ""
+        return ".".join(str(i & m) for i, m in zip(ip_parts, mask_parts))
+    except (ValueError, AttributeError):
+        return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  VPN EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -695,6 +949,7 @@ def parse_fortigate_config(filepath):
     policies = _extract_policies(tree)
     vips = _extract_vips(tree)
     ip_pools = _extract_ip_pools(tree)
+    dhcp_servers = _extract_dhcp_servers(tree)
     vpn_phase1 = _extract_vpn_phase1(tree)
     vpn_phase2 = _extract_vpn_phase2(tree)
     vpn_tunnels = _build_vpn_summary(vpn_phase1, vpn_phase2)
@@ -732,6 +987,8 @@ def parse_fortigate_config(filepath):
     custom_addresses = [a for a in addresses if not a["builtin"]]
     custom_services = [s for s in services if not s["builtin"]]
 
+    dhcp_reservations_total = sum(len(s["reservations"]) for s in dhcp_servers)
+
     stats = {
         "interfaces": len(interfaces),
         "zones": len(zones),
@@ -749,6 +1006,8 @@ def parse_fortigate_config(filepath):
         "nat_policies": nat_policies,
         "vpn_tunnels": len(vpn_tunnels),
         "vpn_phase2_total": len(vpn_phase2),
+        "dhcp_servers": len(dhcp_servers),
+        "dhcp_reservations": dhcp_reservations_total,
     }
 
     return {
@@ -762,6 +1021,7 @@ def parse_fortigate_config(filepath):
         "policies": policies,
         "vips": vips,
         "ip_pools": ip_pools,
+        "dhcp_servers": dhcp_servers,
         "vpn_tunnels": vpn_tunnels,
         "stats": stats,
     }

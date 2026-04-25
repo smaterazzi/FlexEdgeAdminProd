@@ -579,15 +579,7 @@ def reservation_delete(reservation_id):
 @dhcp_bp.route("/scopes/<int:scope_id>/deploy", methods=["POST"])
 @admin_required
 def scope_deploy(scope_id):
-    scope = _scope_or_404(scope_id)
-    if not scope:
-        return redirect(url_for("dhcp.scopes_list"))
-    target = f"{scope.engine_name}/{scope.interface_id}"
-    _log_activity("deploy", "push", "info", target,
-                  "Deploy requested; awaiting Phase 4 (SSH deployer).")
-    flash("Deploy is not wired yet — Phase 4 (SSH-based engine sync) is pending. "
-          "Reservations are stored in SMC and ready for the deployer.", "warning")
-    return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+    return _run_push(scope_id, action="push")
 
 
 @dhcp_bp.route("/scopes/<int:scope_id>/resync", methods=["POST"])
@@ -597,16 +589,60 @@ def scope_resync(scope_id):
 
     Per operator preference (Phase 3 plan question 3), the sync loop is
     operator-triggered via this button instead of a post-policy-upload
-    webhook. Phase 4 wires this to the actual deployer.
+    webhook. Phase 4 — same path as deploy, just a different audit action.
     """
+    return _run_push(scope_id, action="resync")
+
+
+def _run_push(scope_id: int, action: str):
+    """Shared deploy/resync handler — orchestrates the SSH push and
+    surfaces results as flash messages + activity-log rows.
+    """
+    from webapp.dhcp_pusher import push_scope_to_engine
+
     scope = _scope_or_404(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
+
     target = f"{scope.engine_name}/{scope.interface_id}"
-    _log_activity("deploy", "resync", "info", target,
-                  "Re-sync requested; awaiting Phase 4 (SSH deployer).")
-    flash("Re-sync queued. The engine-side sync runs once Phase 4 lands.",
-          "warning")
+    operator = _operator_email()
+
+    _log_activity("deploy", action, "info", target,
+                  f"{action.capitalize()} starting for scope {scope.id}.")
+
+    result = push_scope_to_engine(scope.id, operator, action=action)
+
+    if result.overall_status == "blocked":
+        flash(f"Deployment blocked: {result.blocked_reason}", "warning")
+        _log_activity("deploy", action, "blocked", target,
+                      f"Blocked: {result.blocked_reason}")
+    elif result.overall_status == "ok":
+        flash(f"Deploy succeeded on all {result.successful_nodes} node(s). "
+              f"Pushed {result.nodes[0].reservations_count if result.nodes else 0} "
+              f"reservation(s).", "success")
+        _log_activity("deploy", action, "ok", target,
+                      f"OK on {result.successful_nodes}/{len(result.nodes)} nodes.")
+    elif result.overall_status == "partial":
+        failed = ", ".join(f"node {n.node_index}: {n.error}"
+                           for n in result.nodes if n.status != "ok")
+        flash(f"Partial success: {result.successful_nodes}/{len(result.nodes)} "
+              f"nodes pushed. Failures: {failed}", "warning")
+        _log_activity("deploy", action, "partial", target,
+                      f"Partial: {result.successful_nodes}/{len(result.nodes)} "
+                      f"OK. Failures: {failed}")
+    else:
+        failed = "; ".join(f"node {n.node_index}: {n.error}"
+                           for n in result.nodes) or "no nodes attempted"
+        flash(f"Deploy failed on all nodes. {failed}", "danger")
+        _log_activity("deploy", action, "failed", target,
+                      f"Failed on all nodes: {failed}")
+
+    # Surface any reload warnings as additional flashes.
+    for n in result.nodes:
+        if n.reload_warning:
+            flash(f"Node {n.node_index}: dhcpd reload warning — "
+                  f"{n.reload_warning}", "warning")
+
     return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
 
 

@@ -481,10 +481,20 @@ The DHCP Manager (`/dhcp/*`, admin-only) lets operators define MAC-to-IP reserva
 
 1. **Set the FEA source IP per tenant** — DHCP Manager → Credentials, Card 1. Click the magnifier to auto-detect FlexEdgeAdmin's public IP, or type whatever IP the engine will see when FEA connects (LAN IP if on the same private subnet). One-time per tenant.
 2. **Discover scopes** — DHCP Manager → Scopes → pick a tenant + API key + engine → Discover. Every interface (and VLAN child) with the internal DHCP server enabled appears as a row. Enable the scope to start managing it.
-3. **Enroll the cluster** — Credentials page, Card 2: pick the same tenant + key + engine → Discover nodes → pick a destination IP → **Install rule + push** (creates a `flexedge-dhcp-mgmt-ssh-<engine>` Allow rule on the engine's active policy and pushes it). Then per-node, click **Auto-enroll via SMC**: FlexEdge sets a 64-char random root password via `change_ssh_pwd` and SSH-connects to capture the host fingerprint. The operator never types or sees a password.
-4. **Add reservations** — back on the scope detail page, **New reservation** opens the Host CRUD form. The MAC is stored as a marker in the SMC Host's `comment`. To import existing Host elements that already carry the marker, click **Sync from SMC**.
-5. **Inspect leases** — scope detail → **View leases**. Reads `/spool/dhcp-server/dhcpd.leases` from every enrolled cluster node, merges them, and cross-checks each lease against tracked reservations: green badge = matches, red = IP mismatch with reservation, grey = pool client.
-6. **Deploy reservations to the engine** — pending Phase 4. Today the **Deploy** button on the scope page logs the intent only.
+3. **Discover the cluster** — Credentials page, Card 2: pick the same tenant + key + engine → Discover nodes. FlexEdge enumerates each node's NDIs (Node Dedicated IPs) by walking the engine's physical-interface config, and detects whether the cluster uses **Node-Initiated Contact** (via the `reverse_connection` flag).
+4. **Install the SSH allow rule** — the rule install card shows checkboxes per candidate IP, one per node. SMC-initiated cluster: all pre-checked (one rule covers the whole cluster). Node-initiated cluster: explicit selection required (the engine's primary mgmt IP usually isn't reachable from FEA in this mode). Click **Install rule + push** to create the `flexedge-dhcp-mgmt-ssh-<engine>` rule with all chosen IPs as destinations and push the policy.
+5. **Bulk-enroll nodes** — green **Enroll all (N)** button at the top of the cluster nodes section enrolls every unenrolled node in one batch: ONE SMC session, ONE per-engine lock, parallel-friendly. For each node FlexEdge sets a 64-char random root password via `change_ssh_pwd` and SSH-connects to capture the host fingerprint. Operator never types or sees a password. Per-node Auto-enroll buttons remain for surgical single-node operations.
+6. **Add reservations** — back on the scope detail page, **New reservation** opens the Host CRUD form. The MAC is stored as a marker in the SMC Host's `comment`. To import existing Host elements that already carry the marker, click **Sync from SMC**.
+7. **Inspect leases** — scope detail → **View leases**. Reads `/spool/dhcp-server/dhcpd.leases` from every enrolled cluster node, merges them, and cross-checks each lease against tracked reservations: green badge = matches, red = IP mismatch with reservation, grey = pool client.
+8. **Deploy reservations to the engine** — pending Phase 4. Today the **Deploy** button on the scope page logs the intent only.
+
+### Summary view
+
+The DHCP Manager dashboard (`/dhcp/`) gives at-a-glance health of the whole feature:
+
+- **Top stats row** — tracked scopes / enabled / total reservations / out-of-sync.
+- **Credentials stats row** — enrolled engines / total node credentials / verified (with red "N failing" badge if any) / SSH allow rules in policies.
+- **Enrolled clusters & nodes table** — one row per (tenant, engine) showing node count + chip list (`n0, n1, n2`), status pills (green ok / red failing), rule name with multi-IP indicator (`+N more`), and last-verified timestamp. Direct link to the credentials page for management.
 
 ### Required SMC API permissions
 

@@ -6,7 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-25
 
-### Added — DHCP Reservation Manager (in progress — phases 0, 1, 1b, 1c, 2, 3 landed)
+### Added — DHCP Reservation Manager (in progress — phases 0, 1, 1b, 1c, 2, 3, 4 landed)
+
+**Phase 4 — engine-side reservation push (2026-04-25):**
+
+- **`webapp/dhcp_pusher.py`** — new module: renders FlexEdge-managed reservations as ISC dhcpd `host { hardware ethernet ...; fixed-address ...; }` blocks, merges them into `/data/config/base/dhcp-server.conf` between `# FLEXEDGE-RESERVATIONS-BEGIN` / `# FLEXEDGE-RESERVATIONS-END` markers (idempotent: replaces existing block in place), and atomically writes via `put_file()` (tmp + posix_rename). SMC's subnet block is never touched — host blocks at top level work because ISC matches them by IP into the surrounding subnet.
+- **Per-node orchestration** — `push_scope_to_engine(scope_id, operator_email, action)` runs against every cluster node in order: TCP probe → credential verify → read current file → render + merge → atomic write → re-read verify (sha256 round-trip) → best-effort `pkill -HUP` reload. Each node gets a `DhcpDeployment` audit row with sha256_before/after, unified diff (trimmed to 200 lines), duration, and any reload warning. Reservation rows flip to `synced` on full success, `error` on partial / total failure (with `last_error` populated).
+- **Pre-flight guard** — `_check_preconditions()` blocks the push if the scope isn't `enabled_in_flexedge`, any cluster node lacks a verified credential, or the SSH allow rule is missing — surfacing a clear operator-facing message + `dhcp_activity_logs` row instead of attempting and failing per-node.
+- **Wired into existing routes** — `POST /dhcp/scopes/<id>/deploy` and `POST /dhcp/scopes/<id>/resync` now call the pusher (replacing the Phase-3 stubs that only flashed warnings). The existing "Deploy to engine" button on `scope_detail.html` works without template changes.
+- **Per-node failure isolation** — failures on one node never abort the loop; aggregate status is `ok` (all nodes), `partial` (some), or `failed` (none). Operator gets per-node detail in flash messages and the deployment-history card.
+- **Reload best effort** — `pkill -HUP` against `dhcp-server` then `dhcpd` (Forcepoint engines run the daemon under either name); if neither matches we surface a warning and tell the operator to refresh the policy in SMC. Never fails the deployment over a reload issue.
+
+**Cluster-wide enrollment + summary view (UX iteration, late Apr 2026):**
+
+**Cluster-wide enrollment + summary view (UX iteration, late Apr 2026):**
+
+- **Multi-IP SSH allow rule** — `add_ssh_access_rule(... destination_ips: list)` now creates one rule with N Host elements (`<rule_name>-dst-0`, `<rule_name>-dst-1`, …) so a single rule covers every cluster node. Multi-checkbox picker in the UI; SMC-initiated cluster pre-checks all IPs, node-initiated requires explicit operator selection. Cleanup symmetrically removes both the new `-dst-<n>` shape and the legacy single `-dst` shape.
+- **Bulk enrollment** — new `POST /credentials/bootstrap-batch` endpoint enrolls every unenrolled node for an engine within ONE `smc_session` and ONE per-engine lock. Green "Enroll all (N)" button at the top of the cluster nodes section reads each node form's data and submits a single POST. Per-node "Auto-enroll" buttons retained for surgical operations.
+- **Dashboard summary** — `/dhcp/` now has a second stats row (Enrolled engines, Total node credentials, Verified, SSH allow rules in policies) and an "Enrolled clusters & nodes" table grouped by (tenant, engine) showing node count, status pills, rule name with multi-IP indicator (`+N more`), and last-verified timestamp.
+- **NDI-based node discovery** — `list_cluster_nodes()` now walks `engine.physical_interface` config (instead of the runtime `interface_status` probe that returned empty). Picks up `NodeInterface` and `SingleNodeInterface` entries from physical + VLAN children, groups by `nodeid`. Skips `cluster_virtual_interface` (CVI) — those are shared cluster IPs, not per-node targets.
+- **Node-initiated contact detection** — new `is_node_initiated_contact()` reads the `reverse_connection` flag on every primary mgmt interface (the SDK's name for what the SMC GUI calls "Node-Initiated Contact"). Banner in the rule install card; per-node IP picker requires explicit selection vs auto-suggesting the primary mgt IP.
 
 - **Phase 1c — Auto-enrollment via SMC API**. Replaces the Phase 1 password-prompt flow.
   - **No password ever typed by the operator.** FlexEdgeAdmin generates a 64-char random root password and sets it via SMC's `node.change_ssh_pwd` endpoint.
