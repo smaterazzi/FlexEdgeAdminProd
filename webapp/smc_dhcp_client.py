@@ -22,8 +22,13 @@ from dataclasses import dataclass, field
 
 from smc.core.engine import Engine
 from smc.elements.network import Host
+from smc.elements.service import TCPService
+from smc.policy.layer3 import FirewallPolicy
+from smc.policy.rule_elements import Action, LogOptions
 
-from webapp.smc_tls_client import SMCConfig, smc_session, smc_error_detail
+from webapp.smc_tls_client import (
+    SMCConfig, smc_session, smc_error_detail, get_engine_active_policy,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +42,10 @@ __all__ = [
     "host_create", "host_update", "host_delete", "host_list_by_scope",
     "host_get",
     "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView",
+    "set_node_ssh_enabled", "change_node_ssh_password",
+    "find_active_policy", "find_ssh_access_rule",
+    "add_ssh_access_rule", "remove_ssh_access_rule",
+    "policy_upload",
 ]
 
 
@@ -556,3 +565,166 @@ def host_list_by_scope(subnet_cidr: str) -> list[DhcpHostView]:
         except ValueError:
             continue
     return views
+
+
+# ── Node SSH controls (Phase 1c — auto-enrollment) ──────────────────────
+
+def set_node_ssh_enabled(engine_name: str, node_index: int,
+                         enabled: bool, comment: str = "") -> None:
+    """Enable or disable the SSH daemon on a single cluster node."""
+    engine = Engine(engine_name)
+    nodes = list(getattr(engine, "nodes", []) or [])
+    if node_index >= len(nodes):
+        raise ValueError(
+            f"Node index {node_index} out of range (engine has {len(nodes)} node(s))"
+        )
+    nodes[node_index].ssh(enable=enabled, comment=comment or None)
+
+
+def change_node_ssh_password(engine_name: str, node_index: int,
+                             new_password: str, comment: str = "") -> None:
+    """Set the root SSH password on a single cluster node via SMC API.
+
+    Underlying call: `node.change_ssh_pwd` from fp-NGFW-SMC-python. Audit
+    comment is recorded by SMC and visible in Management Client.
+    """
+    engine = Engine(engine_name)
+    nodes = list(getattr(engine, "nodes", []) or [])
+    if node_index >= len(nodes):
+        raise ValueError(
+            f"Node index {node_index} out of range (engine has {len(nodes)} node(s))"
+        )
+    nodes[node_index].change_ssh_pwd(new_password, comment=comment or None)
+
+
+# ── Active policy + SSH-access rule management (Phase 1c) ───────────────
+
+def find_active_policy(engine_name: str) -> str:
+    """Return the name of the policy currently installed on the engine.
+
+    Falls back to engine-level installed_policy attribute. Raises
+    RuntimeError if no policy is found (caller surfaces as actionable
+    error to the operator).
+    """
+    policy = get_engine_active_policy(engine_name)
+    if not policy:
+        raise RuntimeError(
+            f"No installed policy found on engine {engine_name!r} — "
+            f"install a policy in SMC before enrolling SSH credentials."
+        )
+    if hasattr(policy, "name"):
+        return policy.name
+    return str(policy)
+
+
+def find_ssh_access_rule(policy_name: str, rule_name: str) -> dict | None:
+    """Locate our managed rule by exact name. Returns
+    {name, href, is_disabled, comment} or None if missing.
+    """
+    policy = FirewallPolicy(policy_name)
+    for rule in policy.fw_ipv4_access_rules.all():
+        if rule.name == rule_name:
+            return {
+                "name": rule.name,
+                "href": rule.href,
+                "is_disabled": rule.is_disabled,
+                "comment": rule.comment or "",
+            }
+    return None
+
+
+def _ensure_host_for_ip(name: str, ip: str) -> Host:
+    """Idempotent: get-or-create a Host element with the given name+IP."""
+    try:
+        host = Host(name)
+        host.href     # force load
+        return host
+    except Exception:
+        Host.create(name=name, address=ip)
+        return Host(name)
+
+
+def add_ssh_access_rule(policy_name: str, rule_name: str,
+                        source_ip: str, destination_ip: str,
+                        comment: str = "") -> str:
+    """Insert (at top of rule list) an Allow rule on TCP/22 from source_ip
+    to destination_ip in the named policy. Returns the new rule's href.
+
+    Idempotent: if a rule with `rule_name` already exists, this returns its
+    href without re-adding.
+
+    The `source_ip` and `destination_ip` are wrapped as Host elements named
+    after the rule (so leftover Host objects from one engine don't pollute
+    other engines' rules).
+    """
+    existing = find_ssh_access_rule(policy_name, rule_name)
+    if existing:
+        return existing["href"]
+
+    src_host = _ensure_host_for_ip(f"{rule_name}-src", source_ip)
+    dst_host = _ensure_host_for_ip(f"{rule_name}-dst", destination_ip)
+
+    policy = FirewallPolicy(policy_name)
+    action = Action()
+    action.action = "allow"
+
+    log_opts = LogOptions()
+    log_opts.log_level = "stored"
+
+    policy.fw_ipv4_access_rules.create(
+        name=rule_name,
+        sources=[src_host],
+        destinations=[dst_host],
+        services=[TCPService("SSH")],
+        action=action,
+        log_options=log_opts,
+        add_pos=1,
+        comment=comment[:255] if comment else "",
+    )
+    after = find_ssh_access_rule(policy_name, rule_name)
+    if not after:
+        raise RuntimeError(
+            f"Created rule {rule_name!r} but cannot find it again — "
+            f"policy iteration returned nothing matching the name."
+        )
+    return after["href"]
+
+
+def remove_ssh_access_rule(policy_name: str, rule_name: str
+                           ) -> tuple[bool, str]:
+    """Delete the named rule from the policy. Also tries to remove the
+    Host elements we created for it.
+
+    Returns (rule_was_present, message). `rule_was_present=False` if it
+    was already gone (still considered success — idempotent).
+    """
+    policy = FirewallPolicy(policy_name)
+    target = None
+    for rule in policy.fw_ipv4_access_rules.all():
+        if rule.name == rule_name:
+            target = rule
+            break
+    rule_existed = target is not None
+    if target:
+        try:
+            target.delete()
+        except Exception as exc:
+            return rule_existed, f"rule delete failed: {smc_error_detail(exc)}"
+
+    # Best-effort host cleanup (silent failure ok)
+    for suffix in ("-src", "-dst"):
+        try:
+            Host(f"{rule_name}{suffix}").delete()
+        except Exception:
+            pass
+
+    return rule_existed, "ok"
+
+
+def policy_upload(engine_name: str, policy_name: str | None = None) -> str:
+    """Trigger a policy install on the engine. Synchronous-feeling — the
+    SDK call returns once the upload task completes."""
+    engine = Engine(engine_name)
+    if policy_name:
+        return str(engine.upload(policy=policy_name))
+    return str(engine.upload())

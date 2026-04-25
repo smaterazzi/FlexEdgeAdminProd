@@ -4,19 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-24
+## [2.2.0-dev] - 2026-04-25
 
-### Added — DHCP Reservation Manager (in progress — phases 0, 2, 3 landed)
+### Added — DHCP Reservation Manager (in progress — phases 0, 1, 1b, 1c, 2, 3 landed)
 
-- **Phase 0 lab test procedure** — [docs/DHCP-Phase0-LabTest.md](docs/DHCP-Phase0-LabTest.md): operator-ready procedure that verifies whether `/data/config/base/dhcp-server.conf` survives policy refresh/upload/reboot on a live cluster. Results of this test gate Phase 4.
-- **New DB tables** (auto-created on first boot via `db.create_all()`): `dhcp_scopes`, `dhcp_reservations`, `dhcp_deployments`, `dhcp_activity_logs`.
-- **DHCP Manager Blueprint** at `/dhcp/*` — admin-only, sidebar nav:
-  - Scope discovery (enumerates every DHCP-enabled interface + VLAN child on an engine)
-  - Reservation CRUD — creates SMC Host objects with the MAC packed into `Host.comment` as `[flexedge:mac=aa:bb:cc:dd:ee:ff]`. Full Host-API surface exposed (name, address, ipv6, secondary, tools_profile_ref, comment).
-  - Sync-from-SMC — import pre-existing Host elements with the marker into FlexEdge tracking.
-  - Per-scope Activity log + Deployment history pages.
-  - Bearer-token webhook endpoint stub at `/dhcp/api/*` (token auto-generated at `/config/.dhcp_api_token`, chmod 600).
-- **Deploy / Re-sync buttons are wired but log intent only** — the engine-side SSH push lands with Phase 4.
+- **Phase 1c — Auto-enrollment via SMC API**. Replaces the Phase 1 password-prompt flow.
+  - **No password ever typed by the operator.** FlexEdgeAdmin generates a 64-char random root password and sets it via SMC's `node.change_ssh_pwd` endpoint.
+  - **No public-key install.** Auth is **password-only** (Fernet-encrypted in DB, pinned host fingerprint), engine `authorized_keys` left untouched.
+  - **SSH allow rule** auto-installed on the engine's active policy (name `flexedge-dhcp-mgmt-ssh-<engine>`), with operator-confirmed source IP. Rule is removed when last credential for the engine is deleted, or via a manual "Remove SSH rule" button. Detected if removed externally — banner asks operator to recreate.
+  - **Per-engine concurrency lock** prevents two enrollments racing on the same node's password.
+  - **A3 recovery path**: when verify fails with `paramiko.AuthenticationException` (someone changed root pw out of band), an operator-confirmed "Force re-bootstrap" button rotates the password again via SMC API.
+  - **Pre-flight TCP probe** to the chosen node IP before mutating anything — fails fast with a clear error if the rule push didn't open the path.
+  - **Public-IP probe** (api.ipify.org / ifconfig.me / icanhazip) suggests the FEA source IP per tenant; operator confirms or overrides.
+- **Schema changes (auto-migrating on boot)**:
+  - `tenants.flexedge_source_ip` (new column, ALTER TABLE on existing DBs).
+  - `dhcp_engine_credentials` — replaces `public_key_openssh` + `private_key_pem` with `encrypted_password`. Existing key-based rows from earlier dev-only Phase 1 are dropped on first boot of the new schema (logged warning); re-enroll affected nodes.
+  - `dhcp_engine_ssh_access` (new) — tracks the FlexEdge-managed SSH allow rule per engine with the rule name as the stable lookup tag.
+- **CLAUDE.md DB schema section** to be updated in Phase 6 along with all docs.
+
+### Phase summary (cumulative across earlier 2.2.0-dev iterations)
+
+- **Phase 0** — [docs/DHCP-Phase0-LabTest.md](docs/DHCP-Phase0-LabTest.md): operator-ready procedure to verify whether `/data/config/base/dhcp-server.conf` survives policy refresh/upload/reboot. Gates Phase 4.
+- **Phase 2** — DB tables `dhcp_scopes`, `dhcp_reservations`, `dhcp_deployments`, `dhcp_activity_logs`, `dhcp_engine_credentials`, `dhcp_engine_ssh_access`.
+- **Phase 3** — DHCP Manager Blueprint at `/dhcp/*` (admin-only): scope discovery (recursive walker handling multiple DHCP-config shapes), reservation CRUD with `[flexedge:mac=...]` marker on SMC Host comment, sync-from-SMC, deploy stub, diagnostic endpoint, activity log.
+- **Phase 1b** — Cluster lease viewer: ISC `dhcpd.leases` parser, per-engine cluster lease table with reservation cross-check (mismatch flagged red).
 
 ### Changed — DHCP Reservation Manager
 

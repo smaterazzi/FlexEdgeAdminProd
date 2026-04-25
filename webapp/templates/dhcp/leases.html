@@ -1,0 +1,152 @@
+{% extends "base.html" %}
+{% block title %}DHCP Leases — {{ scope.subnet_cidr }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scopes_list') }}">Scopes</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scope_detail', scope_id=scope.id) }}">{{ scope.subnet_cidr }}</a></li>
+    <li class="breadcrumb-item active">Leases</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2 class="mb-0"><i class="bi bi-clipboard-data"></i>
+    Active leases <small class="text-muted">on <code>{{ scope.subnet_cidr }}</code></small>
+  </h2>
+  <div>
+    <span class="text-muted small me-2">Read from <code>{{ lease_file_path }}</code> · {{ now.strftime('%H:%M:%S') }}</span>
+    <a href="{{ url_for('dhcp.scope_leases', scope_id=scope.id) }}" class="btn btn-sm btn-outline-primary">
+      <i class="bi bi-arrow-clockwise"></i> Refresh
+    </a>
+  </div>
+</div>
+
+<div class="row g-2 mb-3">
+  {% for n in nodes %}
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-body py-2">
+        <div class="d-flex justify-content-between">
+          <span>
+            <strong>Node {{ n.node_index }}</strong>
+            {% if n.node_name %}<small class="text-muted">{{ n.node_name }}</small>{% endif %}
+            — <code>{{ n.hostname }}</code>
+          </span>
+          {% if fetch_errors.get(n.node_index) %}
+            <span class="badge bg-danger" title="{{ fetch_errors.get(n.node_index) }}">read failed</span>
+          {% else %}
+            <span class="badge bg-success">ok</span>
+          {% endif %}
+        </div>
+        {% if fetch_errors.get(n.node_index) %}
+          <div class="small text-danger mt-1 text-truncate" title="{{ fetch_errors.get(n.node_index) }}">
+            {{ fetch_errors.get(n.node_index) }}
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+{% if leases %}
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <span>{{ leases|length }} unique (MAC, IP) entries across all nodes</span>
+    <div>
+      <button class="btn btn-sm btn-outline-secondary" onclick="filterLeases('all')">All</button>
+      <button class="btn btn-sm btn-outline-success" onclick="filterLeases('active')">Active</button>
+      <button class="btn btn-sm btn-outline-warning" onclick="filterLeases('expired')">Expired/free</button>
+      <button class="btn btn-sm btn-outline-info" onclick="filterLeases('reserved')">Reserved</button>
+      <button class="btn btn-sm btn-outline-danger" onclick="filterLeases('mismatch')">IP mismatch</button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr>
+          <th>IP</th><th>MAC</th><th>Hostname</th>
+          <th>State</th><th>Ends</th><th>Seen on</th>
+          <th>Reservation</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for l in leases %}
+        <tr class="lease-row"
+            data-state="{{ l.binding_state }}"
+            data-reserved="{{ '1' if l.reservation_id else '0' }}"
+            data-mismatch="{{ '1' if l.reservation_id and not l.reservation_matches else '0' }}">
+          <td><code>{{ l.ip }}</code></td>
+          <td><code>{{ l.mac }}</code></td>
+          <td>{{ l.client_hostname or '—' }}</td>
+          <td>
+            {% if l.binding_state == 'active' %}
+              <span class="badge bg-success">active</span>
+            {% elif l.binding_state == 'free' %}
+              <span class="badge bg-secondary">free</span>
+            {% elif l.binding_state == 'expired' %}
+              <span class="badge bg-warning text-dark">expired</span>
+            {% elif l.binding_state == 'abandoned' %}
+              <span class="badge bg-danger">abandoned</span>
+            {% else %}
+              <span class="badge bg-secondary">{{ l.binding_state or '—' }}</span>
+            {% endif %}
+          </td>
+          <td class="small text-nowrap">
+            {% if l.ends %}{{ l.ends.strftime('%Y-%m-%d %H:%M') }}{% else %}never{% endif %}
+          </td>
+          <td class="small">
+            {% for n in l.seen_on_nodes %}<span class="badge bg-dark me-1">node {{ n }}</span>{% endfor %}
+          </td>
+          <td class="small">
+            {% if l.reservation_id %}
+              {% if l.reservation_matches %}
+                <a href="{{ url_for('dhcp.reservation_edit', reservation_id=l.reservation_id) }}"
+                   class="badge bg-info text-dark text-decoration-none" title="Matches reservation">
+                  <i class="bi bi-pin-angle"></i> {{ l.reservation_host }}
+                </a>
+              {% else %}
+                <a href="{{ url_for('dhcp.reservation_edit', reservation_id=l.reservation_id) }}"
+                   class="badge bg-danger text-decoration-none"
+                   title="Reservation expects IP {{ l.reservation_ip }} but lease gave {{ l.ip }}">
+                  <i class="bi bi-exclamation-triangle"></i> {{ l.reservation_host }} (expects {{ l.reservation_ip }})
+                </a>
+              {% endif %}
+            {% else %}
+              <span class="text-muted">pool</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% elif not fetch_errors %}
+<div class="alert alert-info">No leases in file on any node — likely a clean / freshly-booted cluster.</div>
+{% else %}
+<div class="alert alert-warning">
+  Could not read leases from any node. See the node status cards above for error details.
+</div>
+{% endif %}
+
+</div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+function filterLeases(mode) {
+  document.querySelectorAll(".lease-row").forEach(row => {
+    let show = true;
+    if (mode === "active")   show = row.dataset.state === "active";
+    if (mode === "expired")  show = (row.dataset.state === "free" || row.dataset.state === "expired");
+    if (mode === "reserved") show = row.dataset.reserved === "1";
+    if (mode === "mismatch") show = row.dataset.mismatch === "1";
+    row.style.display = show ? "" : "none";
+  });
+}
+</script>
+{% endblock %}

@@ -12,10 +12,12 @@ Tables:
   tls_deployment_logs  Per-deployment audit log
   tls_activity_logs    App-wide TLS activity log
 
-  dhcp_scopes          DHCP Manager — per-engine interfaces with internal DHCP active
-  dhcp_reservations    DHCP Manager — MAC→IP reservations (source of truth is SMC Host)
-  dhcp_deployments     DHCP Manager — per-node push history
-  dhcp_activity_logs   DHCP Manager — app-wide activity log
+  dhcp_scopes              DHCP Manager — per-engine interfaces with internal DHCP active
+  dhcp_reservations        DHCP Manager — MAC→IP reservations (source of truth is SMC Host)
+  dhcp_deployments         DHCP Manager — per-node push history
+  dhcp_activity_logs       DHCP Manager — app-wide activity log
+  dhcp_engine_credentials  DHCP Manager — per-node SSH password (root), Fernet-encrypted
+  dhcp_engine_ssh_access   DHCP Manager — managed SSH-allow rule per engine (created in SMC)
 
   optimization_submissions  Rule-optimizer findings submitted for admin review
 """
@@ -65,6 +67,7 @@ class Tenant(db.Model):
     timeout = db.Column(db.Integer, default=120, nullable=False)
     default_domain = db.Column(db.String(255), default="", nullable=False)
     api_version = db.Column(db.String(16), nullable=True)
+    flexedge_source_ip = db.Column(db.String(45), default="", nullable=False)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
@@ -342,6 +345,94 @@ class DhcpDeployment(db.Model):
 
     def __repr__(self):
         return f"<DhcpDeployment scope={self.scope_id} node={self.node_index} status={self.status}>"
+
+
+class DhcpEngineCredential(db.Model):
+    """Per-node SSH credential used to read/write DHCP config files on an
+    NGFW engine node.
+
+    Auth model: root + password (Fernet-encrypted). The password is set by
+    FlexEdgeAdmin via SMC's `change_ssh_pwd` API at enrollment, so the
+    operator never sees or types it. Host fingerprint is pinned on first
+    contact (TOFU); subsequent connects fail closed if the engine's host
+    keys change.
+
+    Uniqueness: one credential per (tenant, engine, node_id). `node_id`
+    comes from SMC so it survives engine renames or node reordering.
+    """
+    __tablename__ = "dhcp_engine_credentials"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+
+    engine_name = db.Column(db.String(256), nullable=False)
+    node_index = db.Column(db.Integer, default=0, nullable=False)
+    node_id = db.Column(db.String(128), default="", nullable=False)
+    node_name = db.Column(db.String(256), default="", nullable=False)
+
+    hostname = db.Column(db.String(256), nullable=False)       # routable IP or DNS
+    ssh_port = db.Column(db.Integer, default=22, nullable=False)
+    ssh_username = db.Column(db.String(64), default="root", nullable=False)
+
+    encrypted_password = db.Column(EncryptedString, nullable=False)
+    host_fingerprint = db.Column(db.String(128), default="", nullable=False)
+
+    last_verified_at = db.Column(db.DateTime, nullable=True)
+    last_verify_status = db.Column(db.String(32), default="unverified", nullable=False)  # ok|failed|unverified
+    last_error = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("tenant_id", "engine_name", "node_id", name="uq_dhcp_cred_engine_node"),
+    )
+
+    tenant = db.relationship("Tenant")
+    api_key = db.relationship("ApiKey")
+
+    def __repr__(self):
+        return f"<DhcpEngineCredential {self.engine_name}/node{self.node_index}@{self.hostname}>"
+
+
+class DhcpEngineSshAccess(db.Model):
+    """Tracks the FlexEdge-managed SSH allow rule on an engine's policy.
+
+    One row per engine (not per node — the rule covers the whole cluster).
+    The rule's name acts as the tag we look it up by; if it disappears from
+    the policy out of band, we surface a banner asking the operator to
+    recreate it (per A2 spec).
+
+    The rule is torn down when the operator clicks "Remove SSH rule" or
+    when the *last* credential for the engine is deleted.
+    """
+    __tablename__ = "dhcp_engine_ssh_access"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+
+    engine_name = db.Column(db.String(256), nullable=False)
+    policy_name = db.Column(db.String(256), default="", nullable=False)
+    rule_name = db.Column(db.String(256), nullable=False)        # the tag — stable id
+    rule_href = db.Column(db.String(512), default="", nullable=False)  # cached
+    fea_source_ip = db.Column(db.String(45), nullable=False)
+    destination_ip = db.Column(db.String(45), default="", nullable=False)  # IP we put in the rule (informational)
+
+    created_by_email = db.Column(db.String(255), default="", nullable=False)
+    last_seen_in_policy_at = db.Column(db.DateTime, nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("tenant_id", "engine_name", name="uq_dhcp_ssh_access_engine"),
+    )
+
+    tenant = db.relationship("Tenant")
+    api_key = db.relationship("ApiKey")
+
+    def __repr__(self):
+        return f"<DhcpEngineSshAccess {self.engine_name} rule={self.rule_name!r}>"
 
 
 class DhcpActivityLog(db.Model):

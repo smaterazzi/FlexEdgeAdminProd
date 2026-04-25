@@ -214,6 +214,11 @@
                     </a>
                 </li>
                 <li class="nav-item">
+                    <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}" href="/dhcp/credentials">
+                        <i class="bi bi-key"></i> Credentials
+                    </a>
+                </li>
+                <li class="nav-item">
                     <a class="nav-link {% if '/dhcp/history' in request.path %}active{% endif %}" href="/dhcp/history">
                         <i class="bi bi-clock-history"></i> History
                     </a>

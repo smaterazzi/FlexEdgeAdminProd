@@ -31,8 +31,8 @@ from flask import (
 
 from shared.db import db
 from webapp.models import (
-    ApiKey, DhcpActivityLog, DhcpDeployment, DhcpReservation,
-    DhcpScope, Tenant,
+    ApiKey, DhcpActivityLog, DhcpDeployment, DhcpEngineCredential,
+    DhcpEngineSshAccess, DhcpReservation, DhcpScope, Tenant,
 )
 from webapp.smc_dhcp_client import (
     SMCConfig, smc_session,
@@ -40,8 +40,21 @@ from webapp.smc_dhcp_client import (
     list_scopes_for_engine, list_cluster_nodes, dump_engine_interfaces,
     host_create, host_update, host_delete, host_get, host_list_by_scope,
     is_valid_mac, normalize_mac,
+    find_ssh_access_rule, find_active_policy,
 )
 from webapp.smc_tls_client import list_engines, smc_error_detail
+from webapp.dhcp_ssh import (
+    SSHTarget, SSHCredential, FingerprintMismatch,
+    verify_credential, is_auth_failure,
+    get_file as ssh_get_file,
+)
+from webapp.dhcp_bootstrap import (
+    engine_bootstrap_lock,
+    probe_public_ip, preflight, install_ssh_rule, upload_policy,
+    remove_rule, enroll_node, force_reset_password,
+    rule_name_for,
+)
+from webapp.dhcp_leases import parse_dhcpd_leases, merge_cluster_leases
 
 log = logging.getLogger(__name__)
 
@@ -579,6 +592,596 @@ def scope_resync(scope_id):
     flash("Re-sync queued. The engine-side sync runs once Phase 4 lands.",
           "warning")
     return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+
+
+# ── SSH credentials (Phase 1c — auto-enrollment via SMC API) ────────────
+
+def _cred_to_target(cred_row: DhcpEngineCredential) -> SSHTarget:
+    return SSHTarget(hostname=cred_row.hostname, port=cred_row.ssh_port,
+                     username=cred_row.ssh_username)
+
+
+def _cred_to_payload(cred_row: DhcpEngineCredential) -> SSHCredential:
+    return SSHCredential(
+        password=cred_row.encrypted_password,
+        host_fingerprint=cred_row.host_fingerprint,
+    )
+
+
+def _operator_email() -> str:
+    return (session.get("user") or {}).get("email", "")
+
+
+def _audit_comment(action: str, engine_name: str = "") -> str:
+    op = _operator_email() or "unknown"
+    suffix = f" engine={engine_name}" if engine_name else ""
+    return f"FlexEdgeAdmin {action} by {op}{suffix}"
+
+
+@dhcp_bp.route("/credentials", methods=["GET"])
+@admin_required
+def credentials_list():
+    creds = (DhcpEngineCredential.query
+             .order_by(DhcpEngineCredential.engine_name,
+                       DhcpEngineCredential.node_index).all())
+    accesses = (DhcpEngineSshAccess.query
+                .order_by(DhcpEngineSshAccess.engine_name).all())
+    tenants = Tenant.query.filter_by(is_active=True).order_by(Tenant.name).all()
+    # Group credentials by (tenant, engine) for the per-engine UI
+    creds_by_engine: dict[tuple[int, str], list] = {}
+    for c in creds:
+        creds_by_engine.setdefault((c.tenant_id, c.engine_name), []).append(c)
+    accesses_by_engine = {(a.tenant_id, a.engine_name): a for a in accesses}
+    return render_template(
+        "dhcp/credentials.html",
+        credentials=creds,
+        creds_by_engine=creds_by_engine,
+        accesses_by_engine=accesses_by_engine,
+        tenants=tenants,
+    )
+
+
+# ── Source-IP detection ────────────────────────────────────────────────
+
+@dhcp_bp.route("/credentials/source-ip/probe", methods=["POST"])
+@admin_required
+def credentials_probe_source_ip():
+    """AJAX: try public-IP echo services and return the suggestion +
+    attempt log so the operator can see what we tried."""
+    detected, log_lines = probe_public_ip()
+    return jsonify({"detected": detected or "", "attempts": log_lines})
+
+
+@dhcp_bp.route("/tenants/<int:tenant_id>/source-ip", methods=["POST"])
+@admin_required
+def tenant_save_source_ip(tenant_id):
+    tenant = db.session.get(Tenant, tenant_id)
+    if not tenant:
+        flash("Tenant not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    new_ip = request.form.get("source_ip", "").strip()
+    if new_ip:
+        # Validate
+        from ipaddress import ip_address
+        try:
+            ip_address(new_ip)
+        except ValueError:
+            flash(f"Invalid IP {new_ip!r}.", "danger")
+            return redirect(url_for("dhcp.credentials_list"))
+    tenant.flexedge_source_ip = new_ip
+    db.session.commit()
+    _log_activity("system", "set_source_ip", "ok", tenant.name,
+                  f"flexedge_source_ip={new_ip!r}")
+    flash(f"Saved FEA source IP for {tenant.name}: {new_ip or '(empty)'}", "success")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+# ── Discover nodes (cascade to populate the wizard) ────────────────────
+
+@dhcp_bp.route("/credentials/discover-nodes", methods=["POST"])
+@admin_required
+def credentials_discover_nodes():
+    """AJAX: given tenant+key+engine, return cluster node list + interface
+    IPs + current SSH-rule state so the operator can pick a destination IP
+    and decide whether to install a rule.
+    """
+    tenant_id = int(request.form["tenant_id"])
+    api_key_id = int(request.form["api_key_id"])
+    engine_name = request.form["engine_name"].strip()
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, api_key_id)
+    if not tenant or not api_key:
+        return jsonify({"error": "Not found"}), 404
+    if not tenant.flexedge_source_ip:
+        return jsonify({"error": (
+            f"Tenant {tenant.name!r} has no FlexEdge source IP configured. "
+            f"Set it first using the 'Source IP' card at the top of the page."
+        )}), 400
+    cfg = _smc_cfg(tenant, api_key)
+    try:
+        with smc_session(cfg):
+            nodes = list_cluster_nodes(engine_name)
+            try:
+                policy_name = find_active_policy(engine_name)
+            except Exception as exc:
+                policy_name = ""
+                policy_error = str(exc)
+            else:
+                policy_error = ""
+            rule_present = False
+            rule_summary = None
+            if policy_name:
+                rule_summary = find_ssh_access_rule(policy_name, rule_name_for(engine_name))
+                rule_present = rule_summary is not None
+        existing_creds = {
+            c.node_id: c
+            for c in DhcpEngineCredential.query
+                .filter_by(tenant_id=tenant_id, engine_name=engine_name).all()
+        }
+        access_row = DhcpEngineSshAccess.query.filter_by(
+            tenant_id=tenant_id, engine_name=engine_name,
+        ).first()
+        out_nodes = []
+        for n in nodes:
+            enrolled = existing_creds.get(n.node_id)
+            out_nodes.append({
+                "node_index": n.node_index,
+                "node_id": n.node_id,
+                "name": n.name,
+                "primary_address": n.primary_address,
+                "already_enrolled": enrolled is not None,
+                "enrolled_hostname": enrolled.hostname if enrolled else "",
+                "last_verify_status": enrolled.last_verify_status if enrolled else "",
+            })
+        return jsonify({
+            "nodes": out_nodes,
+            "policy_name": policy_name,
+            "policy_error": policy_error,
+            "rule_name": rule_name_for(engine_name),
+            "rule_present_in_policy": rule_present,
+            "rule_db_record": {
+                "destination_ip": access_row.destination_ip if access_row else "",
+                "fea_source_ip": access_row.fea_source_ip if access_row else "",
+                "created_by": access_row.created_by_email if access_row else "",
+                "created_at": access_row.created_at.strftime("%Y-%m-%d %H:%M") if access_row else "",
+            } if access_row else None,
+            "rule_externally_removed": (
+                access_row is not None and policy_name and not rule_present
+            ),
+            "tenant_source_ip": tenant.flexedge_source_ip,
+        })
+    except Exception as exc:
+        return jsonify({"error": smc_error_detail(exc)}), 500
+
+
+# ── SSH rule lifecycle (per engine) ────────────────────────────────────
+
+@dhcp_bp.route("/credentials/rule/install", methods=["POST"])
+@admin_required
+def credentials_rule_install():
+    """Install (or detect existing) the SSH allow rule + push policy.
+    The destination IP is whichever node IP the operator selected.
+    """
+    tenant_id = int(request.form["tenant_id"])
+    api_key_id = int(request.form["api_key_id"])
+    engine_name = request.form["engine_name"].strip()
+    destination_ip = request.form["destination_ip"].strip()
+
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, api_key_id)
+    if not tenant or not api_key:
+        flash("Tenant or API key not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    source_ip = tenant.flexedge_source_ip
+    if not source_ip:
+        flash("Tenant FEA source IP not configured.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    cfg = _smc_cfg(tenant, api_key)
+    target_label = f"{engine_name} ({destination_ip})"
+    try:
+        with engine_bootstrap_lock(engine_name):
+            with smc_session(cfg):
+                result = install_ssh_rule(
+                    engine_name=engine_name,
+                    source_ip=source_ip,
+                    destination_ip=destination_ip,
+                    created_by_email=_operator_email(),
+                    fea_hostname=request.host or "",
+                )
+                if not result.ok:
+                    _log_activity("ssh", "install_rule", "failed", target_label, result.error)
+                    flash(f"Install rule failed: {result.error}", "danger")
+                    return redirect(url_for("dhcp.credentials_list"))
+
+                # Persist DB record
+                access = DhcpEngineSshAccess.query.filter_by(
+                    tenant_id=tenant_id, engine_name=engine_name,
+                ).first()
+                now = datetime.now(timezone.utc)
+                if access:
+                    access.api_key_id = api_key_id
+                    access.policy_name = result.policy_name
+                    access.rule_name = result.rule_name
+                    access.rule_href = result.rule_href
+                    access.fea_source_ip = source_ip
+                    access.destination_ip = destination_ip
+                    access.created_by_email = access.created_by_email or _operator_email()
+                    access.last_seen_in_policy_at = now
+                else:
+                    db.session.add(DhcpEngineSshAccess(
+                        tenant_id=tenant_id, api_key_id=api_key_id,
+                        engine_name=engine_name,
+                        policy_name=result.policy_name,
+                        rule_name=result.rule_name,
+                        rule_href=result.rule_href,
+                        fea_source_ip=source_ip,
+                        destination_ip=destination_ip,
+                        created_by_email=_operator_email(),
+                        last_seen_in_policy_at=now,
+                    ))
+                db.session.commit()
+
+                if result.already_present:
+                    flash(f"Rule {result.rule_name} already exists in policy "
+                          f"{result.policy_name}. Skipping policy upload.",
+                          "info")
+                    _log_activity("ssh", "install_rule", "ok", target_label,
+                                  f"already present: {result.rule_name}")
+                    return redirect(url_for("dhcp.credentials_list"))
+
+                # Push policy so the rule actually takes effect
+                upload_ok, upload_msg = upload_policy(engine_name, result.policy_name)
+                if not upload_ok:
+                    _log_activity("ssh", "policy_upload", "failed", target_label, upload_msg)
+                    flash(f"Rule created but policy upload failed: {upload_msg}", "danger")
+                    return redirect(url_for("dhcp.credentials_list"))
+
+                _log_activity("ssh", "install_rule", "ok", target_label,
+                              f"rule={result.rule_name} policy={result.policy_name} "
+                              f"upload={upload_msg}")
+                flash(f"Installed rule {result.rule_name} in policy "
+                      f"{result.policy_name} and uploaded.", "success")
+    except Exception as exc:
+        _log_activity("ssh", "install_rule", "failed", target_label, str(exc))
+        flash(f"Install rule failed: {exc}", "danger")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+@dhcp_bp.route("/credentials/rule/remove", methods=["POST"])
+@admin_required
+def credentials_rule_remove():
+    """Manual rule removal — operator-triggered.
+
+    Refuses if any credentials still reference this engine. The auto-cleanup
+    on last-credential-deletion path is in `credentials_delete`.
+    """
+    tenant_id = int(request.form["tenant_id"])
+    engine_name = request.form["engine_name"].strip()
+    access = DhcpEngineSshAccess.query.filter_by(
+        tenant_id=tenant_id, engine_name=engine_name,
+    ).first()
+    if not access:
+        flash("No managed SSH rule on record for this engine.", "info")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    creds_remaining = DhcpEngineCredential.query.filter_by(
+        tenant_id=tenant_id, engine_name=engine_name,
+    ).count()
+    if creds_remaining > 0:
+        flash(f"Refusing to remove SSH rule: {creds_remaining} credential(s) "
+              f"still depend on it. Delete them first.", "warning")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    _do_rule_teardown(access)
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+def _do_rule_teardown(access: DhcpEngineSshAccess) -> None:
+    """Internal: remove our rule from policy, push policy, delete DB row.
+    Used by manual removal AND last-credential-deletion auto cleanup.
+    """
+    tenant = db.session.get(Tenant, access.tenant_id)
+    api_key = db.session.get(ApiKey, access.api_key_id)
+    if not tenant or not api_key:
+        flash("Tenant or API key gone — cannot remove rule from SMC; "
+              "removing local record only.", "warning")
+        db.session.delete(access)
+        db.session.commit()
+        return
+    cfg = _smc_cfg(tenant, api_key)
+    target = f"{access.engine_name} rule={access.rule_name}"
+    try:
+        with engine_bootstrap_lock(access.engine_name):
+            with smc_session(cfg):
+                ok, msg = remove_rule(access.engine_name, access.policy_name)
+                if not ok:
+                    _log_activity("ssh", "remove_rule", "failed", target, msg)
+                    flash(f"Remove rule failed: {msg}", "danger")
+                    return
+                upload_ok, upload_msg = upload_policy(access.engine_name, access.policy_name)
+                if not upload_ok:
+                    _log_activity("ssh", "policy_upload", "failed", target, upload_msg)
+                    flash(f"Rule removed but policy upload failed: {upload_msg}", "danger")
+                    return
+        db.session.delete(access)
+        db.session.commit()
+        _log_activity("ssh", "remove_rule", "ok", target,
+                      f"removed + policy uploaded: {upload_msg}")
+        flash(f"Removed rule {access.rule_name} and uploaded policy.", "success")
+    except Exception as exc:
+        _log_activity("ssh", "remove_rule", "failed", target, str(exc))
+        flash(f"Remove rule failed: {exc}", "danger")
+
+
+# ── Per-node bootstrap (auto via SMC change_ssh_pwd) ───────────────────
+
+@dhcp_bp.route("/credentials/bootstrap", methods=["POST"])
+@admin_required
+def credentials_bootstrap():
+    """Enroll one node:
+       1. TCP probe to verify path is open
+       2. SMC: enable SSH on the node
+       3. SMC: change_ssh_pwd to a fresh 64-char random
+       4. SSH-connect with TOFU fingerprint capture
+       5. Verify with the captured fingerprint pinned
+       6. Persist the credential (password Fernet-encrypted)
+    """
+    tenant_id = int(request.form["tenant_id"])
+    api_key_id = int(request.form["api_key_id"])
+    engine_name = request.form["engine_name"].strip()
+    node_index = int(request.form["node_index"])
+    node_id = request.form["node_id"].strip()
+    node_name = request.form.get("node_name", "").strip()
+    hostname = request.form["hostname"].strip()
+    ssh_port = int(request.form.get("ssh_port", "22"))
+    ssh_username = request.form.get("ssh_username", "root").strip() or "root"
+
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, api_key_id)
+    if not tenant or not api_key:
+        flash("Tenant or API key not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    target = SSHTarget(hostname=hostname, port=ssh_port, username=ssh_username)
+    cfg = _smc_cfg(tenant, api_key)
+    target_label = f"{engine_name}/node{node_index}@{hostname}"
+    audit = _audit_comment("auto-enrollment", engine_name)
+
+    try:
+        with engine_bootstrap_lock(engine_name):
+            with smc_session(cfg):
+                result = enroll_node(
+                    engine_name=engine_name, node_index=node_index,
+                    target=target, audit_comment=audit,
+                )
+        if not result.ok:
+            _log_activity("ssh", f"bootstrap_{result.failed_at_stage}",
+                          "failed", target_label, result.error)
+            flash(f"Bootstrap failed at stage '{result.failed_at_stage}': "
+                  f"{result.error}", "danger")
+            return redirect(url_for("dhcp.credentials_list"))
+
+        # Persist credential
+        existing = DhcpEngineCredential.query.filter_by(
+            tenant_id=tenant_id, engine_name=engine_name, node_id=node_id,
+        ).first()
+        now = datetime.now(timezone.utc)
+        if existing:
+            existing.api_key_id = api_key_id
+            existing.node_index = node_index
+            existing.node_name = node_name or existing.node_name
+            existing.hostname = hostname
+            existing.ssh_port = ssh_port
+            existing.ssh_username = ssh_username
+            existing.encrypted_password = result.new_password
+            existing.host_fingerprint = result.host_fingerprint
+            existing.last_verified_at = now
+            existing.last_verify_status = "ok"
+            existing.last_error = ""
+        else:
+            db.session.add(DhcpEngineCredential(
+                tenant_id=tenant_id, api_key_id=api_key_id,
+                engine_name=engine_name, node_index=node_index,
+                node_id=node_id, node_name=node_name,
+                hostname=hostname, ssh_port=ssh_port, ssh_username=ssh_username,
+                encrypted_password=result.new_password,
+                host_fingerprint=result.host_fingerprint,
+                last_verified_at=now, last_verify_status="ok",
+            ))
+        db.session.commit()
+        _log_activity("ssh", "bootstrap", "ok", target_label,
+                      f"fingerprint={result.host_fingerprint}")
+        flash(f"Enrolled {engine_name} node {node_index} ({hostname}). "
+              f"Fingerprint: {result.host_fingerprint}", "success")
+    except Exception as exc:
+        _log_activity("ssh", "bootstrap", "failed", target_label, str(exc))
+        flash(f"Bootstrap failed: {exc}", "danger")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+@dhcp_bp.route("/credentials/<int:cred_id>/verify", methods=["POST"])
+@admin_required
+def credentials_verify(cred_id):
+    cred = db.session.get(DhcpEngineCredential, cred_id)
+    if not cred:
+        flash("Credential not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    ok, err = verify_credential(_cred_to_target(cred), _cred_to_payload(cred))
+    cred.last_verified_at = datetime.now(timezone.utc)
+    cred.last_verify_status = "ok" if ok else "failed"
+    cred.last_error = "" if ok else err
+    db.session.commit()
+    target_label = f"{cred.engine_name}/node{cred.node_index}@{cred.hostname}"
+    _log_activity("ssh", "verify", "ok" if ok else "failed", target_label, err)
+    if ok:
+        flash(f"{cred.engine_name} node {cred.node_index} reachable.", "success")
+    elif is_auth_failure(err):
+        flash(f"Authentication failed for {target_label} — the password "
+              f"may have been changed externally. Click 'Force re-bootstrap' "
+              f"to issue a new password via SMC.", "danger")
+    else:
+        flash(f"Verification failed: {err}", "danger")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+@dhcp_bp.route("/credentials/<int:cred_id>/force-reset", methods=["POST"])
+@admin_required
+def credentials_force_reset(cred_id):
+    """A3 recovery: rotate the password via SMC, re-verify, store the new one.
+
+    Used when verify fails with auth-failure (someone changed root pw out
+    of band). Operator-confirmed: a button on the credential row is the
+    only trigger.
+    """
+    cred = db.session.get(DhcpEngineCredential, cred_id)
+    if not cred:
+        flash("Credential not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    tenant = db.session.get(Tenant, cred.tenant_id)
+    api_key = db.session.get(ApiKey, cred.api_key_id)
+    if not tenant or not api_key:
+        flash("Tenant or API key gone.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    cfg = _smc_cfg(tenant, api_key)
+    target = _cred_to_target(cred)
+    target_label = f"{cred.engine_name}/node{cred.node_index}@{cred.hostname}"
+
+    try:
+        with engine_bootstrap_lock(cred.engine_name):
+            with smc_session(cfg):
+                result = force_reset_password(
+                    engine_name=cred.engine_name,
+                    node_index=cred.node_index,
+                    target=target,
+                    existing_fingerprint=cred.host_fingerprint,
+                    audit_comment=_audit_comment("force-reset", cred.engine_name),
+                )
+        if not result.ok:
+            _log_activity("ssh", "force_reset", "failed", target_label, result.error)
+            flash(f"Force re-bootstrap failed at '{result.failed_at_stage}': "
+                  f"{result.error}", "danger")
+            return redirect(url_for("dhcp.credentials_list"))
+
+        cred.encrypted_password = result.new_password
+        if result.host_fingerprint:
+            cred.host_fingerprint = result.host_fingerprint
+        cred.last_verified_at = datetime.now(timezone.utc)
+        cred.last_verify_status = "ok"
+        cred.last_error = ""
+        db.session.commit()
+        _log_activity("ssh", "force_reset", "ok", target_label,
+                      f"fingerprint={cred.host_fingerprint}")
+        flash(f"Password rotated and verified on {target_label}.", "success")
+    except Exception as exc:
+        _log_activity("ssh", "force_reset", "failed", target_label, str(exc))
+        flash(f"Force re-bootstrap failed: {exc}", "danger")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+@dhcp_bp.route("/credentials/<int:cred_id>/delete", methods=["POST"])
+@admin_required
+def credentials_delete(cred_id):
+    cred = db.session.get(DhcpEngineCredential, cred_id)
+    if not cred:
+        flash("Credential not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    target_label = f"{cred.engine_name}/node{cred.node_index}@{cred.hostname}"
+    tenant_id = cred.tenant_id
+    engine_name = cred.engine_name
+    db.session.delete(cred)
+    db.session.commit()
+    _log_activity("ssh", "delete", "ok", target_label,
+                  "Local credential removed. Note: the rotated password is still "
+                  "set on the node — re-bootstrap to rotate again.")
+    flash(f"Credential removed for {target_label}.", "info")
+
+    # Auto-cleanup: if no credentials remain for this engine, tear down the SSH rule
+    remaining = DhcpEngineCredential.query.filter_by(
+        tenant_id=tenant_id, engine_name=engine_name,
+    ).count()
+    if remaining == 0:
+        access = DhcpEngineSshAccess.query.filter_by(
+            tenant_id=tenant_id, engine_name=engine_name,
+        ).first()
+        if access:
+            flash(f"Last credential for {engine_name} removed — tearing down "
+                  f"the SSH allow rule {access.rule_name}.", "info")
+            _do_rule_teardown(access)
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+# ── Leases viewer (Phase 1b) ─────────────────────────────────────────────
+
+LEASE_FILE = "/spool/dhcp-server/dhcpd.leases"
+
+
+@dhcp_bp.route("/scopes/<int:scope_id>/leases")
+@admin_required
+def scope_leases(scope_id):
+    """Read dhcpd.leases from every enrolled node for this scope's engine,
+    parse, merge, and display the consolidated view.
+
+    One row per (MAC, IP) pair, with which nodes saw the lease. Cross-checks
+    against reservations so the UI can flag a lease that deviates from its
+    tracked reservation.
+    """
+    scope = _scope_or_404(scope_id)
+    if not scope:
+        return redirect(url_for("dhcp.scopes_list"))
+
+    creds = (DhcpEngineCredential.query
+             .filter_by(tenant_id=scope.tenant_id,
+                        engine_name=scope.engine_name)
+             .order_by(DhcpEngineCredential.node_index).all())
+    if not creds:
+        flash(f"No SSH credentials enrolled for {scope.engine_name}. "
+              f"Go to Credentials to enroll each cluster node first.", "warning")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    reservations = (DhcpReservation.query.filter_by(scope_id=scope.id).all())
+    res_by_mac = {r.mac_address: r for r in reservations}
+
+    per_node_results: dict[int, list] = {}
+    fetch_errors: dict[int, str] = {}
+    for cred in creds:
+        target = _cred_to_target(cred)
+        payload = _cred_to_payload(cred)
+        try:
+            raw = ssh_get_file(target, payload, LEASE_FILE)
+            per_node_results[cred.node_index] = parse_dhcpd_leases(raw.decode(errors="replace"))
+            _log_activity("ssh", "read_leases", "ok",
+                          f"{cred.engine_name}/node{cred.node_index}",
+                          f"{len(per_node_results[cred.node_index])} lease blocks")
+        except Exception as exc:
+            fetch_errors[cred.node_index] = str(exc)
+            _log_activity("ssh", "read_leases", "failed",
+                          f"{cred.engine_name}/node{cred.node_index}", str(exc))
+
+    merged = merge_cluster_leases(per_node_results) if per_node_results else []
+
+    # Annotate each merged row with reservation cross-check
+    for row in merged:
+        match = res_by_mac.get(row["mac"])
+        if match:
+            row["reservation_id"] = match.id
+            row["reservation_host"] = match.smc_host_name
+            row["reservation_ip"] = match.ip_address
+            row["reservation_matches"] = (match.ip_address == row["ip"])
+        else:
+            row["reservation_id"] = None
+            row["reservation_host"] = ""
+            row["reservation_ip"] = ""
+            row["reservation_matches"] = None
+
+    now = datetime.now(timezone.utc)
+    return render_template(
+        "dhcp/leases.html",
+        scope=scope, leases=merged,
+        nodes=creds, fetch_errors=fetch_errors,
+        now=now, lease_file_path=LEASE_FILE,
+    )
 
 
 # ── History + activity ───────────────────────────────────────────────────
