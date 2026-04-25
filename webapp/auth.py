@@ -56,6 +56,14 @@ def login_required(f):
 def profile_required(f):
     """
     Require an authenticated user with an active SMC profile and domain.
+
+    Re-validates the cached profile's API key on every request: if an
+    admin revoked the key in /admin/api-keys, the operator's session
+    profile (a plaintext snapshot) would otherwise keep failing against
+    SMC with "No session found" until they re-selected. We catch that
+    here, drop the stale snapshot, and bounce them to /select-profile
+    so a fresh resolved profile gets cached.
+
     Redirects in order: login → select_profile → select_domain → view.
     """
     @wraps(f)
@@ -65,6 +73,19 @@ def profile_required(f):
         if "active_profile" not in session:
             flash("Select an SMC profile to continue.", "warning")
             return redirect(url_for("select_profile"))
+
+        import user_manager
+        if not user_manager.is_active_profile_valid(session.get("active_profile")):
+            log.info("Active profile API key is no longer valid for %s — "
+                     "clearing session profile",
+                     session.get("user", {}).get("email", "?"))
+            session.pop("active_profile", None)
+            session.pop("active_domain", None)
+            flash("Your selected API key is no longer active "
+                  "(it may have been revoked). Pick a profile to continue.",
+                  "warning")
+            return redirect(url_for("select_profile"))
+
         if "active_domain" not in session:
             flash("Select an SMC domain to continue.", "warning")
             return redirect(url_for("select_domain"))

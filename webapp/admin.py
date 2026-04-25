@@ -283,6 +283,24 @@ def api_key_revoke(id):
     return redirect(url_for("admin.api_keys"))
 
 
+@admin_bp.route("/api-keys/<int:id>/reactivate", methods=["POST"])
+@admin_required
+def api_key_reactivate(id):
+    """Re-enable a previously revoked key.
+
+    Useful when revocation was a mistake or a temporary safety pull. The
+    plaintext key was already encrypted at creation and is unchanged in
+    storage, so reactivation makes it usable again immediately. Sessions
+    that still cache this key in active_profile will now succeed against
+    SMC again — no re-selection needed.
+    """
+    key = ApiKey.query.get_or_404(id)
+    key.is_active = True
+    db.session.commit()
+    flash(f"API key '{key.name}' reactivated.", "success")
+    return redirect(url_for("admin.api_keys"))
+
+
 # ── Backup ──────────────────────────────────────────────────────────────
 
 @admin_bp.route("/backup")

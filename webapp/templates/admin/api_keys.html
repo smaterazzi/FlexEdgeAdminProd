@@ -58,9 +58,17 @@
                     <td>
                         {% if k.is_active %}
                         <form method="POST" action="{{ url_for('admin.api_key_revoke', id=k.id) }}" class="d-inline"
-                              onsubmit="return confirm('Revoke API key &quot;{{ k.name }}&quot;? This cannot be undone.')">
+                              onsubmit="return confirm('Revoke API key &quot;{{ k.name }}&quot;? Active sessions will be logged out of SMC on the next request and need to re-select a profile.')">
                             <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
                                 <i class="bi bi-x-circle"></i> Revoke
+                            </button>
+                        </form>
+                        {% else %}
+                        <form method="POST" action="{{ url_for('admin.api_key_reactivate', id=k.id) }}" class="d-inline"
+                              onsubmit="return confirm('Reactivate API key &quot;{{ k.name }}&quot;? It will become usable for SMC again immediately.')">
+                            <button type="submit" class="btn btn-outline-success btn-sm py-0 px-2"
+                                    title="Reactivate this key — it will become usable again">
+                                <i class="bi bi-arrow-counterclockwise"></i> Reactivate
                             </button>
                         </form>
                         {% endif %}

@@ -169,3 +169,36 @@ def user_exists_in_db(email: str) -> bool:
         return False
     from webapp.models import User
     return User.query.filter(User.email == email.lower().strip()).first() is not None
+
+
+def is_active_profile_valid(profile: dict | None) -> bool:
+    """Verify that a session's active_profile still maps to an active ApiKey.
+
+    The session caches a snapshot of the resolved profile, including the
+    plaintext API key. If an admin revokes that key (in `/admin/api-keys`)
+    the cached profile keeps working until the user re-selects, which leads
+    to confusing ``SMCConnectionError: No session found`` failures when the
+    SMC SDK rejects the revoked credential mid-session.
+
+    This helper hashes the cached plaintext and confirms a matching
+    ``ApiKey`` row with ``is_active=True`` still exists. Designed for
+    ``@profile_required`` to call once per request; the hash + DB lookup
+    are both indexed and effectively free.
+
+    Behavior when the DB layer is unavailable (CLI / JSON-fallback mode):
+    returns ``True`` so legacy deployments don't lock themselves out.
+    """
+    if not profile:
+        return False
+    if not _db_available():
+        return True   # Fall through for JSON-fallback / non-Flask callers.
+
+    api_key = (profile.get("api_key") or "").strip()
+    if not api_key:
+        return False
+
+    from webapp.models import ApiKey
+    from shared.encryption import hash_value
+    return ApiKey.query.filter_by(
+        key_hash=hash_value(api_key), is_active=True,
+    ).first() is not None
