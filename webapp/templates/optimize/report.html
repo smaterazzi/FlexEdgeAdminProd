@@ -92,6 +92,7 @@
                         <tr>
                             <th style="width:5rem;">Role</th>
                             <th style="width:4.5rem;">Pos</th>
+                            <th style="width:7rem;">SMC ID</th>
                             <th>Name</th>
                             <th>Action</th>
                             <th>Sources</th>
@@ -110,6 +111,7 @@
                                 {% endif %}
                             </td>
                             <td><code>{{ r.pos }}</code></td>
+                            <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
                             <td>{{ r.name or '—' }}</td>
                             <td>{{ r.action }}</td>
                             <td>{{ r.sources|join(', ') }}</td>
@@ -123,6 +125,55 @@
         </div>
     </div>
     {% endfor %}
+    {% endif %}
+
+    {% if result.disabled_rules %}
+    <div class="card mt-4">
+        <div class="card-header d-flex justify-content-between align-items-center"
+             data-bs-toggle="collapse" data-bs-target="#disabledRules"
+             role="button" style="cursor:pointer;">
+            <div>
+                <i class="bi bi-pause-circle text-secondary"></i>
+                <strong>Disabled rules</strong>
+                <span class="text-muted ms-2" style="font-size:0.85rem;">
+                    ({{ result.disabled_count }}) — listed for reference, not analyzed
+                </span>
+            </div>
+            <i class="bi bi-chevron-down"></i>
+        </div>
+        <div id="disabledRules" class="collapse">
+            <div class="card-body py-2">
+                <div class="table-responsive">
+                    <table class="table table-sm table-dark mb-0">
+                        <thead>
+                            <tr>
+                                <th style="width:4.5rem;">Pos</th>
+                                <th style="width:7rem;">SMC ID</th>
+                                <th>Name</th>
+                                <th>Action</th>
+                                <th>Sources</th>
+                                <th>Destinations</th>
+                                <th>Services</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for r in result.disabled_rules %}
+                            <tr class="rule-disabled">
+                                <td><code>{{ r.pos }}</code></td>
+                                <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
+                                <td>{{ r.name or '—' }}</td>
+                                <td>{{ r.action }}</td>
+                                <td>{{ r.sources|join(', ') }}</td>
+                                <td>{{ r.destinations|join(', ') }}</td>
+                                <td>{{ r.services|join(', ') }}</td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
     {% endif %}
 </div>
 {% endblock %}

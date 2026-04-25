@@ -18,7 +18,11 @@ Limitations (addressed in Phase 2):
     - Subsumption is compared by resolved element name, not by expanded
       IP ranges. A host ``10.0.0.1`` inside a group ``WebServers`` will
       not be detected as subsumed by ``WebServers``.
-    - Disabled rules are skipped entirely.
+    - Disabled rules are surfaced separately (``disabled_rules``) but not
+      analyzed for duplicates/shadows.
+    - Rules with action ``continue`` (logging/context modifiers) are
+      skipped entirely — they don't make a match decision so duplicate
+      detection isn't meaningful.
 """
 
 from __future__ import annotations
@@ -27,35 +31,44 @@ from typing import Iterable
 
 
 ANY_TOKEN = "any"
+SKIP_ACTIONS = {"continue"}  # not a match decision — skip entirely
 
 
 # ── Position assignment ──────────────────────────────────────────────────
 
-def assign_positions(rules: list[dict]) -> list[dict]:
+def assign_positions(rules: list[dict]) -> tuple[list[dict], list[dict]]:
     """Walk the rule list, assign a ``pos`` string like "2.5" to each
-    non-section rule, and return the filtered list of real rules
-    (sections dropped, disabled dropped).
+    rule, and split into (active, disabled).
+
+    "continue" rules and section headers are dropped entirely — they
+    don't carry a match decision, so duplicate detection is meaningless.
 
     Each returned rule dict gains:
-        pos          "{section_idx}.{row_in_section}"  — 1-based
-        section_idx  int
-        row_idx      int
+        pos              "{section_idx}.{row_in_section}"  — 1-based
+        section_idx      int
+        row_idx          int
+        section_name     str  — name of the enclosing section (or "")
     """
-    out = []
+    active: list[dict] = []
+    disabled: list[dict] = []
     section_idx = 0  # becomes 1 on the first real section header
+    section_name = ""
     row_idx = 0
     saw_any_section = False
 
     for r in rules:
         if r.get("is_section"):
             section_idx += 1
+            section_name = r.get("name", "") or ""
             row_idx = 0
             saw_any_section = True
             continue
-        if r.get("is_disabled"):
+
+        action = (r.get("action") or "").strip().lower()
+        if action in SKIP_ACTIONS:
             continue
 
-        # Rules that appear before any explicit section get section 0
+        # Rules before any explicit section get section 0
         effective_section = section_idx if saw_any_section else 0
         row_idx += 1
 
@@ -63,9 +76,14 @@ def assign_positions(rules: list[dict]) -> list[dict]:
         enriched["section_idx"] = effective_section
         enriched["row_idx"] = row_idx
         enriched["pos"] = f"{effective_section}.{row_idx}"
-        out.append(enriched)
+        enriched["section_name"] = section_name
 
-    return out
+        if r.get("is_disabled"):
+            disabled.append(enriched)
+        else:
+            active.append(enriched)
+
+    return active, disabled
 
 
 # ── Rule normalization ───────────────────────────────────────────────────
@@ -114,6 +132,7 @@ def _snippet(rule: dict) -> dict:
         "services": rule.get("services", []),
         "comment": rule.get("comment", ""),
         "tag": rule.get("tag", ""),
+        "section_name": rule.get("section_name", ""),
     }
 
 
@@ -247,16 +266,18 @@ def analyze_rules(policy_name: str, raw_rules: list[dict]) -> dict:
 
     Returns:
         {
-            "policy":       str,
-            "rule_count":   int,   # real, non-disabled rules only
-            "findings":     list[dict],
+            "policy":          str,
+            "rule_count":      int,   # active rules analyzed
+            "disabled_count":  int,
+            "findings":        list[dict],
+            "disabled_rules":  list[dict],   # snippet view for display
             "summary": {
                 "exact_duplicate":       int,
                 "shadowed_same_action":  int,
             },
         }
     """
-    active = assign_positions(raw_rules)
+    active, disabled = assign_positions(raw_rules)
 
     exact_findings, next_id = find_exact_duplicates(active, next_id=1)
 
@@ -273,7 +294,9 @@ def analyze_rules(policy_name: str, raw_rules: list[dict]) -> dict:
     return {
         "policy": policy_name,
         "rule_count": len(active),
+        "disabled_count": len(disabled),
         "findings": findings,
+        "disabled_rules": [_snippet(r) for r in disabled],
         "summary": {
             "exact_duplicate": len(exact_findings),
             "shadowed_same_action": len(shadow_findings),

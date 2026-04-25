@@ -71,6 +71,7 @@
                             <tr>
                                 <th style="width:5rem;">Role</th>
                                 <th style="width:4.5rem;">Pos</th>
+                                <th style="width:7rem;">SMC ID</th>
                                 <th>Name</th>
                                 <th>Action</th>
                                 <th>Sources</th>
@@ -89,6 +90,7 @@
                                     {% endif %}
                                 </td>
                                 <td><code>{{ r.pos }}</code></td>
+                                <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
                                 <td>{{ r.name or '—' }}</td>
                                 <td>{{ r.action }}</td>
                                 <td>{{ r.sources|join(', ') }}</td>

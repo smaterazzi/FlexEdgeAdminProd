@@ -8,6 +8,7 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 - **SMC Explorer** — browse SMC objects, policies, and services in a dark-themed Bootstrap 5 UI
 - **Migration Manager** — 7-step guided workflow to import FortiGate configs into Forcepoint SMC
 - **TLS Manager** — automated certbot → Forcepoint TLS credential lifecycle, engine assignment, inspection rules, and auto-renewal on cert renewal (setup in [deployment guide](docs/deployment-guide.md#tls-manager--certbot-integration))
+- **DHCP Manager** — manages MAC→IP reservations on engines with the internal DHCP server enabled. Reservations live as SMC Host objects (MAC stored inline as `[flexedge:mac=...]` in the comment). Auto-managed SSH-allow rule + per-node password rotation via SMC API; cluster-wide lease viewer; engine-side reservation push pending Phase 4 (see [DHCP-ReservationStrategy.md](docs/DHCP-ReservationStrategy.md))
 - **CLI Tools** — command-line firewall management, object queries, and connection testing
 - **Encrypted at rest** — API keys stored with Fernet encryption (AES-128-CBC + HMAC-SHA256)
 - **Multi-tenant, multi-user** — Microsoft Entra ID (Azure AD) authentication with per-user SMC profiles
