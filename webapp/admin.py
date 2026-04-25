@@ -16,9 +16,26 @@ from flask import (
     url_for, flash, session, current_app, send_file,
 )
 
+from sqlalchemy.exc import IntegrityError
+
 from shared.db import db
 from shared.encryption import KEY_FILE, hash_value
 from webapp.models import Tenant, User, ApiKey, UserTenantAccess
+
+
+def _friendly_db_error(exc: Exception, action: str) -> str:
+    """Translate common SQLAlchemy errors to operator-friendly messages."""
+    msg = str(exc)
+    if isinstance(exc, IntegrityError):
+        if "tenants.slug" in msg:
+            return ("That tenant slug is already in use — pick a different one. "
+                    "Slugs must be unique across all tenants.")
+        if "users.email" in msg:
+            return "A user with that email already exists."
+        if "uq_user_tenant_key" in msg:
+            return "That user is already linked to that tenant + API key."
+        return f"Could not {action} — a unique constraint was violated."
+    return f"Error trying to {action}: {exc}"
 
 log = logging.getLogger(__name__)
 
@@ -83,7 +100,7 @@ def tenant_new():
             return redirect(url_for("admin.tenants"))
         except Exception as e:
             db.session.rollback()
-            flash(f"Error creating tenant: {e}", "danger")
+            flash(_friendly_db_error(e, "create the tenant"), "danger")
     return render_template("admin/tenant_form.html", tenant=None)
 
 
@@ -105,7 +122,7 @@ def tenant_edit(id):
             return redirect(url_for("admin.tenants"))
         except Exception as e:
             db.session.rollback()
-            flash(f"Error updating tenant: {e}", "danger")
+            flash(_friendly_db_error(e, "update the tenant"), "danger")
     return render_template("admin/tenant_form.html", tenant=tenant)
 
 

@@ -406,15 +406,22 @@
     {# ───── DHCP servers + reservations (read-only review) ───── #}
     {% set dhcp_servers = parsed.get('dhcp_servers', []) %}
     {% if dhcp_servers %}
-    <div class="alert alert-info" style="font-size:0.85rem;">
-        <i class="bi bi-info-circle me-1"></i>
-        <strong>Read-only preview.</strong> The migration importer will populate
-        the existing DHCP Manager data store (scopes + reservations).
-        The actual push to the engine happens from the
-        <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>
-        — see <code>docs/DHCP-ReservationStrategy.md</code>.
-        Target clusters must be DHCP-ready (nodes enrolled, scope
-        opted into FlexEdge management) before the import target step.
+    <div class="d-flex align-items-start justify-content-between mb-3">
+        <div class="alert alert-info mb-0 me-3 flex-grow-1" style="font-size:0.85rem;">
+            <i class="bi bi-info-circle me-1"></i>
+            <strong>Read-only preview.</strong> The migration importer will populate
+            the existing DHCP Manager data store (scopes + reservations).
+            The actual push to the engine happens from the
+            <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>
+            — see <code>docs/DHCP-ReservationStrategy.md</code>.
+            Target clusters must be DHCP-ready (nodes enrolled, scope
+            opted into FlexEdge management) before the import target step.
+        </div>
+        <a href="{{ url_for('migration_dhcp_map', project_id=project.id) }}"
+           class="btn btn-primary btn-sm flex-shrink-0"
+           style="white-space:nowrap;">
+            <i class="bi bi-arrow-right-circle me-1"></i>Map DHCP scopes →
+        </a>
     </div>
 
     {% for srv in dhcp_servers %}

@@ -1,0 +1,249 @@
+{% extends "base.html" %}
+{% block title %}{{ detail.name }} — cluster detail{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <div class="d-flex justify-content-between align-items-start mb-3">
+        <div>
+            <h4 class="mb-1">
+                <i class="bi bi-bricks"></i> {{ detail.name }}
+            </h4>
+            <div class="text-muted" style="font-size:0.82rem;">
+                <span class="badge bg-secondary text-uppercase" style="font-size:0.65rem;">
+                    {{ detail.typeof or 'engine' }}
+                </span>
+                {% if detail.installed_policy %}
+                · installed policy: <code>{{ detail.installed_policy }}</code>
+                {% endif %}
+                · {{ detail.nodes|length }} node(s)
+            </div>
+        </div>
+        <a href="{{ url_for('engines.clusters') }}" class="btn btn-sm btn-outline-secondary">
+            <i class="bi bi-arrow-left"></i> Back
+        </a>
+    </div>
+
+    {% if detail.errors %}
+    <div class="alert alert-warning py-2" style="font-size:0.82rem;">
+        <strong><i class="bi bi-exclamation-triangle"></i> Partial data</strong> —
+        the following SMC calls failed; the page renders what was reachable:
+        <ul class="mb-0 mt-1">
+            {% for err in detail.errors %}
+            <li><code>{{ err }}</code></li>
+            {% endfor %}
+        </ul>
+    </div>
+    {% endif %}
+
+    <!-- ── Cluster summary tab nav ───────────────────────────── -->
+    <ul class="nav nav-tabs mt-3" id="clusterTabs" role="tablist">
+        <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-nodes">
+            <i class="bi bi-hdd-stack"></i> Nodes ({{ detail.nodes|length }})
+        </button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-interfaces">
+            <i class="bi bi-ethernet"></i> Interfaces ({{ detail.interfaces|length }})
+        </button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-routing">
+            <i class="bi bi-signpost"></i> Routing ({{ detail.routing|length }})
+        </button></li>
+        <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-contact">
+            <i class="bi bi-globe"></i> Contact addresses ({{ detail.contact_addresses|length }})
+        </button></li>
+    </ul>
+
+    <div class="tab-content border border-top-0 p-3 bg-dark">
+
+        <!-- Nodes -->
+        <div class="tab-pane fade show active" id="tab-nodes">
+            {% if not detail.nodes %}
+            <div class="text-muted">No nodes returned by SMC.</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th style="width:3rem;">ID</th>
+                            <th>Name</th>
+                            <th>Firmware</th>
+                            <th>Status</th>
+                            <th>Interfaces</th>
+                            <th class="text-end" style="width:6rem;">Terminal</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for n in detail.nodes %}
+                        {% set cred = creds_by_node.get(n.nodeid) %}
+                        <tr>
+                            <td><code>{{ n.nodeid }}</code></td>
+                            <td><strong>{{ n.name }}</strong></td>
+                            <td>
+                                {% if n.engine_version %}
+                                <code style="font-size:0.78rem;">{{ n.engine_version }}</code>
+                                {% else %}
+                                <span class="text-muted">—</span>
+                                {% endif %}
+                            </td>
+                            <td>
+                                <span class="badge
+                                    {% if n.status_state in ('Online','Ready','Active') %}bg-success
+                                    {% elif n.status_state in ('Offline','Down','Locked Offline') %}bg-danger
+                                    {% else %}bg-secondary{% endif %}"
+                                    title="{{ n.status_detail }}">
+                                    {{ n.status_state or 'Unknown' }}
+                                </span>
+                            </td>
+                            <td>
+                                {% if n.interfaces %}
+                                <div style="font-size:0.78rem;">
+                                {% for iface in n.interfaces %}
+                                    <div>
+                                        <code>iface {{ iface.interface_id }}{% if iface.vlan_id %}.{{ iface.vlan_id }}{% endif %}</code>
+                                        {% for a in iface.addresses %}
+                                        — {{ a.address }} <span class="text-muted">{{ a.network_value }}</span>{% if not loop.last %},{% endif %}
+                                        {% endfor %}
+                                    </div>
+                                {% endfor %}
+                                </div>
+                                {% else %}
+                                <span class="text-muted">—</span>
+                                {% endif %}
+                            </td>
+                            <td class="text-end">
+                                {% if cred and cred.last_verify_status == 'ok' %}
+                                <a href="{{ url_for('engines.node_terminal', cred_id=cred.id) }}"
+                                   target="_blank" rel="noopener"
+                                   class="btn btn-sm btn-outline-success"
+                                   title="Open SSH session to {{ n.name }}">
+                                    <i class="bi bi-terminal-fill"></i>
+                                </a>
+                                {% else %}
+                                <button type="button" class="btn btn-sm btn-outline-secondary disabled"
+                                        title="No verified credential for this node — enroll one in /dhcp/credentials"
+                                        tabindex="-1" aria-disabled="true">
+                                    <i class="bi bi-terminal"></i>
+                                </button>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Interfaces -->
+        <div class="tab-pane fade" id="tab-interfaces">
+            {% if not detail.interfaces %}
+            <div class="text-muted">No interfaces returned by SMC.</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Interface</th>
+                            <th>VLAN</th>
+                            <th>Address(es)</th>
+                            <th>Network</th>
+                            <th>Node</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for iface in detail.interfaces %}
+                        {% if iface.addresses %}
+                        {% for addr in iface.addresses %}
+                        <tr>
+                            {% if loop.first %}
+                            <td rowspan="{{ iface.addresses|length }}"><code>{{ iface.interface_id }}</code></td>
+                            <td rowspan="{{ iface.addresses|length }}">
+                                {% if iface.vlan_id %}<code>{{ iface.vlan_id }}</code>{% else %}<span class="text-muted">—</span>{% endif %}
+                            </td>
+                            {% endif %}
+                            <td><code>{{ addr.address }}</code></td>
+                            <td><code style="font-size:0.78rem;">{{ addr.network_value }}</code></td>
+                            <td>
+                                {% if addr.nodeid %}
+                                <span class="badge bg-info text-dark">node {{ addr.nodeid }}</span>
+                                {% else %}
+                                <span class="text-muted">cluster</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                        {% else %}
+                        <tr class="text-muted">
+                            <td><code>{{ iface.interface_id }}</code></td>
+                            <td>{% if iface.vlan_id %}<code>{{ iface.vlan_id }}</code>{% else %}—{% endif %}</td>
+                            <td colspan="3"><em>no addresses</em></td>
+                        </tr>
+                        {% endif %}
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Routing -->
+        <div class="tab-pane fade" id="tab-routing">
+            {% if not detail.routing %}
+            <div class="text-muted">No routing entries returned by SMC.</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Name</th>
+                            <th>Level</th>
+                            <th>IP</th>
+                            <th>Routing node element</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for r in detail.routing %}
+                        <tr>
+                            <td>{{ r.name or '—' }}</td>
+                            <td><code style="font-size:0.78rem;">{{ r.level }}</code></td>
+                            <td><code>{{ r.ip or '—' }}</code></td>
+                            <td><code style="font-size:0.78rem;">{{ r.routing_node_element }}</code></td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+
+        <!-- Contact addresses -->
+        <div class="tab-pane fade" id="tab-contact">
+            {% if not detail.contact_addresses %}
+            <div class="text-muted">No contact addresses returned by SMC (or unsupported on this version).</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark align-middle mb-0">
+                    <thead>
+                        <tr>
+                            <th>Interface</th>
+                            <th>Interface IP</th>
+                            <th>Contact addresses</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for ca in detail.contact_addresses %}
+                        <tr>
+                            <td><code>{{ ca.interface_id }}</code></td>
+                            <td><code>{{ ca.interface_ip }}</code></td>
+                            <td>
+                                {% for a in ca.addresses %}<code>{{ a }}</code>{% if not loop.last %}, {% endif %}{% endfor %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+        </div>
+
+    </div>
+</div>
+{% endblock %}

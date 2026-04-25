@@ -304,6 +304,10 @@ class DhcpReservation(db.Model):
     status = db.Column(db.String(32), default="pending", nullable=False)  # pending|synced|out_of_sync|error
     last_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, default="", nullable=False)
+    # Origin of this row — empty for manually-added, "migration:<project_id>"
+    # for FortiGate-import-generated rows. Used for the "From migration"
+    # badge in the DHCP Manager UI and for traceability.
+    source = db.Column(db.String(64), default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -446,6 +450,34 @@ class DhcpActivityLog(db.Model):
     target = db.Column(db.String(256), default="", nullable=False)
     detail = db.Column(db.Text, default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+
+class EngineTerminalSession(db.Model):
+    """
+    Audit log for browser-based SSH terminal sessions to engine nodes.
+
+    One row per open/close cycle. Connect/disconnect events only — never
+    keystroke contents (sudo passwords typed in shell would otherwise land
+    in the audit table).
+    """
+    __tablename__ = "engine_terminal_sessions"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    credential_id = db.Column(db.Integer,
+                              db.ForeignKey("dhcp_engine_credentials.id", ondelete="SET NULL"),
+                              nullable=True)
+    engine_name = db.Column(db.String(256), nullable=False)
+    node_index = db.Column(db.Integer, nullable=False)
+    opened_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    closed_at = db.Column(db.DateTime, nullable=True)
+    source_ip = db.Column(db.String(45), default="", nullable=False)
+    close_reason = db.Column(db.String(64), default="", nullable=False)  # disconnect|replaced|error|server_close
+
+    user = db.relationship("User", foreign_keys=[user_id])
+
+    def __repr__(self):
+        return f"<EngineTerminalSession #{self.id} user={self.user_id} {self.engine_name}/{self.node_index}>"
 
 
 class OptimizationSubmission(db.Model):

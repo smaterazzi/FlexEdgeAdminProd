@@ -115,3 +115,17 @@ def _migrate_post_create(db, app):
         except Exception as exc:
             db.session.rollback()
             log.error("Failed to add tenants.flexedge_source_ip: %s", exc)
+
+    # Add dhcp_reservations.source if missing (FortiGate-migration origin tag)
+    cols = _sqlite_columns(db, "dhcp_reservations")
+    if cols and "source" not in cols:
+        log.info("Adding dhcp_reservations.source column")
+        try:
+            db.session.execute(db.text(
+                "ALTER TABLE dhcp_reservations ADD COLUMN source "
+                "VARCHAR(64) NOT NULL DEFAULT ''"
+            ))
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            log.error("Failed to add dhcp_reservations.source: %s", exc)

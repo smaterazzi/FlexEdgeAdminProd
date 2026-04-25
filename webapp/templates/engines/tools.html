@@ -1,0 +1,27 @@
+{% extends "base.html" %}
+{% block title %}Engine Tools{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-3"><i class="bi bi-tools"></i> Engine Tools</h4>
+
+    <div class="row g-3">
+        <div class="col-md-6 col-lg-4">
+            <div class="card h-100">
+                <div class="card-body">
+                    <h6 class="card-title">
+                        <i class="bi bi-radar text-primary"></i> Network Scan
+                    </h6>
+                    <p class="card-text text-muted" style="font-size:0.85rem;">
+                        Run a network scan from a selected node against the subnet attached to a chosen
+                        interface. Reports per-host status, ports, and MAC.
+                    </p>
+                    <a href="{{ url_for('engines.tools_scan') }}" class="btn btn-sm btn-outline-primary">
+                        Open
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

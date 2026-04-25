@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}Scan tool — coming soon{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-3"><i class="bi bi-radar"></i> Network Scan</h4>
+
+    <div class="alert alert-info">
+        <strong>Phase C — not yet implemented.</strong>
+        This tool will run network scans from a selected firewall node against the subnet
+        attached to a chosen interface. The implementation is pending verification of
+        scanner availability on Forcepoint NGFW engines (Python 3 + <code>nc</code> /
+        <code>arp</code> from BusyBox, or a custom Python scanner shipped on demand).
+    </div>
+
+    <p class="text-muted" style="font-size:0.85rem;">
+        See <code>CLAUDE.md § Engines → Tools → Scan</code> for the full spec.
+    </p>
+</div>
+{% endblock %}

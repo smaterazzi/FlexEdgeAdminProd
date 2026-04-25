@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}DHCP mapping: {{ project.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_projects') }}">Migration</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('migration_parsed', project_id=project.id, tab='dhcp') }}">{{ project.name }}</a></li>
+            <li class="breadcrumb-item active">DHCP mapping</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <h4 class="mb-2">
+        <i class="bi bi-hdd-network me-2"></i>Map DHCP scopes to target engines
+    </h4>
+    <p class="text-muted">
+        For each FortiGate DHCP server, pick the destination scope on the
+        target Forcepoint cluster. Imported reservations will land as
+        <code>DhcpReservation</code> rows on the chosen scope; the actual
+        engine push happens later from the
+        <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>.
+    </p>
+
+    {# Tenant resolver feedback ─────────────────────────────────────────── #}
+    {% if not tenant %}
+    <div class="alert alert-warning">
+        <i class="bi bi-exclamation-triangle me-1"></i>
+        <strong>Tenant unresolved.</strong> Could not match the migration
+        target's SMC URL + API key to any active tenant in the database.
+        Add the tenant in the
+        <a href="{{ url_for('admin.tenants') }}">Admin Portal</a>
+        (or fix the target config) before mapping DHCP scopes.
+    </div>
+    {% else %}
+    <div class="alert alert-info" style="font-size:0.85rem;">
+        <i class="bi bi-info-circle me-1"></i>
+        Showing DHCP scopes for tenant <strong>{{ tenant.name }}</strong>
+        (slug <code>{{ tenant.slug }}</code>).
+        Only scopes opted into FlexEdge management appear here — manage
+        them in the <a href="{{ url_for('dhcp.scopes_list') }}">DHCP Manager</a>.
+    </div>
+    {% endif %}
+
+    {# Readiness summary ───────────────────────────────────────────────── #}
+    {% if scope_options %}
+    {% set ready_count = scope_options | selectattr('ready') | list | length %}
+    {% set total_count = scope_options | length %}
+    <p class="text-muted small">
+        <span class="badge bg-success">{{ ready_count }} ready</span>
+        {% if total_count > ready_count %}
+        <span class="badge bg-warning text-dark ms-1">
+            {{ total_count - ready_count }} not ready (greyed out below)
+        </span>
+        {% endif %}
+        of <strong>{{ total_count }}</strong> scope(s) on this tenant.
+    </p>
+    {% endif %}
+
+    {# The form ──────────────────────────────────────────────────────────── #}
+    <form method="POST">
+
+    {% for srv in fg_servers %}
+    {% set saved = saved_mappings.get(srv.id|string, '') %}
+    <div class="card bg-dark border-secondary mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between">
+            <div>
+                <i class="bi bi-arrow-right me-1"></i>
+                <strong>FG DHCP server #{{ srv.id }}</strong>
+                <span class="text-muted ms-2">on interface
+                    <code>{{ srv.interface or '(none)' }}</code>
+                    {% if srv.subnet_cidr %}
+                    <span class="badge bg-secondary">{{ srv.subnet_cidr }}</span>
+                    {% endif %}
+                </span>
+            </div>
+            <span class="badge bg-info">{{ srv.reservations|length }} reservation(s)</span>
+        </div>
+        <div class="card-body">
+            <div class="row g-3">
+                {# ──── Source recap (left) ──── #}
+                <div class="col-md-5">
+                    <strong style="font-size:0.85rem;">Source (FortiGate)</strong>
+                    <table class="table table-sm table-dark mt-1 mb-0" style="font-size:0.82rem;">
+                        <tr><td class="text-muted" style="width:45%;">Interface</td>
+                            <td><code>{{ srv.interface }}</code></td></tr>
+                        <tr><td class="text-muted">Subnet</td>
+                            <td><code>{{ srv.subnet_cidr or srv.subnet or '-' }}</code></td></tr>
+                        <tr><td class="text-muted">Pool</td>
+                            <td>
+                                {% for r in srv.ranges %}
+                                <code>{{ r.start_ip }} → {{ r.end_ip }}</code>
+                                {% else %}-{% endfor %}
+                            </td></tr>
+                        <tr><td class="text-muted">Gateway</td>
+                            <td><code>{{ srv.default_gateway or '-' }}</code></td></tr>
+                        <tr><td class="text-muted">Reservations</td>
+                            <td>{{ srv.reservations|length }}</td></tr>
+                    </table>
+                </div>
+
+                {# ──── Destination dropdown (right) ──── #}
+                <div class="col-md-7">
+                    <strong style="font-size:0.85rem;">Target (Forcepoint)</strong>
+                    <div class="mt-1">
+                        <select class="form-select bg-dark border-secondary text-light"
+                                name="map_{{ srv.id }}"
+                                id="map_{{ srv.id }}">
+                            <option value="skip" {% if saved == 'skip' or not saved %}selected{% endif %}>
+                                — Skip this scope (don't import) —
+                            </option>
+                            {% for opt in scope_options %}
+                            <option value="{{ opt.scope_id }}"
+                                    {% if not opt.ready %}disabled{% endif %}
+                                    {% if saved == opt.scope_id %}selected{% endif %}>
+                                {{ opt.label }}
+                                {%- if not opt.ready %} — NOT READY: {{ opt.missing|join(', ') }}{% endif %}
+                            </option>
+                            {% endfor %}
+                        </select>
+                    </div>
+
+                    {# Per-option feedback chips for the not-ready ones ─── #}
+                    {% set unready = scope_options | rejectattr('ready') | list %}
+                    {% if unready %}
+                    <details class="mt-2">
+                        <summary class="text-warning" style="font-size:0.8rem;cursor:pointer;">
+                            <i class="bi bi-exclamation-triangle me-1"></i>
+                            {{ unready|length }} scope(s) excluded — fix to enable
+                        </summary>
+                        <ul class="text-muted mt-1 mb-0" style="font-size:0.78rem;">
+                            {% for opt in unready %}
+                            <li>
+                                <strong>{{ opt.engine_name }}</strong>
+                                / port {{ opt.interface_label }} — {{ opt.subnet_cidr }}:
+                                {{ opt.missing|join('; ') }}
+                                <a href="{{ opt.deep_link }}" class="ms-1">[fix]</a>
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    </details>
+                    {% endif %}
+
+                    {# Subnet match warning (rendered if mapping is set) ── #}
+                    {% if saved and saved != 'skip' %}
+                    {% for opt in scope_options if opt.scope_id == saved %}
+                    {% if opt.subnet_cidr and srv.subnet_cidr and opt.subnet_cidr != srv.subnet_cidr %}
+                    <div class="alert alert-warning mt-2 mb-0 py-1 px-2"
+                         style="font-size:0.78rem;">
+                        <i class="bi bi-exclamation-triangle me-1"></i>
+                        Subnet mismatch: source <code>{{ srv.subnet_cidr }}</code>
+                        ≠ target <code>{{ opt.subnet_cidr }}</code>.
+                        Reservations will still import but the engine may reject
+                        IPs outside its subnet.
+                    </div>
+                    {% endif %}
+                    {% endfor %}
+                    {% endif %}
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <div class="d-flex justify-content-between mt-4">
+        <a href="{{ url_for('migration_parsed', project_id=project.id, tab='dhcp') }}"
+           class="btn btn-outline-secondary">
+            <i class="bi bi-arrow-left"></i> Back to parsed view
+        </a>
+        <button type="submit" class="btn btn-primary">
+            <i class="bi bi-check-lg"></i> Save mapping & continue
+        </button>
+    </div>
+
+    </form>
+</div>
+{% endblock %}

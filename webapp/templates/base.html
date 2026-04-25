@@ -201,6 +201,28 @@
                 </li>
             </ul>
 
+            <div class="section-label">Engines</div>
+            <ul class="nav flex-column mb-2">
+                <li class="nav-item">
+                    <a class="nav-link {% if '/engines/clusters' in request.path %}active{% endif %}"
+                       href="{{ url_for('engines.clusters') }}">
+                        <i class="bi bi-bricks"></i> Clusters
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}"
+                       href="/dhcp/credentials">
+                        <i class="bi bi-key"></i> Credentials
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/engines/tools' in request.path %}active{% endif %}"
+                       href="{{ url_for('engines.tools') }}">
+                        <i class="bi bi-tools"></i> Tools
+                    </a>
+                </li>
+            </ul>
+
             <div class="section-label">DHCP Manager</div>
             <ul class="nav flex-column mb-2">
                 <li class="nav-item">
@@ -211,11 +233,6 @@
                 <li class="nav-item">
                     <a class="nav-link {% if '/dhcp/scopes' in request.path %}active{% endif %}" href="/dhcp/scopes">
                         <i class="bi bi-diagram-3"></i> Scopes
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}" href="/dhcp/credentials">
-                        <i class="bi bi-key"></i> Credentials
                     </a>
                 </li>
                 <li class="nav-item">

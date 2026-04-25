@@ -104,7 +104,16 @@
       <tbody>
         {% for r in reservations %}
         <tr>
-          <td><strong>{{ r.smc_host_name }}</strong></td>
+          <td>
+            <strong>{{ r.smc_host_name }}</strong>
+            {% if r.source and r.source.startswith('migration:') %}
+            <span class="badge bg-secondary ms-1"
+                  style="font-size:0.65rem;font-weight:normal;"
+                  title="Imported from FortiGate migration project {{ r.source.split(':',1)[1] }}">
+              <i class="bi bi-arrow-left-right"></i> from migration
+            </span>
+            {% endif %}
+          </td>
           <td><code>{{ r.ip_address }}</code></td>
           <td><code>{{ r.mac_address }}</code></td>
           <td>

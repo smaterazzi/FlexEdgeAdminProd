@@ -62,6 +62,10 @@ EXPOSE 8088
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:${PORT}/login || exit 1
 
-# Default: run the web app via gunicorn
+# Default: run the web app via gunicorn.
+# Threaded workers (-k gthread) are required for flask-sock WebSocket terminals;
+# 2 workers × 8 threads = 16 concurrent sockets, well within an admin-tool budget.
 # CLI tools available via: docker compose exec flexedge-web python -m cli.connect --tenant prod
-CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8088", "--timeout", "120", "--chdir", "/app/webapp", "app:app"]
+CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "8", \
+     "-b", "0.0.0.0:8088", "--timeout", "120", \
+     "--chdir", "/app/webapp", "app:app"]

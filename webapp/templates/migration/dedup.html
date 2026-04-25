@@ -43,7 +43,7 @@
     {% if dedup %}
     <!-- Stats cards -->
     <div class="row g-2 mb-3">
-        {% for cat, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles')] %}
+        {% for cat, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles'), ('dhcp_reservations', 'DHCP Reservations')] %}
         {% set st = dedup_stats.get(cat, {}) %}
         <div class="col-md-3">
             <div class="card bg-dark border-secondary stat-card">
@@ -62,16 +62,167 @@
 
     <!-- Tabs -->
     <ul class="nav nav-tabs mb-3">
-        {% for key, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles')] %}
+        {% for key, label in [('addresses', 'Addresses'), ('services', 'Services'), ('address_groups', 'Address Groups'), ('service_groups', 'Service Groups'), ('nat_hosts', 'NAT Hosts'), ('vpn_profiles', 'VPN Profiles'), ('dhcp_reservations', 'DHCP')] %}
         <li class="nav-item">
             <a class="nav-link {% if tab == key %}active{% endif %}"
                href="{{ url_for('migration_dedup', project_id=project.id, tab=key) }}">{{ label }}
+                {% if key == 'dhcp_reservations' %}
+                <span class="badge bg-secondary">
+                    {{- dedup_stats.get('dhcp_reservations', {}).get('total', 0) -}}
+                </span>
+                {% else %}
                 <span class="badge bg-secondary">{{ dedup.get(key, []) | length }}</span>
+                {% endif %}
             </a>
         </li>
         {% endfor %}
     </ul>
 
+    {% if tab == 'dhcp_reservations' %}
+    {# ─────────── DHCP migration dedup view (per-FG-scope cards) ─────────── #}
+    {% set dhcp_entries = dedup.get('dhcp_reservations', []) %}
+    {% if dhcp_entries %}
+
+    <p class="text-muted small mb-3">
+        Per-FG-scope summary. Conflicts default to <em>not selected</em> —
+        click "⚙ Overwrite" if you want the FortiGate value to win at
+        import (the existing SMC Host's IP/MAC marker will be updated).
+        Push to engine happens later from the
+        <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>.
+    </p>
+
+    {% for entry in dhcp_entries %}
+    <div class="card bg-dark border-secondary mb-3">
+        <div class="card-header d-flex align-items-center justify-content-between flex-wrap gap-2">
+            <div>
+                <i class="bi bi-arrow-right me-1"></i>
+                <strong>FG DHCP server #{{ entry.fg_server_id }}</strong>
+                <span class="text-muted ms-2">interface
+                    <code>{{ entry.fg_interface or '-' }}</code>
+                    {% if entry.fg_subnet_cidr %}
+                    <span class="badge bg-secondary">{{ entry.fg_subnet_cidr }}</span>
+                    {% endif %}
+                </span>
+            </div>
+            <div>
+                {% if entry.target_scope_id %}
+                <span class="text-muted me-2">→</span>
+                <strong>{{ entry.target_scope_label }}</strong>
+                {% if entry.target_scope_ready %}
+                <span class="badge bg-success ms-2">DHCP-ready</span>
+                {% else %}
+                <span class="badge bg-warning text-dark ms-2"
+                      title="{{ entry.target_scope_ready_missing | join('; ') }}">
+                    NOT READY
+                </span>
+                {% endif %}
+                {% else %}
+                <span class="badge bg-secondary">Not mapped</span>
+                <a href="{{ url_for('migration_dhcp_map', project_id=project.id) }}"
+                   class="btn btn-outline-primary btn-sm ms-2">
+                    <i class="bi bi-arrow-right"></i> Map now
+                </a>
+                {% endif %}
+            </div>
+        </div>
+
+        {% if entry.target_scope_id and not entry.target_scope_ready %}
+        <div class="card-body py-2">
+            <div class="alert alert-warning mb-0" style="font-size:0.85rem;">
+                <i class="bi bi-exclamation-triangle me-1"></i>
+                Scope is not DHCP-ready ({{ entry.target_scope_ready_missing | join(', ') }}).
+                All reservations will be skipped at import. Fix in the
+                <a href="{{ url_for('dhcp.dashboard') }}">DHCP Manager</a>
+                and re-run dedup.
+            </div>
+        </div>
+        {% elif entry.reservations %}
+        <div class="card-body p-0">
+            <table class="table table-sm table-dark table-hover mb-0">
+                <thead>
+                    <tr>
+                        <th style="width:5%;">Pick</th>
+                        <th style="width:18%;">IP</th>
+                        <th style="width:18%;">MAC</th>
+                        <th>Description</th>
+                        <th style="width:14%;">Status</th>
+                        <th style="width:18%;">Existing match</th>
+                    </tr>
+                </thead>
+                <tbody>
+                {% for r in entry.reservations %}
+                <tr>
+                    <td>
+                        <input type="checkbox"
+                               class="form-check-input dhcp-select"
+                               data-fg-server="{{ entry.fg_server_id }}"
+                               data-fg-res="{{ r.fg_id }}"
+                               data-action="{{ r.action }}"
+                               {% if r.selected %}checked{% endif %}
+                               {% if not entry.target_scope_ready %}disabled{% endif %}>
+                    </td>
+                    <td><code>{{ r.ip }}</code></td>
+                    <td><code>{{ r.mac }}</code></td>
+                    <td><small>{{ r.description or '-' }}</small></td>
+                    <td>
+                        {% if r.match_type == 'already_migrated' %}
+                        <span class="badge bg-info">already migrated</span>
+                        {% elif r.match_type == 'mac_conflict' %}
+                        <span class="badge bg-warning text-dark"
+                              title="{{ r.warnings | join('; ') }}">MAC conflict</span>
+                        {% elif r.match_type == 'ip_conflict' %}
+                        <span class="badge bg-warning text-dark"
+                              title="{{ r.warnings | join('; ') }}">IP conflict</span>
+                        {% elif r.match_type == 'none' %}
+                        <span class="badge bg-success">new</span>
+                        {% endif %}
+
+                        {% if r.match_type in ('mac_conflict', 'ip_conflict') %}
+                        <button type="button"
+                                class="btn btn-outline-warning btn-sm ms-1 dhcp-overwrite py-0 px-1"
+                                style="font-size:0.7rem;"
+                                data-fg-server="{{ entry.fg_server_id }}"
+                                data-fg-res="{{ r.fg_id }}"
+                                title="Mark as overwrite — FG value wins at import">
+                            ⚙ Overwrite
+                        </button>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if r.smc_match %}
+                        <small>
+                            <code>{{ r.smc_match.host_name }}</code><br>
+                            <span class="text-muted">
+                                {{ r.smc_match.ip }} / {{ r.smc_match.mac }}
+                            </span>
+                        </small>
+                        {% else %}
+                        <small class="text-muted">-</small>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% else %}
+        <div class="card-body py-2">
+            <p class="text-muted mb-0" style="font-size:0.85rem;">
+                <em>No reservations on this FG scope.</em>
+            </p>
+        </div>
+        {% endif %}
+    </div>
+    {% endfor %}
+
+    {% else %}
+    <div class="alert alert-secondary">
+        <i class="bi bi-info-circle me-1"></i>
+        No DHCP servers parsed from the FortiGate config — nothing to migrate.
+    </div>
+    {% endif %}
+
+    {% else %}
     <!-- Table -->
     <div class="table-responsive">
         <table class="table table-sm table-hover table-dark" id="dedupTable">
@@ -178,6 +329,8 @@
             </tbody>
         </table>
     </div>
+    {% endif %}{# end tab == 'dhcp_reservations' switch #}
+
     {% else %}
     <div class="text-center py-5 text-muted">
         <i class="bi bi-search" style="font-size:3rem;"></i>
@@ -189,6 +342,52 @@
 
 {% block extra_js %}
 <script>
+// DHCP reservation checkbox toggle
+document.querySelectorAll('.dhcp-select').forEach(cb => {
+    cb.addEventListener('change', function() {
+        fetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                fg_server_id: this.dataset.fgServer,
+                fg_res_id: this.dataset.fgRes,
+                selected: this.checked
+            })
+        });
+    });
+});
+
+// "Overwrite" button — flip a conflict to selected + action='conflict_overwrite'
+document.querySelectorAll('.dhcp-overwrite').forEach(btn => {
+    btn.addEventListener('click', function() {
+        const fgServer = this.dataset.fgServer;
+        const fgRes = this.dataset.fgRes;
+        // Find the matching checkbox in the same row and force-check it
+        const cb = document.querySelector(
+            `.dhcp-select[data-fg-server="${fgServer}"][data-fg-res="${fgRes}"]`
+        );
+        if (cb) {
+            cb.checked = true;
+            cb.dataset.action = 'conflict_overwrite';
+        }
+        fetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+                fg_server_id: fgServer,
+                fg_res_id: fgRes,
+                selected: true,
+                action: 'conflict_overwrite'
+            })
+        }).then(() => {
+            this.classList.remove('btn-outline-warning');
+            this.classList.add('btn-warning');
+            this.textContent = '✓ Overwriting';
+            this.disabled = true;
+        });
+    });
+});
+
 document.querySelectorAll('.dedup-action').forEach(sel => {
     sel.addEventListener('change', function() {
         fetch('{{ url_for("migration_dedup_update", project_id=project.id) }}', {

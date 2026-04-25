@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Clusters{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <h4 class="mb-3"><i class="bi bi-bricks"></i> Clusters &amp; Engines</h4>
+
+    {% if not engines %}
+    <div class="alert alert-secondary">No engines visible to the current SMC profile.</div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table table-sm table-dark align-middle">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Type</th>
+                    <th class="text-center">Nodes</th>
+                    <th>Installed policy</th>
+                    <th class="text-end">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for e in engines %}
+                <tr>
+                    <td><strong>{{ e.name }}</strong></td>
+                    <td>
+                        <span class="badge bg-secondary text-uppercase" style="font-size:0.7rem;">
+                            {{ e.typeof or 'engine' }}
+                        </span>
+                    </td>
+                    <td class="text-center">
+                        {% if e.node_count > 1 %}
+                        <span class="badge bg-info text-dark">{{ e.node_count }}</span>
+                        {% else %}
+                        <span class="text-muted">{{ e.node_count or '—' }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if e.installed_policy %}
+                        <code style="font-size:0.78rem;">{{ e.installed_policy }}</code>
+                        {% else %}
+                        <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td class="text-end">
+                        <a href="{{ url_for('engines.cluster_detail', engine_name=e.name) }}"
+                           class="btn btn-sm btn-outline-primary">
+                            <i class="bi bi-search"></i> Details
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+</div>
+{% endblock %}

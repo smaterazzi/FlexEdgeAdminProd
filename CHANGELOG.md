@@ -6,6 +6,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-25
 
+### Added — FortiGate DHCP migration (phases A, B, C, D landed 2026-04-25)
+
+The FortiGate import now handles `config system dhcp server` blocks
+end-to-end and feeds them into the existing DHCP Manager:
+
+- **Phase A** (parser + read-only review tab) — `_extract_dhcp_servers()`
+  in fgt_parser, "DHCP" tab on parsed.html with per-scope cards.
+  See e184773.
+- **Phase B** (target mapping + DHCP-ready guard) — `webapp/dhcp_readiness.py`
+  resolves migration target → tenant + lists candidate scopes with
+  ready/not-ready tags. New `/migration/<id>/dhcp-map` route + template
+  persists `target.dhcp_mappings`. See 412f61d.
+- **Phase C** (dedup) — `_dedup_dhcp_reservations()` in dedup_engine.py
+  classifies each parsed reservation against existing DhcpReservation
+  rows on the mapped target scope (already_migrated / mac_conflict /
+  ip_conflict / new). DB-only, no SMC session required. New "DHCP" tab
+  on dedup.html with per-FG-scope cards + per-reservation checkboxes
+  and a "⚙ Overwrite" button for conflicts (operator opts into making
+  the FG value win at import).
+- **Phase D** (importer) — `webapp/migration_dhcp_writer.py`
+  `import_dhcp_reservations()` calls `smc_dhcp_client.host_create()`
+  (same path the DHCP Manager UI uses, same `[flexedge:mac=...]` comment
+  marker) for every selected reservation, inserts a DhcpReservation row
+  with `source="migration:<project_id>"` and `status="pending"` so it
+  appears in the existing DHCP Manager UI ready for the existing Phase 4
+  "Deploy" button. **Migration never pushes** — it only stages.
+- **Locked design constraints** (chat with operator, 2026-04-25):
+  imported config wins in staging (conflicts default off; operator opts
+  into overwrite); migration reuses DHCP Manager primitives entirely;
+  un-ready scopes are blocked at import with deep links to enroll/enable
+  rather than auto-enrolling.
+- **Schema additions** (additive, lightweight): `DhcpReservation.source`
+  column for traceability ("migration:&lt;project_id&gt;"). Migrated rows
+  show a "From migration" source tag in the DHCP Manager UI.
+
+Files: webapp/dhcp_readiness.py, webapp/migration_dhcp_writer.py,
+webapp/dedup_engine.py (extended), webapp/db_init.py (ALTER TABLE for
+.source), webapp/templates/migration/{dhcp_map,dedup,parsed}.html,
+webapp/app.py (new routes: /dhcp-map GET/POST, /dhcp/update AJAX,
+/import wired to the writer).
+
 ### Added — DHCP Reservation Manager (in progress — phases 0, 1, 1b, 1c, 2, 3, 4 landed)
 
 **Phase 4 — engine-side reservation push (2026-04-25):**

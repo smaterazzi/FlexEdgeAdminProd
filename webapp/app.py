@@ -147,6 +147,12 @@ from dhcp_manager import dhcp_bp, init_dhcp_manager
 init_dhcp_manager(app)
 app.register_blueprint(dhcp_bp)
 
+# ── Engines (clusters, credentials link, tools, terminal) ───────────────
+
+from engines_manager import engines_bp, init_engines_manager
+app.register_blueprint(engines_bp)
+init_engines_manager(app)
+
 
 # ── Session-based SMC config ─────────────────────────────────────────────
 
@@ -524,6 +530,79 @@ def migration_target(project_id):
     )
 
 
+@app.route("/migration/<project_id>/dhcp-map", methods=["GET", "POST"])
+@login_required
+def migration_dhcp_map(project_id):
+    """Map FortiGate DHCP servers to target SMC scopes.
+
+    Phase B of the FortiGate DHCP migration: persists a mapping
+    ``{ fg_server_id: target_scope_id | "skip" }`` into the project's
+    ``target.dhcp_mappings`` dict. Phase D's importer reads this when
+    creating SMC Hosts and DhcpReservation rows.
+
+    The page is opt-in (operator hits it from the parsed-objects DHCP
+    tab) — no DHCP servers means the wizard goes straight from target
+    config to dedup as before.
+    """
+    from webapp.dhcp_readiness import find_tenant_for_target, list_scope_options
+
+    project = project_manager.get_project(project_id)
+    if not project:
+        flash("Project not found.", "danger")
+        return redirect(url_for("migration_projects"))
+
+    parsed = project_manager.get_parsed_objects(project_id)
+    if not parsed:
+        flash("Config not yet parsed.", "warning")
+        return redirect(url_for("migration_projects"))
+
+    fg_servers = parsed.get("dhcp_servers", [])
+    if not fg_servers:
+        flash("No DHCP servers in this configuration — nothing to map.", "info")
+        return redirect(url_for("migration_parsed",
+                                project_id=project_id, tab="dhcp"))
+
+    target = project.get("target") or {}
+
+    if request.method == "POST":
+        new_mappings = {}
+        for srv in fg_servers:
+            field = f"map_{srv['id']}"
+            value = request.form.get(field, "").strip()
+            if not value or value == "skip":
+                new_mappings[str(srv["id"])] = "skip"
+            else:
+                # Coerce scope_id to int; reject unknown
+                try:
+                    new_mappings[str(srv["id"])] = int(value)
+                except ValueError:
+                    new_mappings[str(srv["id"])] = "skip"
+        target["dhcp_mappings"] = new_mappings
+        project_manager.update_project(project_id, {"target": target})
+        flash(
+            f"DHCP mapping saved ({sum(1 for v in new_mappings.values() if v != 'skip')} "
+            f"of {len(fg_servers)} FG scopes mapped).",
+            "success",
+        )
+        # Continue to dedup — the migration wizard's natural next step
+        return redirect(url_for("migration_dedup", project_id=project_id))
+
+    # GET: build the form data
+    tenant = find_tenant_for_target(target)
+    scope_options = list_scope_options(tenant) if tenant else []
+    saved_mappings = (target.get("dhcp_mappings") or {})
+
+    return render_template(
+        "migration/dhcp_map.html",
+        project=project,
+        fg_servers=fg_servers,
+        scope_options=scope_options,
+        saved_mappings=saved_mappings,
+        tenant=tenant,
+        target=target,
+    )
+
+
 @app.route("/migration/<project_id>/dedup")
 @login_required
 def migration_dedup(project_id):
@@ -555,7 +634,7 @@ def migration_dedup(project_id):
         }
         try:
             import dedup_engine
-            dedup = dedup_engine.run_dedup(parsed, cfg)
+            dedup = dedup_engine.run_dedup(parsed, cfg, target_dict=target)
             project_manager.save_dedup_results(project_id, dedup)
             project_manager.update_project(project_id, {"status": "validated"})
             flash("Deduplication analysis complete.", "success")
@@ -575,6 +654,25 @@ def migration_dedup(project_id):
             "reuse":  sum(1 for i in items if i["action"] == "reuse"),
             "skip":   sum(1 for i in items if i["action"] == "skip"),
         }
+
+    # DHCP reservations have a different shape (nested per FG scope) — compute
+    # dedicated stats so the UI's stat-card row stays balanced.
+    dhcp_entries = dedup.get("dhcp_reservations", []) or []
+    dhcp_total_reservations = sum(len(e.get("reservations", [])) for e in dhcp_entries)
+    dhcp_selected = sum(1 for e in dhcp_entries
+                        for r in e.get("reservations", []) if r.get("selected"))
+    dhcp_conflicts = sum(1 for e in dhcp_entries
+                         for r in e.get("reservations", [])
+                         if r.get("match_type") in ("mac_conflict", "ip_conflict"))
+    dedup_stats["dhcp_reservations"] = {
+        "total": dhcp_total_reservations,
+        "create": dhcp_selected,
+        "reuse": sum(1 for e in dhcp_entries
+                     for r in e.get("reservations", [])
+                     if r.get("match_type") == "already_migrated"),
+        "skip": dhcp_conflicts,
+    }
+
     tab = request.args.get("tab", "addresses")
     return render_template(
         "migration/dedup.html",
@@ -602,6 +700,50 @@ def migration_dedup_update(project_id):
         if entry.get(key_field) == parsed_name:
             entry["action"] = new_action
             break
+    project_manager.save_dedup_results(project_id, dedup)
+    return jsonify({"status": "ok"})
+
+
+@app.route("/migration/<project_id>/dhcp/update", methods=["POST"])
+@login_required
+def migration_dhcp_update(project_id):
+    """Toggle DHCP-reservation selection (AJAX).
+
+    Body: {fg_server_id: <int>, fg_res_id: <str>, selected: <bool>,
+           action?: <str>}
+    Optional ``action`` lets the operator flip a conflict to
+    ``conflict_overwrite`` (so the importer treats it as an explicit
+    overwrite of the existing Host) — UI button does this in one click.
+    """
+    data = request.get_json() or {}
+    fg_server_id = data.get("fg_server_id")
+    fg_res_id    = str(data.get("fg_res_id", ""))
+    new_selected = bool(data.get("selected"))
+    new_action   = data.get("action")
+    if fg_server_id is None or not fg_res_id:
+        return jsonify({"status": "error", "message": "Missing fields"}), 400
+
+    dedup = project_manager.get_dedup_results(project_id)
+    if not dedup:
+        return jsonify({"status": "error", "message": "No dedup results"}), 404
+
+    found = False
+    for entry in dedup.get("dhcp_reservations", []):
+        if str(entry.get("fg_server_id")) != str(fg_server_id):
+            continue
+        for r in entry.get("reservations", []):
+            if str(r.get("fg_id", "")) == fg_res_id:
+                r["selected"] = new_selected
+                if new_action:
+                    r["action"] = new_action
+                found = True
+                break
+        if found:
+            break
+
+    if not found:
+        return jsonify({"status": "error", "message": "Reservation not found"}), 404
+
     project_manager.save_dedup_results(project_id, dedup)
     return jsonify({"status": "ok"})
 
@@ -727,6 +869,9 @@ def migration_import(project_id):
             "rules_created": 0, "rules_errors": 0,
             "nat_created": 0, "nat_errors": 0,
             "vpn_profiles": 0, "vpn_gateways": 0, "vpn_policies": 0, "vpn_errors": 0,
+            "dhcp_scopes_processed": 0, "dhcp_scopes_skipped": 0,
+            "dhcp_reservations_created": 0, "dhcp_reservations_updated": 0,
+            "dhcp_reservations_skipped": 0, "dhcp_reservations_errors": 0,
             "status": "running",
         }
         try:
@@ -757,6 +902,24 @@ def migration_import(project_id):
                 import_log["vpn_gateways"] = vpn_result.get("gateways", 0)
                 import_log["vpn_policies"] = vpn_result.get("vpn_policies", 0)
                 import_log["vpn_errors"]   = vpn_result.get("vpn_errors", 0)
+
+            # DHCP migration — populates DHCP Manager DB rows + SMC Hosts.
+            # Push to engine remains the DHCP Manager's job (Phase 4 button).
+            if (import_type in ("all", "dhcp")
+                    and parsed and parsed.get("dhcp_servers")
+                    and dedup and dedup.get("dhcp_reservations")):
+                from migration_dhcp_writer import import_dhcp_reservations
+                dhcp_result = import_dhcp_reservations(
+                    parsed, dedup, target, project_id,
+                )
+                import_log["entries"].extend(dhcp_result.get("entries", []))
+                import_log["dhcp_scopes_processed"]      = dhcp_result.get("scopes_processed", 0)
+                import_log["dhcp_scopes_skipped"]        = dhcp_result.get("scopes_skipped", 0)
+                import_log["dhcp_reservations_created"]  = dhcp_result.get("reservations_created", 0)
+                import_log["dhcp_reservations_updated"]  = dhcp_result.get("reservations_updated", 0)
+                import_log["dhcp_reservations_skipped"]  = dhcp_result.get("reservations_skipped", 0)
+                import_log["dhcp_reservations_errors"]   = dhcp_result.get("reservations_errors", 0)
+
             import_log["status"] = "done"
             project_manager.update_project(project_id, {"status": "imported"})
             flash("Import completed.", "success")

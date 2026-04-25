@@ -20,12 +20,15 @@ import logging
 log = logging.getLogger(__name__)
 
 
-def run_dedup(parsed_objects, cfg):
+def run_dedup(parsed_objects, cfg, target_dict=None):
     """Run deduplication against the SMC.
 
     Args:
         parsed_objects: Output of fgt_parser.parse_fortigate_config()
         cfg: SMC config dict (from smc_config.yml)
+        target_dict: Optional migration project ``target`` dict — used to
+            compute DHCP reservation dedup against the mapped target scopes.
+            When omitted, ``dhcp_reservations`` is empty.
 
     Returns:
         {
@@ -33,6 +36,9 @@ def run_dedup(parsed_objects, cfg):
             "address_groups": [...],
             "services": [...],
             "service_groups": [...],
+            "nat_hosts": [...],
+            "vpn_profiles": [...],
+            "dhcp_reservations": [...],   # one entry per FG dhcp server
         }
         Each entry: {parsed_name, smc_match, match_type, action, smc_name, ...}
     """
@@ -98,6 +104,9 @@ def run_dedup(parsed_objects, cfg):
         ),
         "vpn_profiles": _dedup_vpn_profiles(
             parsed_objects.get("vpn_tunnels", []),
+        ),
+        "dhcp_reservations": _dedup_dhcp_reservations(
+            parsed_objects, target_dict or {},
         ),
     }
 
@@ -392,6 +401,166 @@ def _dedup_nat_hosts(parsed_objects, smc_names, ip_index):
 
         results.append(entry)
     return results
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  DHCP RESERVATION DEDUP (DB-only, no SMC session)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _dedup_dhcp_reservations(parsed_objects, target_dict):
+    """Per-FG-DHCP-server dedup against the existing ``dhcp_reservations``
+    rows on the mapped target scope.
+
+    Pure DB lookup — no SMC API calls. Reads ``target.dhcp_mappings``
+    written by Phase B's mapping step. Each FG DHCP server produces one
+    result entry; reservations within are individually classified.
+
+    Match logic per reservation:
+      - same MAC + same IP  → ``already_migrated`` (skip)
+      - same MAC + diff IP  → ``mac_conflict``     (manual review)
+      - diff MAC + same IP  → ``ip_conflict``      (manual review)
+      - none                → ``create``           (selected by default)
+
+    Returns ``[]`` if there are no FG DHCP servers parsed, or if no
+    Flask app context (CLI / test mode) — keeps the function safe to call
+    outside a Flask request.
+    """
+    fg_servers = parsed_objects.get("dhcp_servers", [])
+    if not fg_servers:
+        return []
+
+    try:
+        from flask import current_app
+        if current_app is None or "sqlalchemy" not in current_app.extensions:
+            return [_unmapped_entry(s, "no Flask DB context") for s in fg_servers]
+    except (RuntimeError, ImportError):
+        return [_unmapped_entry(s, "no Flask DB context") for s in fg_servers]
+
+    from webapp.models import DhcpScope, DhcpReservation
+    from webapp.dhcp_readiness import is_scope_ready
+
+    mappings = (target_dict or {}).get("dhcp_mappings", {}) or {}
+
+    results = []
+    for srv in fg_servers:
+        target_id_raw = mappings.get(str(srv["id"]), "skip")
+
+        # Skip / unmapped — surface as a row so the operator sees it
+        if target_id_raw in ("skip", "", None):
+            results.append(_unmapped_entry(srv, "not mapped — will be skipped at import"))
+            continue
+
+        try:
+            scope_id = int(target_id_raw)
+        except (TypeError, ValueError):
+            results.append(_unmapped_entry(srv, f"invalid mapping value: {target_id_raw!r}"))
+            continue
+
+        scope = DhcpScope.query.get(scope_id)
+        if not scope:
+            results.append(_unmapped_entry(srv,
+                f"target scope {scope_id} not found (deleted?)"))
+            continue
+
+        ready, missing = is_scope_ready(scope_id)
+
+        # Index existing reservations on the target scope
+        existing = DhcpReservation.query.filter_by(scope_id=scope_id).all()
+        by_mac = {r.mac_address.lower(): r for r in existing}
+        by_ip = {r.ip_address: r for r in existing}
+
+        reservations = []
+        for r in srv.get("reservations", []):
+            mac = (r.get("mac") or "").lower()
+            ip = r.get("ip", "")
+            entry = {
+                "fg_id": r.get("id", ""),
+                "ip": ip,
+                "mac": mac,
+                "description": r.get("description", ""),
+                "smc_match": None,
+                "match_type": "none",
+                "action": "create",
+                "selected": ready,        # only auto-select if scope is ready
+                "warnings": [],
+            }
+
+            existing_match = by_mac.get(mac)
+            if existing_match:
+                snap = {
+                    "host_name": existing_match.smc_host_name,
+                    "ip": existing_match.ip_address,
+                    "mac": existing_match.mac_address,
+                }
+                entry["smc_match"] = snap
+                if existing_match.ip_address == ip:
+                    entry["match_type"] = "already_migrated"
+                    entry["action"] = "skip"
+                    entry["selected"] = False
+                    entry["warnings"].append(
+                        f"Already migrated as Host {existing_match.smc_host_name}"
+                    )
+                else:
+                    entry["match_type"] = "mac_conflict"
+                    entry["action"] = "conflict_skip"
+                    entry["selected"] = False
+                    entry["warnings"].append(
+                        f"MAC already used by {existing_match.smc_host_name} "
+                        f"at {existing_match.ip_address} — manual review"
+                    )
+            elif ip in by_ip:
+                existing_match = by_ip[ip]
+                entry["smc_match"] = {
+                    "host_name": existing_match.smc_host_name,
+                    "ip": existing_match.ip_address,
+                    "mac": existing_match.mac_address,
+                }
+                entry["match_type"] = "ip_conflict"
+                entry["action"] = "conflict_skip"
+                entry["selected"] = False
+                entry["warnings"].append(
+                    f"IP already used by {existing_match.smc_host_name} "
+                    f"(MAC {existing_match.mac_address}) — manual review"
+                )
+
+            if not ready:
+                entry["selected"] = False
+                entry["warnings"].append(
+                    f"Target scope not DHCP-ready: {', '.join(missing)}"
+                )
+
+            reservations.append(entry)
+
+        results.append({
+            "fg_server_id": srv["id"],
+            "fg_interface": srv.get("interface", ""),
+            "fg_subnet_cidr": srv.get("subnet_cidr", ""),
+            "target_scope_id": scope_id,
+            "target_scope_label": (
+                f"{scope.engine_name} / port {scope.interface_id} "
+                f"— {scope.subnet_cidr}"
+            ),
+            "target_scope_ready": ready,
+            "target_scope_ready_missing": missing,
+            "reservations": reservations,
+        })
+    return results
+
+
+def _unmapped_entry(srv, reason):
+    """Render an FG DHCP server that has no actionable target — operator
+    sees it in the dedup UI, can go back to /dhcp-map to fix it.
+    """
+    return {
+        "fg_server_id": srv["id"],
+        "fg_interface": srv.get("interface", ""),
+        "fg_subnet_cidr": srv.get("subnet_cidr", ""),
+        "target_scope_id": None,
+        "target_scope_label": "",
+        "target_scope_ready": False,
+        "target_scope_ready_missing": [reason],
+        "reservations": [],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════════
