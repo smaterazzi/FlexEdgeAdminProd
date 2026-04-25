@@ -138,11 +138,12 @@ def _snippet(rule: dict) -> dict:
 
 def _make_finding(fid: str, kind: str, severity: str,
                   primary: dict, redundant: list[dict],
-                  rationale: str) -> dict:
+                  rationale: str, rule_kind: str = "access") -> dict:
     snippets = [_snippet(primary)] + [_snippet(r) for r in redundant]
     return {
         "id": fid,
         "kind": kind,
+        "rule_kind": rule_kind,           # 'access' | 'nat'
         "severity": severity,
         "primary_pos": primary["pos"],
         "redundant_pos": [r["pos"] for r in redundant],
@@ -156,11 +157,17 @@ def _make_finding(fid: str, kind: str, severity: str,
 
 # ── Check: exact duplicates ──────────────────────────────────────────────
 
-def find_exact_duplicates(rules: list[dict], next_id: int = 1) -> tuple[list[dict], int]:
+def find_exact_duplicates(rules: list[dict], next_id: int = 1,
+                          rule_kind: str = "access",
+                          id_prefix: str = "F") -> tuple[list[dict], int]:
     """Group rules with an identical (src, dst, svc, action) key.
 
     Rule order is preserved: the earliest rule in each group is the primary
     (kept); the rest are redundant (dead).
+
+    For NAT rules, the ``action`` field carries the translation summary
+    string, so two NAT rules with identical match criteria but different
+    translations will NOT collapse as duplicates.
     """
     groups: dict[tuple, list[dict]] = {}
     for r in rules:
@@ -171,19 +178,21 @@ def find_exact_duplicates(rules: list[dict], next_id: int = 1) -> tuple[list[dic
         if len(group) < 2:
             continue
         primary, *rest = group
+        what = "NAT rule" if rule_kind == "nat" else "rule"
         rationale = (
-            f"Rule {primary['pos']} is byte-identical to "
-            f"{len(rest)} later rule(s): "
+            f"{what.capitalize()} {primary['pos']} is byte-identical to "
+            f"{len(rest)} later {what}(s): "
             f"{', '.join(r['pos'] for r in rest)}. "
             "The later rule(s) never match and can be removed."
         )
         findings.append(_make_finding(
-            fid=f"F{next_id:03d}",
+            fid=f"{id_prefix}{next_id:03d}",
             kind="exact_duplicate",
             severity="safe_auto",
             primary=primary,
             redundant=rest,
             rationale=rationale,
+            rule_kind=rule_kind,
         ))
         next_id += 1
 
@@ -193,7 +202,8 @@ def find_exact_duplicates(rules: list[dict], next_id: int = 1) -> tuple[list[dic
 # ── Check: shadowed same-action rules ────────────────────────────────────
 
 def find_shadows(rules: list[dict], next_id: int = 1,
-                 skip_pos: set[str] | None = None) -> tuple[list[dict], int]:
+                 skip_pos: set[str] | None = None,
+                 id_prefix: str = "F") -> tuple[list[dict], int]:
     """Flag rule pairs ``(i, j)`` where ``i < j``, same action, and
     ``i``'s sources/destinations/services each cover ``j``'s.
 
@@ -243,7 +253,7 @@ def find_shadows(rules: list[dict], next_id: int = 1,
             "The later rule(s) never match."
         )
         findings.append(_make_finding(
-            fid=f"F{next_id:03d}",
+            fid=f"{id_prefix}{next_id:03d}",
             kind="shadowed_same_action",
             severity="safe_auto",
             primary=outer,
@@ -257,48 +267,98 @@ def find_shadows(rules: list[dict], next_id: int = 1,
 
 # ── Public entry point ───────────────────────────────────────────────────
 
-def analyze_rules(policy_name: str, raw_rules: list[dict]) -> dict:
-    """Run all Phase 1 checks against a policy's rule list.
+def _run_analysis(raw_rules: list[dict], rule_kind: str,
+                  id_prefix: str, enable_shadows: bool) -> dict:
+    """Run Phase 1 checks on one rule list (access OR NAT).
 
-    Args:
-        policy_name: Name of the policy being analyzed (echoed back).
-        raw_rules:   Output of ``smc_client.get_policy_rules(policy_name)``.
-
-    Returns:
-        {
-            "policy":          str,
-            "rule_count":      int,   # active rules analyzed
-            "disabled_count":  int,
-            "findings":        list[dict],
-            "disabled_rules":  list[dict],   # snippet view for display
-            "summary": {
-                "exact_duplicate":       int,
-                "shadowed_same_action":  int,
-            },
-        }
+    Returns the per-section payload (no top-level ``policy`` field).
+    Each finding is tagged with ``rule_kind`` so the UI can group them.
     """
     active, disabled = assign_positions(raw_rules)
 
-    exact_findings, next_id = find_exact_duplicates(active, next_id=1)
+    exact_findings, next_id = find_exact_duplicates(
+        active, next_id=1, rule_kind=rule_kind, id_prefix=id_prefix,
+    )
 
-    # Exclude rules already flagged as exact duplicates from shadow analysis.
-    already_flagged: set[str] = set()
-    for f in exact_findings:
-        already_flagged.update(f["redundant_pos"])
+    shadow_findings: list[dict] = []
+    if enable_shadows:
+        already_flagged: set[str] = set()
+        for f in exact_findings:
+            already_flagged.update(f["redundant_pos"])
+        shadow_findings, _ = find_shadows(
+            active, next_id=next_id, skip_pos=already_flagged,
+            id_prefix=id_prefix,
+        )
+        for f in shadow_findings:
+            f["rule_kind"] = rule_kind
 
-    shadow_findings, _ = find_shadows(active, next_id=next_id,
-                                      skip_pos=already_flagged)
-
-    findings = exact_findings + shadow_findings
+    # Tag every disabled-rule snippet with its kind so templates can split.
+    disabled_snips = []
+    for r in disabled:
+        snip = _snippet(r)
+        snip["rule_kind"] = rule_kind
+        disabled_snips.append(snip)
 
     return {
-        "policy": policy_name,
         "rule_count": len(active),
         "disabled_count": len(disabled),
-        "findings": findings,
-        "disabled_rules": [_snippet(r) for r in disabled],
+        "findings": exact_findings + shadow_findings,
+        "disabled_rules": disabled_snips,
         "summary": {
             "exact_duplicate": len(exact_findings),
             "shadowed_same_action": len(shadow_findings),
+        },
+    }
+
+
+def analyze_rules(policy_name: str, raw_rules: list[dict]) -> dict:
+    """Backwards-compatible single-list analyzer (access rules only).
+
+    New callers should prefer ``analyze_policy`` which also covers NAT.
+    """
+    section = _run_analysis(raw_rules, rule_kind="access",
+                            id_prefix="A", enable_shadows=True)
+    return {
+        "policy": policy_name,
+        **section,
+    }
+
+
+def analyze_policy(policy_name: str,
+                   access_rules: list[dict],
+                   nat_rules: list[dict]) -> dict:
+    """Run analysis on both access and NAT rule lists.
+
+    Per Phase 1.5 scope:
+        - access rules: exact_duplicate + shadowed_same_action
+        - NAT rules:    exact_duplicate only (shadow semantics deferred)
+
+    Returns:
+        {
+            "policy":         str,
+            "findings":       list[dict],   # flat — each carries rule_kind
+            "disabled_rules": list[dict],   # flat — each carries rule_kind
+            "access": { rule_count, disabled_count, summary },
+            "nat":    { rule_count, disabled_count, summary },
+        }
+    """
+    access = _run_analysis(access_rules, rule_kind="access",
+                           id_prefix="A", enable_shadows=True)
+    nat = _run_analysis(nat_rules, rule_kind="nat",
+                        id_prefix="N", enable_shadows=False)
+
+    return {
+        "policy": policy_name,
+        "findings": access["findings"] + nat["findings"],
+        "disabled_rules": access["disabled_rules"] + nat["disabled_rules"],
+        "access": {
+            "rule_count": access["rule_count"],
+            "disabled_count": access["disabled_count"],
+            "summary": access["summary"],
+        },
+        "nat": {
+            "rule_count": nat["rule_count"],
+            "disabled_count": nat["disabled_count"],
+            "summary": nat["summary"],
         },
     }

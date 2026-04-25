@@ -1,13 +1,150 @@
 {% extends "base.html" %}
 {% block title %}Optimize · {{ policy_name }}{% endblock %}
 
+{% macro rule_table(snippets, primary=true) -%}
+<div class="table-responsive">
+    <table class="table table-sm table-dark mb-0">
+        <thead>
+            <tr>
+                {% if primary %}<th style="width:5rem;">Role</th>{% endif %}
+                <th style="width:4.5rem;">Pos</th>
+                <th style="width:7rem;">SMC ID</th>
+                <th>Name</th>
+                <th>Action / Translation</th>
+                <th>Sources</th>
+                <th>Destinations</th>
+                <th>Services</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for r in snippets %}
+            <tr {% if primary and loop.first %}class="table-primary"{% elif not primary %}class="rule-disabled"{% endif %}>
+                {% if primary %}
+                <td>
+                    {% if loop.first %}
+                    <span class="badge bg-success">keep</span>
+                    {% else %}
+                    <span class="badge bg-danger">dead</span>
+                    {% endif %}
+                </td>
+                {% endif %}
+                <td><code>{{ r.pos }}</code></td>
+                <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
+                <td>{{ r.name or '—' }}</td>
+                <td><code style="font-size:0.78rem;">{{ r.action }}</code></td>
+                <td>{{ r.sources|join(', ') }}</td>
+                <td>{{ r.destinations|join(', ') }}</td>
+                <td>{{ r.services|join(', ') }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{%- endmacro %}
+
+{% macro section_block(label, icon, kind_key, section, findings, disabled, anchor) -%}
+<h5 class="mt-4 mb-2">
+    <i class="bi bi-{{ icon }}"></i> {{ label }}
+    <small class="text-muted" style="font-size:0.7rem;">
+        {{ section.rule_count }} active · {{ section.disabled_count }} disabled
+    </small>
+</h5>
+
+<div class="row g-3 mb-3">
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body py-2">
+                <div class="text-muted" style="font-size:0.72rem;">Exact duplicates</div>
+                <h4 class="mb-0">{{ section.summary.exact_duplicate }}</h4>
+            </div>
+        </div>
+    </div>
+    {% if kind_key == 'access' %}
+    <div class="col-md-3">
+        <div class="card stat-card">
+            <div class="card-body py-2">
+                <div class="text-muted" style="font-size:0.72rem;">Shadowed rules</div>
+                <h4 class="mb-0">{{ section.summary.shadowed_same_action }}</h4>
+            </div>
+        </div>
+    </div>
+    {% else %}
+    <div class="col-md-5">
+        <div class="card stat-card border-info">
+            <div class="card-body py-2">
+                <div class="text-muted" style="font-size:0.72rem;">NAT shadow detection</div>
+                <span class="text-info" style="font-size:0.85rem;">deferred to Phase 2 — exact duplicates only</span>
+            </div>
+        </div>
+    </div>
+    {% endif %}
+</div>
+
+{% if not findings %}
+<div class="alert alert-success py-2 px-3" style="font-size:0.85rem;">
+    <i class="bi bi-check-circle"></i> No redundancies detected in {{ label|lower }}.
+</div>
+{% else %}
+{% for f in findings %}
+<div class="card mb-3">
+    <div class="card-header d-flex justify-content-between align-items-center">
+        <div>
+            <span class="badge
+                {% if f.kind == 'exact_duplicate' %}bg-danger
+                {% else %}bg-warning text-dark{% endif %}">
+                {{ f.kind }}
+            </span>
+            <strong class="ms-2">{{ f.id }}</strong>
+            <span class="text-muted ms-2" style="font-size:0.8rem;">
+                primary {{ f.primary_pos }} ·
+                {{ f.redundant_pos|length }} redundant
+            </span>
+        </div>
+        <span class="badge bg-secondary">{{ f.severity }}</span>
+    </div>
+    <div class="card-body py-2">
+        <div class="text-muted mb-2" style="font-size:0.85rem;">{{ f.rationale }}</div>
+        {{ rule_table(f.rule_snippets, primary=true) }}
+    </div>
+</div>
+{% endfor %}
+{% endif %}
+
+{% if disabled %}
+<div class="card mb-3">
+    <div class="card-header d-flex justify-content-between align-items-center"
+         data-bs-toggle="collapse" data-bs-target="#{{ anchor }}"
+         role="button" style="cursor:pointer;">
+        <div>
+            <i class="bi bi-pause-circle text-secondary"></i>
+            <strong>Disabled {{ label|lower }}</strong>
+            <span class="text-muted ms-2" style="font-size:0.85rem;">
+                ({{ disabled|length }}) — listed for reference, not analyzed
+            </span>
+        </div>
+        <i class="bi bi-chevron-down"></i>
+    </div>
+    <div id="{{ anchor }}" class="collapse">
+        <div class="card-body py-2">
+            {{ rule_table(disabled, primary=false) }}
+        </div>
+    </div>
+</div>
+{% endif %}
+{%- endmacro %}
+
 {% block content %}
+{% set access_findings = result.findings | selectattr('rule_kind', 'equalto', 'access') | list %}
+{% set nat_findings    = result.findings | selectattr('rule_kind', 'equalto', 'nat')    | list %}
+{% set access_disabled = result.disabled_rules | selectattr('rule_kind', 'equalto', 'access') | list %}
+{% set nat_disabled    = result.disabled_rules | selectattr('rule_kind', 'equalto', 'nat')    | list %}
+
 <div class="p-4">
     <div class="d-flex justify-content-between align-items-center mb-3">
         <div>
             <h4 class="mb-0"><i class="bi bi-magic"></i> {{ policy_name }}</h4>
             <div class="text-muted" style="font-size:0.82rem;">
-                {{ result.rule_count }} active rule(s) analyzed ·
+                {{ result.access.rule_count + result.nat.rule_count }} active rule(s) analyzed ·
                 {{ result.findings|length }} finding(s)
             </div>
         </div>
@@ -31,25 +168,6 @@
       {% endfor %}
     {% endwith %}
 
-    <div class="row g-3 mb-3">
-        <div class="col-md-3">
-            <div class="card stat-card">
-                <div class="card-body py-2">
-                    <div class="text-muted" style="font-size:0.72rem;">Exact duplicates</div>
-                    <h4 class="mb-0">{{ result.summary.exact_duplicate }}</h4>
-                </div>
-            </div>
-        </div>
-        <div class="col-md-3">
-            <div class="card stat-card">
-                <div class="card-body py-2">
-                    <div class="text-muted" style="font-size:0.72rem;">Shadowed rules</div>
-                    <h4 class="mb-0">{{ result.summary.shadowed_same_action }}</h4>
-                </div>
-            </div>
-        </div>
-    </div>
-
     {% if not result.findings %}
     <div class="alert alert-success">
         <i class="bi bi-check-circle"></i> No redundancies detected in this policy.
@@ -62,118 +180,16 @@
                 <i class="bi bi-send"></i> Submit for admin review
             </button>
             <span class="text-muted ms-2" style="font-size:0.78rem;">
-                A snapshot of these findings will be sent to an admin. The policy is not modified.
+                A snapshot of all findings (access + NAT) is sent to an admin. The policy is not modified.
             </span>
         </form>
     </div>
-
-    {% for f in result.findings %}
-    <div class="card mb-3">
-        <div class="card-header d-flex justify-content-between align-items-center">
-            <div>
-                <span class="badge
-                    {% if f.kind == 'exact_duplicate' %}bg-danger
-                    {% else %}bg-warning text-dark{% endif %}">
-                    {{ f.kind }}
-                </span>
-                <strong class="ms-2">{{ f.id }}</strong>
-                <span class="text-muted ms-2" style="font-size:0.8rem;">
-                    primary {{ f.primary_pos }} ·
-                    {{ f.redundant_pos|length }} redundant
-                </span>
-            </div>
-            <span class="badge bg-secondary">{{ f.severity }}</span>
-        </div>
-        <div class="card-body py-2">
-            <div class="text-muted mb-2" style="font-size:0.85rem;">{{ f.rationale }}</div>
-            <div class="table-responsive">
-                <table class="table table-sm table-dark mb-0">
-                    <thead>
-                        <tr>
-                            <th style="width:5rem;">Role</th>
-                            <th style="width:4.5rem;">Pos</th>
-                            <th style="width:7rem;">SMC ID</th>
-                            <th>Name</th>
-                            <th>Action</th>
-                            <th>Sources</th>
-                            <th>Destinations</th>
-                            <th>Services</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {% for r in f.rule_snippets %}
-                        <tr {% if loop.first %}class="table-primary"{% endif %}>
-                            <td>
-                                {% if loop.first %}
-                                <span class="badge bg-success">keep</span>
-                                {% else %}
-                                <span class="badge bg-danger">dead</span>
-                                {% endif %}
-                            </td>
-                            <td><code>{{ r.pos }}</code></td>
-                            <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
-                            <td>{{ r.name or '—' }}</td>
-                            <td>{{ r.action }}</td>
-                            <td>{{ r.sources|join(', ') }}</td>
-                            <td>{{ r.destinations|join(', ') }}</td>
-                            <td>{{ r.services|join(', ') }}</td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-    {% endfor %}
     {% endif %}
 
-    {% if result.disabled_rules %}
-    <div class="card mt-4">
-        <div class="card-header d-flex justify-content-between align-items-center"
-             data-bs-toggle="collapse" data-bs-target="#disabledRules"
-             role="button" style="cursor:pointer;">
-            <div>
-                <i class="bi bi-pause-circle text-secondary"></i>
-                <strong>Disabled rules</strong>
-                <span class="text-muted ms-2" style="font-size:0.85rem;">
-                    ({{ result.disabled_count }}) — listed for reference, not analyzed
-                </span>
-            </div>
-            <i class="bi bi-chevron-down"></i>
-        </div>
-        <div id="disabledRules" class="collapse">
-            <div class="card-body py-2">
-                <div class="table-responsive">
-                    <table class="table table-sm table-dark mb-0">
-                        <thead>
-                            <tr>
-                                <th style="width:4.5rem;">Pos</th>
-                                <th style="width:7rem;">SMC ID</th>
-                                <th>Name</th>
-                                <th>Action</th>
-                                <th>Sources</th>
-                                <th>Destinations</th>
-                                <th>Services</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {% for r in result.disabled_rules %}
-                            <tr class="rule-disabled">
-                                <td><code>{{ r.pos }}</code></td>
-                                <td><code class="text-muted">{{ r.tag or '—' }}</code></td>
-                                <td>{{ r.name or '—' }}</td>
-                                <td>{{ r.action }}</td>
-                                <td>{{ r.sources|join(', ') }}</td>
-                                <td>{{ r.destinations|join(', ') }}</td>
-                                <td>{{ r.services|join(', ') }}</td>
-                            </tr>
-                            {% endfor %}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-    </div>
-    {% endif %}
+    {{ section_block('Access rules', 'shield-check', 'access',
+                     result.access, access_findings, access_disabled, 'disabledAccessRules') }}
+
+    {{ section_block('NAT rules', 'arrow-left-right', 'nat',
+                     result.nat, nat_findings, nat_disabled, 'disabledNatRules') }}
 </div>
 {% endblock %}

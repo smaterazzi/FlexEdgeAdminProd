@@ -51,6 +51,11 @@
             <div class="card-header d-flex justify-content-between align-items-center">
                 <div>
                     <span class="badge
+                        {% if (f.rule_kind or 'access') == 'nat' %}bg-info text-dark
+                        {% else %}bg-primary{% endif %}">
+                        {{ f.rule_kind or 'access' }}
+                    </span>
+                    <span class="badge
                         {% if f.kind == 'exact_duplicate' %}bg-danger
                         {% else %}bg-warning text-dark{% endif %}">
                         {{ f.kind }}
@@ -73,7 +78,7 @@
                                 <th style="width:4.5rem;">Pos</th>
                                 <th style="width:7rem;">SMC ID</th>
                                 <th>Name</th>
-                                <th>Action</th>
+                                <th>Action / Translation</th>
                                 <th>Sources</th>
                                 <th>Destinations</th>
                                 <th>Services</th>

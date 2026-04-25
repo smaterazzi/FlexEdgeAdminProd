@@ -865,18 +865,25 @@ def optimize_list():
                            my_submissions=my_subs)
 
 
+def _fetch_policy_for_analysis(policy_name):
+    """Fetch both access + NAT rules in a single SMC session."""
+    cfg = get_user_cfg()
+    with smc_client.smc_session(cfg):
+        access = smc_client.get_policy_rules(policy_name)
+        nat = smc_client.get_policy_nat_rules(policy_name)
+    return access, nat
+
+
 @app.route("/optimize/<path:policy_name>")
 @profile_required
 def optimize_report(policy_name):
     """Run the analyzer live against the selected policy."""
     try:
-        cfg = get_user_cfg()
-        with smc_client.smc_session(cfg):
-            rules = smc_client.get_policy_rules(policy_name)
+        access, nat = _fetch_policy_for_analysis(policy_name)
     except Exception as e:
         return render_template("error.html", message=str(e))
 
-    result = rule_optimizer.analyze_rules(policy_name, rules)
+    result = rule_optimizer.analyze_policy(policy_name, access, nat)
     return render_template("optimize/report.html",
                            policy_name=policy_name,
                            result=result)
@@ -893,14 +900,12 @@ def optimize_submit(policy_name):
         return redirect(url_for("optimize_report", policy_name=policy_name))
 
     try:
-        cfg = get_user_cfg()
-        with smc_client.smc_session(cfg):
-            rules = smc_client.get_policy_rules(policy_name)
+        access, nat = _fetch_policy_for_analysis(policy_name)
     except Exception as e:
         flash(f"Failed to re-fetch rules for submission: {e}", "danger")
         return redirect(url_for("optimize_report", policy_name=policy_name))
 
-    result = rule_optimizer.analyze_rules(policy_name, rules)
+    result = rule_optimizer.analyze_policy(policy_name, access, nat)
     if not result["findings"]:
         flash("No findings to submit — this policy looks clean.", "info")
         return redirect(url_for("optimize_report", policy_name=policy_name))
@@ -909,7 +914,7 @@ def optimize_submit(policy_name):
         tenant_id=tenant.id,
         policy_name=policy_name,
         submitted_by_id=me.id if me else None,
-        findings_json=_json.dumps(result["findings"]),
+        findings_json=_json.dumps(result),
         finding_count=len(result["findings"]),
         status="pending",
     )
@@ -936,16 +941,41 @@ def optimize_submissions():
                            pending=pending, decided=decided)
 
 
+def _load_submission_payload(sub):
+    """Read the submission JSON, accepting both the old flat-list format
+    (Phase 1) and the new ``analyze_policy`` dict format (Phase 1.5+)."""
+    try:
+        raw = _json.loads(sub.findings_json)
+    except Exception:
+        return {"findings": [], "disabled_rules": [],
+                "access": {"rule_count": 0, "disabled_count": 0,
+                           "summary": {"exact_duplicate": 0,
+                                       "shadowed_same_action": 0}},
+                "nat": {"rule_count": 0, "disabled_count": 0,
+                        "summary": {"exact_duplicate": 0,
+                                    "shadowed_same_action": 0}}}
+    if isinstance(raw, list):
+        # Legacy: a flat list of findings (access only, no NAT awareness).
+        for f in raw:
+            f.setdefault("rule_kind", "access")
+        return {"findings": raw, "disabled_rules": [],
+                "access": {"rule_count": 0, "disabled_count": 0,
+                           "summary": {"exact_duplicate": 0,
+                                       "shadowed_same_action": 0}},
+                "nat": {"rule_count": 0, "disabled_count": 0,
+                        "summary": {"exact_duplicate": 0,
+                                    "shadowed_same_action": 0}}}
+    return raw
+
+
 @app.route("/optimize/submissions/<int:sub_id>")
 @admin_required
 def optimize_submission_detail(sub_id):
     sub = OptimizationSubmission.query.get_or_404(sub_id)
-    try:
-        findings = _json.loads(sub.findings_json)
-    except Exception:
-        findings = []
+    payload = _load_submission_payload(sub)
     return render_template("optimize/submission_detail.html",
-                           submission=sub, findings=findings)
+                           submission=sub, payload=payload,
+                           findings=payload["findings"])
 
 
 @app.route("/optimize/submissions/<int:sub_id>/decide", methods=["POST"])
@@ -953,10 +983,8 @@ def optimize_submission_detail(sub_id):
 def optimize_submission_decide(sub_id):
     """Record per-finding decisions + close the submission."""
     sub = OptimizationSubmission.query.get_or_404(sub_id)
-    try:
-        findings = _json.loads(sub.findings_json)
-    except Exception:
-        findings = []
+    payload = _load_submission_payload(sub)
+    findings = payload["findings"]
 
     for f in findings:
         fid = f.get("id", "")
@@ -973,7 +1001,7 @@ def optimize_submission_decide(sub_id):
     close = request.form.get("action") == "close"
 
     me = _current_user_row()
-    sub.findings_json = _json.dumps(findings)
+    sub.findings_json = _json.dumps(payload)
     sub.admin_notes = admin_notes
     sub.reviewed_by_id = me.id if me else None
     from datetime import datetime, timezone as _tz

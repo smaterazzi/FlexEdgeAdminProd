@@ -41,7 +41,8 @@ __all__ = [
     "dump_engine_interfaces",
     "host_create", "host_update", "host_delete", "host_list_by_scope",
     "host_get",
-    "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView",
+    "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView", "NodeAddress",
+    "is_node_initiated_contact",
     "set_node_ssh_enabled", "change_node_ssh_password",
     "find_active_policy", "find_ssh_access_rule",
     "add_ssh_access_rule", "remove_ssh_access_rule",
@@ -377,26 +378,176 @@ def dump_engine_interfaces(engine_name: str) -> dict:
 # ── Cluster nodes ──────────────────────────────────────────────────────────
 
 @dataclass
+class NodeAddress:
+    """A single static IP assigned to a cluster node on one interface (NDI)."""
+    interface_id: str            # "0", "1.100" for VLAN child
+    address: str
+    network_value: str
+    nodeid: int                   # cluster node identifier (1-based in SMC)
+    is_primary_mgt: bool = False
+    is_outgoing: bool = False
+    is_dynamic: bool = False      # True for DHCP-assigned (not a stable target)
+
+
+@dataclass
 class DhcpClusterNode:
-    node_index: int
-    node_id: str = ""
+    node_index: int               # 0-based for our purposes (engine.nodes[i])
+    node_id: str = ""             # SMC's node identifier — survives rename/reorder
     name: str = ""
+    nodeid: int = 0               # SMC's nodeid value (matches NodeAddress.nodeid)
     status: str = ""
-    primary_address: str = ""     # auto-discovered routable IP
+    addresses: list = field(default_factory=list)    # list[NodeAddress]
+    primary_address: str = ""     # the SMC-managed primary mgmt IP (auto target)
+
+
+def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
+                          ) -> list[NodeAddress]:
+    """Recursively walk a physical_interface payload and collect every static
+    NDI address (SingleNodeInterface or NodeInterface), including VLAN children.
+
+    Skips dynamic (DHCP-assigned) interfaces — they're not stable targets.
+    """
+    out: list[NodeAddress] = []
+    iface_id = parent_iface_id or str(level_payload.get("interface_id") or "")
+
+    # Direct interfaces on this level (each entry wraps a single_node_interface
+    # or node_interface; cluster_virtual_interface is the CVI which we skip)
+    for entry in level_payload.get("interfaces", []) or []:
+        for inner_kind, inner in entry.items():
+            if inner_kind not in ("single_node_interface", "node_interface"):
+                continue
+            if not isinstance(inner, dict):
+                continue
+            address = inner.get("address") or ""
+            network = inner.get("network_value") or ""
+            is_dynamic = bool(inner.get("dynamic"))
+            if not address and not is_dynamic:
+                continue
+            out.append(NodeAddress(
+                interface_id=iface_id,
+                address=address,
+                network_value=network,
+                nodeid=int(inner.get("nodeid") or 0),
+                is_primary_mgt=bool(inner.get("primary_mgt")),
+                is_outgoing=bool(inner.get("outgoing")),
+                is_dynamic=is_dynamic,
+            ))
+
+    # VLAN children
+    vlans = (level_payload.get("vlanInterfaces")
+             or level_payload.get("vlan_interfaces") or [])
+    for vlan_wrap in vlans:
+        vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+        vlan_raw_id = vlan.get("interface_id", "")
+        combined = f"{iface_id}.{vlan_raw_id}" if vlan_raw_id else iface_id
+        out.extend(_walk_node_interfaces(vlan, combined))
+
+    return out
+
+
+def is_node_initiated_contact(engine_name: str) -> bool:
+    """Detect whether the engine uses *node-initiated contact* (the engine
+    reaches out to SMC rather than SMC reaching in).
+
+    Implementation: check every primary management NodeInterface for the
+    `reverse_connection` flag. The SDK's NodeInterface docstring explicitly
+    states *"Reverse connection enables engine to contact SMC versus other
+    way around"* — which is the SMC term for node-initiated mode.
+
+    Returns False on any error (treat as conservative SMC-initiated default).
+    """
+    try:
+        engine = Engine(engine_name)
+        for phys in engine.physical_interface:
+            try:
+                data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
+            except Exception:
+                continue
+            # Walk same as _walk_node_interfaces but return early on a hit
+            for entry in data.get("interfaces", []) or []:
+                for kind, inner in entry.items():
+                    if kind not in ("single_node_interface", "node_interface"):
+                        continue
+                    if isinstance(inner, dict) and inner.get("primary_mgt"):
+                        if inner.get("reverse_connection"):
+                            return True
+            # Also walk VLAN children
+            for vlan_wrap in (data.get("vlanInterfaces")
+                              or data.get("vlan_interfaces") or []):
+                vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+                for entry in vlan.get("interfaces", []) or []:
+                    for kind, inner in entry.items():
+                        if kind not in ("single_node_interface", "node_interface"):
+                            continue
+                        if isinstance(inner, dict) and inner.get("primary_mgt"):
+                            if inner.get("reverse_connection"):
+                                return True
+    except Exception as exc:
+        logger.info("is_node_initiated_contact(%s): %s", engine_name, exc)
+    return False
 
 
 def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
-    """Return one record per node, with node IDs + best-effort primary address.
+    """Return one record per cluster node with **all** static NDI addresses
+    (per-node).
 
-    The address is discovered from the node's interface status. We pick the
-    first non-link-local IPv4 on a non-loopback interface. The Phase 1 SSH
-    bootstrap uses this as the default "reach this node at" hint.
+    Strategy:
+      1. Walk every physical interface (incl. VLAN children) and collect
+         every NodeInterface/SingleNodeInterface entry (NDI).
+      2. Group entries by `nodeid` — that's the cluster node identifier
+         baked into the interface config (1, 2, ... for cluster members).
+      3. Map each `engine.nodes[i]` to one of these groups by matching
+         the SDK's node attribute ordering.
+      4. The "primary address" for each node is the one tagged `primary_mgt`
+         (the IP SMC uses to reach the node). For node-initiated clusters
+         this may not be reachable from FEA — the operator picks instead.
     """
     engine = Engine(engine_name)
-    nodes: list[DhcpClusterNode] = []
-    for idx, n in enumerate(getattr(engine, "nodes", []) or []):
+
+    # Collect every NDI address across all interfaces
+    all_addresses: list[NodeAddress] = []
+    for phys in engine.physical_interface:
+        try:
+            data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
+        except Exception:
+            continue
+        all_addresses.extend(_walk_node_interfaces(data))
+
+    # Group by nodeid (1-based in SMC). Single-node engines may not assign
+    # a nodeid; treat unset as 1.
+    by_nodeid: dict[int, list[NodeAddress]] = {}
+    for a in all_addresses:
+        nid = a.nodeid or 1
+        by_nodeid.setdefault(nid, []).append(a)
+
+    # Map engine.nodes (which has display ordering) to our groups
+    nodes_meta = list(getattr(engine, "nodes", []) or [])
+    out: list[DhcpClusterNode] = []
+    for idx, n in enumerate(nodes_meta):
+        # Try to extract the node's nodeid from the SDK
+        smc_nodeid = 0
+        for attr in ("nodeid", "node_id", "key"):
+            val = getattr(n, attr, None)
+            if val and str(val).isdigit():
+                smc_nodeid = int(val)
+                break
+
+        # Match group: prefer SDK-reported nodeid, else assume idx+1 (1-based)
+        if smc_nodeid in by_nodeid:
+            group = by_nodeid[smc_nodeid]
+        elif (idx + 1) in by_nodeid:
+            group = by_nodeid[idx + 1]
+            smc_nodeid = idx + 1
+        else:
+            # Single-node case — give the node all addresses
+            group = list(all_addresses) if len(nodes_meta) == 1 else []
+
+        # Identify primary address: the one tagged primary_mgt
+        primary = next((a.address for a in group if a.is_primary_mgt and a.address), "")
+
+        # Stable node_id for our DB (must survive renames). Fall back to href tail.
         node_id = ""
-        for attr in ("node_id", "nodeid", "key"):
+        for attr in ("node_id", "key"):
             val = getattr(n, attr, None)
             if val:
                 node_id = str(val)
@@ -405,28 +556,28 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
             try:
                 node_id = n.href.rstrip("/").split("/")[-1]
             except Exception:
-                node_id = str(idx)
+                node_id = str(smc_nodeid or (idx + 1))
 
-        address = ""
-        try:
-            status = n.interface_status
-            for row in getattr(status, "interfaces", []) or []:
-                candidate = getattr(row, "aggregate_is_active", None)
-                addr = getattr(row, "address", "") or ""
-                if addr and not addr.startswith("169.254") and not addr.startswith("127."):
-                    address = addr
-                    break
-        except Exception:
-            pass
-
-        nodes.append(DhcpClusterNode(
+        out.append(DhcpClusterNode(
             node_index=idx,
             node_id=node_id,
-            name=getattr(n, "name", "") or f"node{idx}",
+            name=getattr(n, "name", "") or f"node{idx + 1}",
+            nodeid=smc_nodeid or (idx + 1),
             status=str(getattr(n, "status", "") or ""),
-            primary_address=address,
+            addresses=[a for a in group if a.address],   # drop dynamic-no-address
+            primary_address=primary,
         ))
-    return nodes
+
+    # Edge case: no engine.nodes reported (very unusual — fallback to address groups)
+    if not out and by_nodeid:
+        for nid, group in sorted(by_nodeid.items()):
+            primary = next((a.address for a in group if a.is_primary_mgt and a.address), "")
+            out.append(DhcpClusterNode(
+                node_index=nid - 1, node_id=str(nid), name=f"node{nid}",
+                nodeid=nid, addresses=[a for a in group if a.address],
+                primary_address=primary,
+            ))
+    return out
 
 
 # ── Host CRUD ──────────────────────────────────────────────────────────────

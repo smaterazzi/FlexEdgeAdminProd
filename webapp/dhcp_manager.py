@@ -38,6 +38,7 @@ from webapp.smc_dhcp_client import (
     SMCConfig, smc_session,
     DhcpHostView, DhcpScopeInfo,
     list_scopes_for_engine, list_cluster_nodes, dump_engine_interfaces,
+    is_node_initiated_contact,
     host_create, host_update, host_delete, host_get, host_list_by_scope,
     is_valid_mac, normalize_mac,
     find_ssh_access_rule, find_active_policy,
@@ -701,6 +702,7 @@ def credentials_discover_nodes():
     try:
         with smc_session(cfg):
             nodes = list_cluster_nodes(engine_name)
+            node_initiated = is_node_initiated_contact(engine_name)
             try:
                 policy_name = find_active_policy(engine_name)
             except Exception as exc:
@@ -709,10 +711,8 @@ def credentials_discover_nodes():
             else:
                 policy_error = ""
             rule_present = False
-            rule_summary = None
             if policy_name:
-                rule_summary = find_ssh_access_rule(policy_name, rule_name_for(engine_name))
-                rule_present = rule_summary is not None
+                rule_present = find_ssh_access_rule(policy_name, rule_name_for(engine_name)) is not None
         existing_creds = {
             c.node_id: c
             for c in DhcpEngineCredential.query
@@ -721,20 +721,66 @@ def credentials_discover_nodes():
         access_row = DhcpEngineSshAccess.query.filter_by(
             tenant_id=tenant_id, engine_name=engine_name,
         ).first()
+
         out_nodes = []
         for n in nodes:
             enrolled = existing_creds.get(n.node_id)
+            # Per the operator spec:
+            #   - node-initiated cluster → operator MUST pick from the
+            #     candidate list (we don't auto-pick because primary_mgt
+            #     may not be reachable from FEA).
+            #   - SMC-initiated cluster → primary_mgt IP is the natural
+            #     target (SMC reaches it, so FEA likely can too).
+            candidates = [
+                {
+                    "address": a.address,
+                    "interface_id": a.interface_id,
+                    "network_value": a.network_value,
+                    "is_primary_mgt": a.is_primary_mgt,
+                    "is_outgoing": a.is_outgoing,
+                } for a in n.addresses if a.address
+            ]
+            suggested = "" if node_initiated else n.primary_address
             out_nodes.append({
                 "node_index": n.node_index,
                 "node_id": n.node_id,
                 "name": n.name,
-                "primary_address": n.primary_address,
+                "smc_nodeid": n.nodeid,
+                "primary_mgt_address": n.primary_address,
+                "candidates": candidates,
+                "suggested_address": suggested,
                 "already_enrolled": enrolled is not None,
                 "enrolled_hostname": enrolled.hostname if enrolled else "",
                 "last_verify_status": enrolled.last_verify_status if enrolled else "",
             })
+
+        # Aggregate destination-IP picker for the rule install:
+        # node-initiated → all candidate IPs across the cluster
+        # SMC-initiated  → just the primary_mgt IP per node
+        rule_destinations = []
+        seen = set()
+        for n in nodes:
+            if node_initiated:
+                for a in n.addresses:
+                    if a.address and a.address not in seen:
+                        rule_destinations.append({
+                            "address": a.address,
+                            "label": f"node {n.node_index} ({n.name}) — {a.interface_id} — {a.address}"
+                                     + (" [primary mgt]" if a.is_primary_mgt else ""),
+                        })
+                        seen.add(a.address)
+            else:
+                if n.primary_address and n.primary_address not in seen:
+                    rule_destinations.append({
+                        "address": n.primary_address,
+                        "label": f"node {n.node_index} ({n.name}) — {n.primary_address} [primary mgt]",
+                    })
+                    seen.add(n.primary_address)
+
         return jsonify({
             "nodes": out_nodes,
+            "node_initiated_contact": node_initiated,
+            "rule_destinations": rule_destinations,
             "policy_name": policy_name,
             "policy_error": policy_error,
             "rule_name": rule_name_for(engine_name),

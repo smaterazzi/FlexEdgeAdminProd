@@ -362,6 +362,123 @@ def get_policy_rules(policy_name):
     return rules
 
 
+# ── NAT Rules ────────────────────────────────────────────────────────────
+
+def _nat_target_name(nat_value):
+    """Best-effort human name for a NAT translated value."""
+    if nat_value is None:
+        return ""
+    try:
+        elem = nat_value.as_element
+        if elem is not None:
+            return getattr(elem, "name", "")
+    except Exception:
+        pass
+    try:
+        return nat_value.ip_descriptor or ""
+    except Exception:
+        return ""
+
+
+def _nat_translation_summary(rule):
+    """
+    Build a deterministic, human-readable string describing the NAT
+    translation on this rule. Used as the rule's "action" field for the
+    purpose of duplicate detection.
+
+    Examples:
+        static_src→Public_NAT_Host
+        dynamic_src→1.2.3.4[1024-65535]
+        static_dst→10.0.0.5:443
+        no_nat
+        static_src→A;static_dst→B   (multiple translations)
+    """
+    parts = []
+    try:
+        src_static = rule.static_src_nat
+        if src_static.has_nat:
+            parts.append(f"static_src->{_nat_target_name(src_static.translated_value)}")
+    except Exception:
+        pass
+    try:
+        src_dynamic = rule.dynamic_src_nat
+        if src_dynamic.has_nat:
+            tv = src_dynamic.translated_value
+            tgt = _nat_target_name(tv)
+            ports = ""
+            try:
+                if tv and (tv.min_port or tv.max_port):
+                    ports = f"[{tv.min_port}-{tv.max_port}]"
+            except Exception:
+                pass
+            parts.append(f"dynamic_src->{tgt}{ports}")
+    except Exception:
+        pass
+    try:
+        dst_static = rule.static_dst_nat
+        if dst_static.has_nat:
+            tv = dst_static.translated_value
+            tgt = _nat_target_name(tv)
+            port = ""
+            try:
+                if tv and tv.min_port:
+                    port = f":{tv.min_port}"
+                    if tv.max_port and tv.max_port != tv.min_port:
+                        port = f":{tv.min_port}-{tv.max_port}"
+            except Exception:
+                pass
+            parts.append(f"static_dst->{tgt}{port}")
+    except Exception:
+        pass
+
+    return ";".join(parts) if parts else "no_nat"
+
+
+def get_policy_nat_rules(policy_name):
+    """
+    Return all IPv4 NAT rules for the given policy, with the same shape
+    as ``get_policy_rules`` so the optimizer can reuse the same logic.
+
+    The ``action`` field carries the translation summary string (so
+    rules with identical match criteria but different translations
+    do NOT collapse as duplicates).
+    """
+    clear_href_cache()
+    rules = []
+    try:
+        policy = FirewallPolicy(policy_name)
+        for rule in policy.fw_ipv4_nat_rules.all():
+            rule_type = getattr(rule, "typeof", "")
+            if "section" in rule_type.lower():
+                rules.append({
+                    "is_section": True,
+                    "name": getattr(rule, "name", ""),
+                    "tag": getattr(rule, "tag", ""),
+                })
+                continue
+
+            rules.append({
+                "is_section": False,
+                "name": getattr(rule, "name", ""),
+                "sources": _resolve_rule_field(rule.sources),
+                "destinations": _resolve_rule_field(rule.destinations),
+                "services": _resolve_rule_field(rule.services),
+                "action": _nat_translation_summary(rule),
+                "is_disabled": getattr(rule, "is_disabled", False),
+                "comment": getattr(rule, "comment", ""),
+                "tag": getattr(rule, "tag", ""),
+            })
+    except Exception as e:
+        log.error(f"Error reading policy NAT rules: {e}")
+        rules.append({
+            "is_section": False,
+            "name": f"ERROR: {e}",
+            "sources": [], "destinations": [], "services": [],
+            "action": "", "is_disabled": False, "comment": "",
+        })
+    return rules
+
+
 # ── Admin Domain Listing ─────────────────────────────────────────────────
 
 def list_domains(cfg):
