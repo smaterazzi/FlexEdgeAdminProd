@@ -103,11 +103,29 @@ def _current_tenant() -> Tenant | None:
 
 
 def _credentials_for_engine(tenant_id: int, engine_name: str) -> dict[int, DhcpEngineCredential]:
-    """Map nodeid -> DhcpEngineCredential (only entries with verify_status='ok')."""
+    """Map nodeid -> DhcpEngineCredential.
+
+    NodeInfo.nodeid (engine_inquiry) is ``int``, but DhcpEngineCredential.node_id
+    is stored as ``str`` ("0", "1", ...). Coerce to int so the template's
+    ``creds_by_node.get(n.nodeid)`` lookup actually hits — earlier the dict
+    keys were strings and the lookup keys were ints, so the lookup always
+    missed and every Terminal button was greyed out.
+
+    Falls back to ``node_index`` (int column) when ``node_id`` isn't
+    numeric, and stores under both keys when the int conversion succeeds
+    so existing callers using either form keep working.
+    """
     rows = (DhcpEngineCredential.query
             .filter_by(tenant_id=tenant_id, engine_name=engine_name)
             .all())
-    return {r.node_id: r for r in rows}
+    out: dict[int, DhcpEngineCredential] = {}
+    for r in rows:
+        try:
+            out[int(r.node_id)] = r
+        except (ValueError, TypeError):
+            # node_id wasn't a plain integer — use node_index as the fallback key
+            out[int(getattr(r, "node_index", 0))] = r
+    return out
 
 
 # ── Routes ───────────────────────────────────────────────────────────────
@@ -133,23 +151,34 @@ def clusters():
 @engines_bp.route("/clusters/<path:engine_name>")
 @profile_required_admin
 def cluster_detail(engine_name):
+    """Render a single cluster's full detail page.
+
+    All work — SMC fetch, DB credential lookup, template render — is wrapped
+    in a single try/except. Any exception bubbles up to a friendly
+    ``error.html`` page instead of Flask's bare 500 default, *and* gets
+    logged with stack trace so we can diagnose without operator screenshots.
+    """
     try:
         cfg = _user_cfg()
         detail = engine_inquiry.cluster_detail(cfg, engine_name)
+
+        creds_by_node = {}
+        tenant = _current_tenant()
+        if tenant:
+            creds_by_node = _credentials_for_engine(tenant.id, engine_name)
+
+        return render_template(
+            "engines/cluster_detail.html",
+            detail=detail,
+            creds_by_node=creds_by_node,
+        )
     except Exception as exc:
-        log.error("cluster_detail(%s) failed: %s", engine_name, exc)
-        return render_template("error.html", message=str(exc))
-
-    creds_by_node = {}
-    tenant = _current_tenant()
-    if tenant:
-        creds_by_node = _credentials_for_engine(tenant.id, engine_name)
-
-    return render_template(
-        "engines/cluster_detail.html",
-        detail=detail,
-        creds_by_node=creds_by_node,
-    )
+        log.exception("cluster_detail(%s) failed", engine_name)
+        return render_template(
+            "error.html",
+            message=f"Could not render cluster detail for {engine_name!r}: "
+                    f"{type(exc).__name__}: {exc}",
+        )
 
 
 @engines_bp.route("/credentials")
