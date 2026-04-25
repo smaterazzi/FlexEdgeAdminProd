@@ -157,12 +157,27 @@ def dashboard():
         s.id: s.reservations.filter(DhcpReservation.status != "synced").count()
         for s in scopes
     }
+
+    # Credential / cluster summary stats
+    creds = DhcpEngineCredential.query.all()
+    accesses = DhcpEngineSshAccess.query.all()
+    enrolled_engines = {(c.tenant_id, c.engine_name) for c in creds}
+    healthy_creds = sum(1 for c in creds if c.last_verify_status == "ok")
+    unhealthy_creds = sum(1 for c in creds if c.last_verify_status == "failed")
+
     return render_template(
         "dhcp/dashboard.html",
         scopes=scopes,
         reservation_counts=reservation_counts,
         out_of_sync=out_of_sync,
         activity_logs=activity_logs,
+        creds=creds,
+        accesses=accesses,
+        enrolled_engine_count=len(enrolled_engines),
+        total_credential_count=len(creds),
+        healthy_cred_count=healthy_creds,
+        unhealthy_cred_count=unhealthy_creds,
+        ssh_rule_count=len(accesses),
     )
 
 
@@ -806,12 +821,32 @@ def credentials_discover_nodes():
 @admin_required
 def credentials_rule_install():
     """Install (or detect existing) the SSH allow rule + push policy.
-    The destination IP is whichever node IP the operator selected.
+
+    Accepts multiple destination IPs (one per cluster node) via either a
+    repeated `destination_ip` form field or a single comma-separated
+    `destination_ips`. The rule covers all of them so cluster nodes can be
+    enrolled in one batch.
     """
     tenant_id = int(request.form["tenant_id"])
     api_key_id = int(request.form["api_key_id"])
     engine_name = request.form["engine_name"].strip()
-    destination_ip = request.form["destination_ip"].strip()
+
+    # Multi-IP collection: prefer multi-valued `destination_ip` (browsers
+    # send each checked checkbox), fall back to comma-separated CSV.
+    raw_list = request.form.getlist("destination_ip")
+    if not raw_list:
+        csv = request.form.get("destination_ips", "")
+        raw_list = [x.strip() for x in csv.split(",") if x.strip()]
+    destination_ips = [ip.strip() for ip in raw_list if ip and ip.strip()]
+    # Deduplicate while preserving order
+    seen, dedup = set(), []
+    for ip in destination_ips:
+        if ip not in seen:
+            seen.add(ip); dedup.append(ip)
+    destination_ips = dedup
+    if not destination_ips:
+        flash("Pick at least one destination IP for the SSH rule.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
 
     tenant = db.session.get(Tenant, tenant_id)
     api_key = db.session.get(ApiKey, api_key_id)
@@ -824,14 +859,14 @@ def credentials_rule_install():
         return redirect(url_for("dhcp.credentials_list"))
 
     cfg = _smc_cfg(tenant, api_key)
-    target_label = f"{engine_name} ({destination_ip})"
+    target_label = f"{engine_name} ({len(destination_ips)} dest IP(s))"
     try:
         with engine_bootstrap_lock(engine_name):
             with smc_session(cfg):
                 result = install_ssh_rule(
                     engine_name=engine_name,
                     source_ip=source_ip,
-                    destination_ip=destination_ip,
+                    destination_ips=destination_ips,
                     created_by_email=_operator_email(),
                     fea_hostname=request.host or "",
                 )
@@ -840,18 +875,21 @@ def credentials_rule_install():
                     flash(f"Install rule failed: {result.error}", "danger")
                     return redirect(url_for("dhcp.credentials_list"))
 
-                # Persist DB record
+                # Persist DB record. The model's destination_ip column
+                # holds a comma-separated list (SQLite ignores VARCHAR
+                # length, so it fits any reasonable cluster size).
                 access = DhcpEngineSshAccess.query.filter_by(
                     tenant_id=tenant_id, engine_name=engine_name,
                 ).first()
                 now = datetime.now(timezone.utc)
+                csv_dst = ",".join(destination_ips)
                 if access:
                     access.api_key_id = api_key_id
                     access.policy_name = result.policy_name
                     access.rule_name = result.rule_name
                     access.rule_href = result.rule_href
                     access.fea_source_ip = source_ip
-                    access.destination_ip = destination_ip
+                    access.destination_ip = csv_dst
                     access.created_by_email = access.created_by_email or _operator_email()
                     access.last_seen_in_policy_at = now
                 else:
@@ -862,7 +900,7 @@ def credentials_rule_install():
                         rule_name=result.rule_name,
                         rule_href=result.rule_href,
                         fea_source_ip=source_ip,
-                        destination_ip=destination_ip,
+                        destination_ip=csv_dst,
                         created_by_email=_operator_email(),
                         last_seen_in_policy_at=now,
                     ))
@@ -1043,6 +1081,153 @@ def credentials_bootstrap():
     except Exception as exc:
         _log_activity("ssh", "bootstrap", "failed", target_label, str(exc))
         flash(f"Bootstrap failed: {exc}", "danger")
+    return redirect(url_for("dhcp.credentials_list"))
+
+
+@dhcp_bp.route("/credentials/bootstrap-batch", methods=["POST"])
+@admin_required
+def credentials_bootstrap_batch():
+    """Enroll multiple cluster nodes for one engine in a single transaction.
+
+    Form data shape (one engine, N nodes):
+      tenant_id, api_key_id, engine_name
+      node_count
+      node_<i>_index, node_<i>_id, node_<i>_name, node_<i>_hostname,
+      node_<i>_ssh_port, node_<i>_ssh_username
+
+    Aggregates per-node results, persists each successful credential, and
+    returns a summary flash. The whole batch runs inside ONE smc_session
+    and ONE per-engine lock acquisition — significantly faster than N
+    sequential single-node calls.
+    """
+    tenant_id = int(request.form["tenant_id"])
+    api_key_id = int(request.form["api_key_id"])
+    engine_name = request.form["engine_name"].strip()
+    try:
+        node_count = int(request.form.get("node_count", "0"))
+    except ValueError:
+        node_count = 0
+    if node_count <= 0:
+        flash("No nodes specified for batch enrollment.", "warning")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, api_key_id)
+    if not tenant or not api_key:
+        flash("Tenant or API key not found.", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+    cfg = _smc_cfg(tenant, api_key)
+    audit = _audit_comment("auto-enrollment (batch)", engine_name)
+
+    # Pre-collect node specs from form (so we don't need form access inside the lock)
+    specs: list[dict] = []
+    for i in range(node_count):
+        prefix = f"node_{i}_"
+        host = request.form.get(prefix + "hostname", "").strip()
+        if not host:
+            continue
+        try:
+            specs.append({
+                "node_index": int(request.form[prefix + "index"]),
+                "node_id":    request.form.get(prefix + "id", "").strip(),
+                "node_name":  request.form.get(prefix + "name", "").strip(),
+                "hostname":   host,
+                "port":       int(request.form.get(prefix + "ssh_port", "22")),
+                "username":   request.form.get(prefix + "ssh_username", "root").strip() or "root",
+            })
+        except (KeyError, ValueError) as exc:
+            _log_activity("ssh", "bootstrap_batch", "failed",
+                          f"{engine_name}/node{i}", f"bad form data: {exc}")
+
+    if not specs:
+        flash("No valid node specs in batch.", "warning")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    successes, failures = 0, 0
+    detail_lines: list[str] = []
+
+    try:
+        with engine_bootstrap_lock(engine_name, timeout=180):
+            with smc_session(cfg):
+                for spec in specs:
+                    target_label = f"{engine_name}/node{spec['node_index']}@{spec['hostname']}"
+                    target = SSHTarget(hostname=spec["hostname"], port=spec["port"],
+                                       username=spec["username"])
+                    try:
+                        result = enroll_node(
+                            engine_name=engine_name,
+                            node_index=spec["node_index"],
+                            target=target, audit_comment=audit,
+                        )
+                    except Exception as exc:
+                        failures += 1
+                        detail_lines.append(f"node{spec['node_index']}: exception: {exc}")
+                        _log_activity("ssh", "bootstrap", "failed", target_label, str(exc))
+                        continue
+
+                    if not result.ok:
+                        failures += 1
+                        detail_lines.append(
+                            f"node{spec['node_index']}: failed at "
+                            f"{result.failed_at_stage} — {result.error}"
+                        )
+                        _log_activity("ssh", f"bootstrap_{result.failed_at_stage}",
+                                      "failed", target_label, result.error)
+                        continue
+
+                    # Persist this credential
+                    existing = DhcpEngineCredential.query.filter_by(
+                        tenant_id=tenant_id, engine_name=engine_name,
+                        node_id=spec["node_id"],
+                    ).first()
+                    now = datetime.now(timezone.utc)
+                    if existing:
+                        existing.api_key_id = api_key_id
+                        existing.node_index = spec["node_index"]
+                        existing.node_name = spec["node_name"] or existing.node_name
+                        existing.hostname = spec["hostname"]
+                        existing.ssh_port = spec["port"]
+                        existing.ssh_username = spec["username"]
+                        existing.encrypted_password = result.new_password
+                        existing.host_fingerprint = result.host_fingerprint
+                        existing.last_verified_at = now
+                        existing.last_verify_status = "ok"
+                        existing.last_error = ""
+                    else:
+                        db.session.add(DhcpEngineCredential(
+                            tenant_id=tenant_id, api_key_id=api_key_id,
+                            engine_name=engine_name,
+                            node_index=spec["node_index"],
+                            node_id=spec["node_id"], node_name=spec["node_name"],
+                            hostname=spec["hostname"], ssh_port=spec["port"],
+                            ssh_username=spec["username"],
+                            encrypted_password=result.new_password,
+                            host_fingerprint=result.host_fingerprint,
+                            last_verified_at=now, last_verify_status="ok",
+                        ))
+                    db.session.commit()
+                    successes += 1
+                    detail_lines.append(f"node{spec['node_index']}: ok ({result.host_fingerprint})")
+                    _log_activity("ssh", "bootstrap", "ok", target_label,
+                                  f"fingerprint={result.host_fingerprint}")
+    except Exception as exc:
+        _log_activity("ssh", "bootstrap_batch", "failed", engine_name, str(exc))
+        flash(f"Batch enrollment aborted: {exc}", "danger")
+        return redirect(url_for("dhcp.credentials_list"))
+
+    _log_activity("ssh", "bootstrap_batch",
+                  "ok" if failures == 0 else ("partial" if successes else "failed"),
+                  engine_name,
+                  f"successes={successes} failures={failures}\n" + "\n".join(detail_lines))
+
+    if successes and not failures:
+        flash(f"Batch enrolled {successes} node(s) on {engine_name}.", "success")
+    elif successes and failures:
+        flash(f"Partial: {successes} succeeded, {failures} failed on {engine_name}. "
+              f"See activity log for per-node detail.", "warning")
+    else:
+        flash(f"Batch enrollment failed for all {failures} node(s) on {engine_name}. "
+              f"See activity log.", "danger")
     return redirect(url_for("dhcp.credentials_list"))
 
 

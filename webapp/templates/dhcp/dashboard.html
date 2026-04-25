@@ -13,7 +13,7 @@
   currently log the intent but do not push.
 </div>
 
-<div class="row g-3 mb-4">
+<div class="row g-3 mb-3">
   <div class="col-md-3">
     <div class="card stat-card">
       <div class="card-body text-center">
@@ -47,6 +47,116 @@
     </div>
   </div>
 </div>
+
+<!-- SSH credential summary row -->
+<div class="row g-3 mb-4">
+  <div class="col-md-3">
+    <div class="card stat-card">
+      <div class="card-body text-center">
+        <h3>{{ enrolled_engine_count }}</h3>
+        <p class="text-muted mb-0 small">Enrolled engines</p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card stat-card">
+      <div class="card-body text-center">
+        <h3>{{ total_credential_count }}</h3>
+        <p class="text-muted mb-0 small">Total node credentials</p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card stat-card">
+      <div class="card-body text-center">
+        <h3>
+          {% if healthy_cred_count == total_credential_count and total_credential_count > 0 %}
+            <span class="text-success">{{ healthy_cred_count }}</span>
+          {% else %}
+            {{ healthy_cred_count }}
+          {% endif %}
+        </h3>
+        <p class="text-muted mb-0 small">
+          Verified
+          {% if unhealthy_cred_count %}
+            · <span class="text-danger">{{ unhealthy_cred_count }} failing</span>
+          {% endif %}
+        </p>
+      </div>
+    </div>
+  </div>
+  <div class="col-md-3">
+    <div class="card stat-card">
+      <div class="card-body text-center">
+        <h3>{{ ssh_rule_count }}</h3>
+        <p class="text-muted mb-0 small">SSH allow rules in policies</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+{% if creds %}
+<div class="card mb-4">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <h5 class="mb-0"><i class="bi bi-key"></i> Enrolled clusters &amp; nodes</h5>
+    <a href="{{ url_for('dhcp.credentials_list') }}" class="btn btn-sm btn-outline-primary">
+      <i class="bi bi-pencil"></i> Manage credentials
+    </a>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr>
+          <th>Engine</th><th>Tenant</th><th>Nodes</th><th>Status</th>
+          <th>SSH rule</th><th>Last verified</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set seen_engines = [] %}
+        {% for c in creds %}
+          {% set key = c.tenant_id|string + '/' + c.engine_name %}
+          {% if key not in seen_engines %}
+            {% set _ = seen_engines.append(key) %}
+            {% set sibling_creds = creds|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('tenant_id', 'equalto', c.tenant_id)|list %}
+            {% set rule = (accesses|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('tenant_id', 'equalto', c.tenant_id)|list|first) %}
+            {% set healthy = sibling_creds|selectattr('last_verify_status', 'equalto', 'ok')|list|length %}
+            {% set failing = sibling_creds|selectattr('last_verify_status', 'equalto', 'failed')|list|length %}
+            <tr>
+              <td><strong>{{ c.engine_name }}</strong></td>
+              <td>{{ c.tenant.name if c.tenant else '—' }}</td>
+              <td>
+                {{ sibling_creds|length }}
+                <small class="text-muted">
+                  ({% for sc in sibling_creds %}n{{ sc.node_index }}{% if not loop.last %}, {% endif %}{% endfor %})
+                </small>
+              </td>
+              <td>
+                {% if failing %}<span class="badge bg-danger">{{ failing }} failing</span>{% endif %}
+                {% if healthy %}<span class="badge bg-success">{{ healthy }} ok</span>{% endif %}
+              </td>
+              <td class="small">
+                {% if rule %}
+                  <code>{{ rule.rule_name }}</code>
+                  {% set ip_count = (rule.destination_ip or '').split(',')|length %}
+                  {% if ip_count > 1 %}
+                    <span class="badge bg-secondary">{{ ip_count }} IPs</span>
+                  {% endif %}
+                {% else %}
+                  <span class="text-warning">missing</span>
+                {% endif %}
+              </td>
+              <td class="small text-nowrap">
+                {% set max_seen = sibling_creds|selectattr('last_verified_at')|map(attribute='last_verified_at')|list %}
+                {% if max_seen %}{{ max_seen|max|string|truncate(16, True, '') }}{% else %}—{% endif %}
+              </td>
+            </tr>
+          {% endif %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 
 <div class="card mb-4">
   <div class="card-header d-flex justify-content-between align-items-center">

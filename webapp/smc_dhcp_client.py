@@ -796,24 +796,31 @@ def _ensure_host_for_ip(name: str, ip: str) -> Host:
 
 
 def add_ssh_access_rule(policy_name: str, rule_name: str,
-                        source_ip: str, destination_ip: str,
+                        source_ip: str, destination_ips: list[str],
                         comment: str = "") -> str:
     """Insert (at top of rule list) an Allow rule on TCP/22 from source_ip
-    to destination_ip in the named policy. Returns the new rule's href.
+    to one OR MORE destination IPs in the named policy. Returns the new
+    rule's href.
 
     Idempotent: if a rule with `rule_name` already exists, this returns its
     href without re-adding.
 
-    The `source_ip` and `destination_ip` are wrapped as Host elements named
-    after the rule (so leftover Host objects from one engine don't pollute
-    other engines' rules).
+    Each destination IP is wrapped as its own Host element named
+    `{rule_name}-dst-<index>` so multi-node clusters end up with one rule
+    that targets every node IP.
     """
+    if not destination_ips:
+        raise ValueError("add_ssh_access_rule requires at least one destination IP")
+
     existing = find_ssh_access_rule(policy_name, rule_name)
     if existing:
         return existing["href"]
 
     src_host = _ensure_host_for_ip(f"{rule_name}-src", source_ip)
-    dst_host = _ensure_host_for_ip(f"{rule_name}-dst", destination_ip)
+    dst_hosts: list[Host] = []
+    for i, ip in enumerate(destination_ips):
+        host_name = f"{rule_name}-dst-{i}"
+        dst_hosts.append(_ensure_host_for_ip(host_name, ip))
 
     policy = FirewallPolicy(policy_name)
     action = Action()
@@ -825,7 +832,7 @@ def add_ssh_access_rule(policy_name: str, rule_name: str,
     policy.fw_ipv4_access_rules.create(
         name=rule_name,
         sources=[src_host],
-        destinations=[dst_host],
+        destinations=dst_hosts,
         services=[TCPService("SSH")],
         action=action,
         log_options=log_opts,
@@ -844,7 +851,8 @@ def add_ssh_access_rule(policy_name: str, rule_name: str,
 def remove_ssh_access_rule(policy_name: str, rule_name: str
                            ) -> tuple[bool, str]:
     """Delete the named rule from the policy. Also tries to remove the
-    Host elements we created for it.
+    Host elements we created for it (`-src` and any `-dst-<n>` from
+    multi-IP rules, plus the legacy `-dst` from single-IP rules).
 
     Returns (rule_was_present, message). `rule_was_present=False` if it
     was already gone (still considered success — idempotent).
@@ -862,10 +870,17 @@ def remove_ssh_access_rule(policy_name: str, rule_name: str
         except Exception as exc:
             return rule_existed, f"rule delete failed: {smc_error_detail(exc)}"
 
-    # Best-effort host cleanup (silent failure ok)
-    for suffix in ("-src", "-dst"):
+    # Best-effort host cleanup. Cover the legacy single-`-dst` shape and
+    # the new multi-`-dst-<n>` shape. Stop at the first missing index for
+    # the multi-shape — typical cluster size is 2-4 so iterating ~16 is fine.
+    for legacy_suffix in ("-src", "-dst"):
         try:
-            Host(f"{rule_name}{suffix}").delete()
+            Host(f"{rule_name}{legacy_suffix}").delete()
+        except Exception:
+            pass
+    for i in range(16):
+        try:
+            Host(f"{rule_name}-dst-{i}").delete()
         except Exception:
             pass
 

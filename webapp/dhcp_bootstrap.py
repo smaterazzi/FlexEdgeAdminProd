@@ -139,16 +139,21 @@ def rule_name_for(engine_name: str) -> str:
     return f"flexedge-dhcp-mgmt-ssh-{slug}"
 
 
-def install_ssh_rule(engine_name: str, source_ip: str, destination_ip: str,
+def install_ssh_rule(engine_name: str, source_ip: str,
+                     destination_ips: list[str],
                      created_by_email: str = "",
                      fea_hostname: str = "") -> RuleInstallResult:
     """Pre-flight + create rule + push policy. Idempotent.
 
-    Caller MUST be inside an `smc_session` context.
+    Accepts a LIST of destination IPs so a single rule can cover every
+    node of a cluster. Caller MUST be inside an `smc_session` context.
     """
     pre = preflight(engine_name)
     if not pre.ok:
         return RuleInstallResult(ok=False, error=pre.error)
+    if not destination_ips:
+        return RuleInstallResult(ok=False, policy_name=pre.policy_name,
+                                 error="no destination IPs supplied")
 
     name = rule_name_for(engine_name)
     existing = smc.find_ssh_access_rule(pre.policy_name, name)
@@ -169,7 +174,7 @@ def install_ssh_rule(engine_name: str, source_ip: str, destination_ip: str,
             policy_name=pre.policy_name,
             rule_name=name,
             source_ip=source_ip,
-            destination_ip=destination_ip,
+            destination_ips=list(destination_ips),
             comment=audit,
         )
     except Exception as exc:
