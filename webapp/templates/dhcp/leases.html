@@ -1,6 +1,31 @@
 {% extends "base.html" %}
 {% block title %}DHCP Leases — {{ scope.subnet_cidr }}{% endblock %}
 
+{# Scan-state badge shared between the lease table and the
+   "discovered hosts (no DHCP lease)" card below. Kept inline so the
+   palette stays consistent across both views. #}
+{% macro scan_badge(state, icmp, arp) -%}
+  {% if state == 'active' %}
+    <span class="badge bg-success" title="Lease + ICMP reply">active</span>
+  {% elif state == 'leased-silent' %}
+    <span class="badge bg-dark" title="Has lease but no ICMP/ARP reply — powered off?">silent</span>
+  {% elif state == 'firewalled' %}
+    <span class="badge bg-warning text-dark" title="L2-visible (ARP) but drops ICMP — host firewall">firewalled</span>
+  {% elif state == 'free' %}
+    <span class="badge bg-light text-dark" title="Pool slot, no occupant">free</span>
+  {% elif state == 'active-untracked' %}
+    <span class="badge bg-info text-dark" title="Replies to ICMP but has no DHCP lease — static IP?">untracked</span>
+  {% elif state == 'firewalled-untracked' %}
+    <span class="badge" style="background:#6f42c1;color:#fff" title="L2 visible, drops ICMP, no DHCP lease">untracked + firewalled</span>
+  {% else %}
+    <span class="badge bg-secondary">{{ state }}</span>
+  {% endif %}
+  <span class="ms-1 small text-muted">
+    {% if icmp %}<i class="bi bi-broadcast text-success" title="ICMP reply"></i>{% endif %}
+    {% if arp and not icmp %}<i class="bi bi-diagram-2 text-warning" title="ARP reply only"></i>{% endif %}
+  </span>
+{%- endmacro %}
+
 {% block content %}
 <div class="p-4">
 <nav aria-label="breadcrumb" class="mb-3">
@@ -16,13 +41,76 @@
   <h2 class="mb-0"><i class="bi bi-clipboard-data"></i>
     Active leases <small class="text-muted">on <code>{{ scope.subnet_cidr }}</code></small>
   </h2>
-  <div>
-    <span class="text-muted small me-2">Read from <code>{{ lease_file_path }}</code> · {{ now.strftime('%H:%M:%S') }}</span>
+  <div class="d-flex align-items-center gap-2">
+    <span class="text-muted small">Read from <code>{{ lease_file_path }}</code> · {{ now.strftime('%H:%M:%S') }}</span>
     <a href="{{ url_for('dhcp.scope_leases', scope_id=scope.id) }}" class="btn btn-sm btn-outline-primary">
       <i class="bi bi-arrow-clockwise"></i> Refresh
     </a>
+    <button type="button" class="btn btn-sm btn-outline-info"
+            data-bs-toggle="modal" data-bs-target="#scanRangeModal"
+            {% if scan_running %}disabled{% endif %}>
+      <i class="bi bi-radar"></i> Scan subnet
+    </button>
   </div>
 </div>
+
+{% if scan_running %}
+<div id="scan-watcher" class="card mb-3"
+     data-scan-id="{{ scan_running.scan_id }}"
+     data-status-url="{{ url_for('dhcp.scope_scan_status', scope_id=scope.id) }}"
+     data-leases-url="{{ url_for('dhcp.scope_leases', scope_id=scope.id) }}">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+    <span>
+      <i class="bi bi-radar"></i>
+      Scanning <code>{{ scan_running.subnet_cidr }}</code>
+      <span class="ms-2 small text-muted">
+        from node {{ scan_running.source_node_index }}
+        (<code>{{ scan_running.source_node_hostname }}</code>)
+      </span>
+    </span>
+    <span class="small text-muted" id="scan-counters">
+      ICMP <span class="badge bg-success" id="scan-icmp">{{ scan_running.icmp_replies }}</span>
+      · ARP <span class="badge bg-warning text-dark" id="scan-arp">{{ scan_running.arp_replies }}</span>
+      · <span id="scan-progress-text">{{ scan_running.progress }} / {{ scan_running.total }}</span>
+    </span>
+  </div>
+  <div class="card-body py-2">
+    <div class="progress" style="height: 14px;">
+      <div id="scan-progress-bar"
+           class="progress-bar progress-bar-striped progress-bar-animated bg-info"
+           role="progressbar"
+           style="width: {{ ((scan_running.progress / scan_running.total) * 100)|round(1) if scan_running.total else 0 }}%"
+           aria-valuenow="{{ scan_running.progress }}"
+           aria-valuemin="0" aria-valuemax="{{ scan_running.total }}"></div>
+    </div>
+    <pre id="scan-log" class="mt-2 mb-0 small bg-dark text-light p-2 rounded"
+         style="height: 12em; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;"
+>{% for line in scan_running.log_tail %}{{ line }}
+{% endfor %}</pre>
+  </div>
+</div>
+{% endif %}
+
+{% if scan_report %}
+<div class="alert alert-info py-2 px-3 mb-3 small d-flex align-items-center justify-content-between flex-wrap gap-2">
+  <div>
+    <i class="bi bi-radar me-1"></i>
+    <strong>Subnet scan complete</strong> —
+    <span class="badge bg-success">{{ scan_report.icmp_replies }} ICMP</span>
+    <span class="badge bg-warning text-dark">{{ scan_report.arp_replies }} ARP only</span>
+    {% set silent = scan_report.targets - scan_report.icmp_replies - scan_report.arp_replies %}
+    <span class="badge bg-secondary">{{ silent }} silent</span>
+    <span class="text-muted ms-2">
+      out of {{ scan_report.targets }} target(s) in {{ scan_report.subnet_cidr }} ·
+      {{ scan_report.duration_ms }} ms ·
+      via node {{ scan_report.source_node_index }}
+      (<code>{{ scan_report.source_node_hostname }}</code>)
+    </span>
+  </div>
+  <a href="{{ url_for('dhcp.scope_leases', scope_id=scope.id) }}"
+     class="btn btn-sm btn-outline-secondary">Hide scan</a>
+</div>
+{% endif %}
 
 {% if subnet_filter_cidr %}
 <div class="alert alert-secondary py-2 px-3 mb-3 small d-flex align-items-center">
@@ -104,6 +192,7 @@
           <th>IP</th><th>MAC</th><th>Hostname</th>
           <th>State</th><th>Ends</th><th>Seen on</th>
           <th>Reservation</th>
+          {% if scan_report %}<th>Discovery</th>{% endif %}
         </tr>
       </thead>
       <tbody>
@@ -164,6 +253,9 @@
               <span class="text-muted">pool</span>
             {% endif %}
           </td>
+          {% if scan_report %}
+          <td class="small">{{ scan_badge(l.scan_state, l.scan_icmp, l.scan_arp) }}</td>
+          {% endif %}
         </tr>
         {% endfor %}
       </tbody>
@@ -171,6 +263,53 @@
   </div>
 </div>
 </form>
+
+{% if scan_report and untracked_rows %}
+<div class="card mt-3">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+    <span>
+      <i class="bi bi-search-heart"></i>
+      Discovered hosts (no DHCP lease) —
+      <strong>{{ untracked_rows|length }}</strong>
+    </span>
+    <span class="small text-muted">
+      Devices answering on {{ scope.subnet_cidr }} that aren't in <code>dhcpd.leases</code> —
+      typically static IPs or non-DHCP clients.
+    </span>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0">
+      <thead>
+        <tr>
+          <th>IP</th>
+          <th>MAC (from ARP)</th>
+          <th>Discovery</th>
+          <th>Reservation</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in untracked_rows %}
+        <tr>
+          <td><code>{{ r.ip }}</code></td>
+          <td><code>{{ r.mac or '—' }}</code></td>
+          <td class="small">{{ scan_badge(r.scan_state, r.scan_icmp, r.scan_arp) }}</td>
+          <td class="small">
+            {% if r.reservation_id %}
+              <a href="{{ url_for('dhcp.reservation_edit', reservation_id=r.reservation_id) }}"
+                 class="badge bg-info text-dark text-decoration-none">
+                <i class="bi bi-pin-angle"></i> {{ r.reservation_host }}
+              </a>
+            {% else %}
+              <span class="text-muted">none</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
 {% elif not fetch_errors %}
 <div class="alert alert-info">No leases in file on any node — likely a clean / freshly-booted cluster.</div>
 {% else %}
@@ -178,6 +317,111 @@
   Could not read leases from any node. See the node status cards above for error details.
 </div>
 {% endif %}
+
+{# ── Scan range modal ───────────────────────────────────────────────── #}
+{% set _subnet_size = 0 %}
+{% if scope.subnet_cidr %}
+  {% set _parts = scope.subnet_cidr.split('/') %}
+  {% if _parts|length == 2 %}
+    {% set _prefix = _parts[1]|int %}
+    {% if _prefix >= 0 and _prefix <= 32 %}
+      {% set _subnet_size = (1 << (32 - _prefix)) - 2 %}
+    {% endif %}
+  {% endif %}
+{% endif %}
+{% set _pool_count = 0 %}
+{% if scope.dhcp_pool_start and scope.dhcp_pool_end %}
+  {# Approximate count for the modal description — exact list is built server-side. #}
+  {% set _pool_count = 1 %}
+{% endif %}
+{% set _big_subnet = _subnet_size > 256 %}
+<div class="modal fade" id="scanRangeModal" tabindex="-1" aria-labelledby="scanRangeLabel" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <form method="POST" action="{{ url_for('dhcp.scope_scan', scope_id=scope.id) }}"
+          class="modal-content" id="scan-range-form">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <div class="modal-header">
+        <h5 class="modal-title" id="scanRangeLabel">
+          <i class="bi bi-radar"></i> Scan range — <code>{{ scope.subnet_cidr }}</code>
+        </h5>
+        <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+      </div>
+      <div class="modal-body">
+        <p class="small text-muted mb-3">
+          Active-discovery sweep from node {{ nodes[0].node_index if nodes else '?' }}
+          (<code>{{ nodes[0].hostname if nodes else 'no node' }}</code>):
+          parallel ICMP first, then arping for IPs that don't answer ping.
+          Results joined with <code>dhcpd.leases</code> + classified into 6 buckets.
+        </p>
+
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="radio" name="range_mode"
+                 id="rmScope" value="scope"
+                 {% if not (scope.dhcp_pool_start and scope.dhcp_pool_end) %}disabled{% endif %}
+                 {% if _big_subnet and scope.dhcp_pool_start %}checked{% endif %}>
+          <label class="form-check-label" for="rmScope">
+            <strong>Scope (pool only)</strong>
+            {% if scope.dhcp_pool_start and scope.dhcp_pool_end %}
+              — <code>{{ scope.dhcp_pool_start }}</code> to <code>{{ scope.dhcp_pool_end }}</code>
+            {% else %}
+              <span class="text-muted">— pool range not defined; pick another option</span>
+            {% endif %}
+          </label>
+        </div>
+
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="radio" name="range_mode"
+                 id="rmSubnet" value="subnet"
+                 {% if not _big_subnet %}checked{% endif %}>
+          <label class="form-check-label" for="rmSubnet">
+            <strong>Full subnet</strong> — <code>{{ scope.subnet_cidr }}</code>
+            {% if _subnet_size %}
+              <span class="text-muted">(~{{ _subnet_size }} hosts)</span>
+            {% endif %}
+            {% if _big_subnet %}
+              <span class="badge bg-warning text-dark ms-1">large</span>
+            {% endif %}
+          </label>
+        </div>
+
+        <div class="form-check mb-2">
+          <input class="form-check-input" type="radio" name="range_mode"
+                 id="rmCustom" value="custom">
+          <label class="form-check-label" for="rmCustom">
+            <strong>Custom range</strong>
+          </label>
+          <div class="row g-2 ms-3 mt-1" id="custom-range-fields" style="display:none;">
+            <div class="col-md-5">
+              <label class="form-label small mb-1">Start IP</label>
+              <input type="text" class="form-control form-control-sm"
+                     name="custom_start" placeholder="e.g. {{ scope.dhcp_pool_start or '10.0.0.10' }}">
+            </div>
+            <div class="col-md-5">
+              <label class="form-label small mb-1">End IP</label>
+              <input type="text" class="form-control form-control-sm"
+                     name="custom_end" placeholder="e.g. {{ scope.dhcp_pool_end or '10.0.0.250' }}">
+            </div>
+          </div>
+        </div>
+
+        <div class="form-check mt-3" id="warning-block" style="display:none;">
+          <input class="form-check-input" type="checkbox" name="accept_warning"
+                 value="1" id="acceptWarning">
+          <label class="form-check-label small text-warning" for="acceptWarning">
+            <i class="bi bi-exclamation-triangle"></i>
+            I understand this scan will probe more than 256 hosts and may take a few minutes.
+          </label>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+        <button type="submit" class="btn btn-sm btn-info" id="scan-submit-btn">
+          <i class="bi bi-radar"></i> Start scan
+        </button>
+      </div>
+    </form>
+  </div>
+</div>
 
 </div>
 {% endblock %}
@@ -225,5 +469,104 @@ function confirmLeaseReserve() {
 }
 
 document.addEventListener("DOMContentLoaded", updateReserveCount);
+
+// ── Scan-range modal — toggle custom-range fields + warning checkbox ──
+function _scanRangeUpdateUI() {
+  const mode = (document.querySelector('input[name="range_mode"]:checked') || {}).value;
+  const customFields = document.getElementById("custom-range-fields");
+  if (customFields) customFields.style.display = (mode === "custom") ? "" : "none";
+
+  // Show the >256-host warning when the chosen range likely exceeds it.
+  // For 'subnet' we know the size from the server-rendered _big_subnet flag,
+  // for 'custom' we conservatively show it (the server enforces the actual gate).
+  const subnetSize = parseInt({{ _subnet_size | tojson }}) || 0;
+  let showWarn = false;
+  if (mode === "subnet" && subnetSize > 256) showWarn = true;
+  if (mode === "custom") showWarn = true;
+  const warnBlock = document.getElementById("warning-block");
+  if (warnBlock) warnBlock.style.display = showWarn ? "" : "none";
+}
+document.addEventListener("DOMContentLoaded", () => {
+  document.querySelectorAll('input[name="range_mode"]').forEach(el =>
+    el.addEventListener("change", _scanRangeUpdateUI));
+  _scanRangeUpdateUI();
+  const form = document.getElementById("scan-range-form");
+  if (form) {
+    form.addEventListener("submit", () => {
+      const btn = document.getElementById("scan-submit-btn");
+      if (btn) {
+        btn.disabled = true;
+        btn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Starting…';
+      }
+    });
+  }
+});
+
+// ── Scan watcher — poll /scan/status, update progress bar + log ──
+(function pollScanWatcher() {
+  const w = document.getElementById("scan-watcher");
+  if (!w) return;
+  const scanId  = w.dataset.scanId;
+  const statusUrl = w.dataset.statusUrl;
+  const leasesUrl = w.dataset.leasesUrl;
+  const bar  = document.getElementById("scan-progress-bar");
+  const text = document.getElementById("scan-progress-text");
+  const icmp = document.getElementById("scan-icmp");
+  const arp  = document.getElementById("scan-arp");
+  const log  = document.getElementById("scan-log");
+
+  let stopped = false;
+  let lastLogLen = log ? log.textContent.split("\n").filter(l => l.length).length : 0;
+
+  async function tick() {
+    if (stopped) return;
+    try {
+      const res = await fetch(statusUrl + "?id=" + encodeURIComponent(scanId), {
+        headers: {"Accept": "application/json"},
+      });
+      if (res.status === 404) {
+        stopped = true;
+        // Job vanished — bounce to the plain leases page.
+        window.location = leasesUrl;
+        return;
+      }
+      const s = await res.json();
+      const total = s.total || 1;
+      const pct = Math.min(100, Math.round((s.progress / total) * 1000) / 10);
+      if (bar) {
+        bar.style.width = pct + "%";
+        bar.setAttribute("aria-valuenow", String(s.progress));
+      }
+      if (text) text.textContent = s.progress + " / " + s.total;
+      if (icmp) icmp.textContent = s.icmp_replies;
+      if (arp)  arp.textContent  = s.arp_replies;
+      if (log) {
+        const lines = s.log_tail || [];
+        if (lines.length !== lastLogLen) {
+          log.textContent = lines.join("\n") + (lines.length ? "\n" : "");
+          log.scrollTop = log.scrollHeight;
+          lastLogLen = lines.length;
+        }
+      }
+      if (s.state === "done") {
+        stopped = true;
+        // Reload the page — leases route consumes the report and renders enriched view.
+        window.location = leasesUrl + "?scan_id=" + encodeURIComponent(scanId);
+        return;
+      }
+      if (s.state === "failed") {
+        stopped = true;
+        // Server flashes the error on next render.
+        window.location = leasesUrl + "?scan_id=" + encodeURIComponent(scanId);
+        return;
+      }
+    } catch (err) {
+      // Transient network error — keep polling.
+      console.warn("scan poll error", err);
+    }
+    setTimeout(tick, 800);
+  }
+  tick();
+})();
 </script>
 {% endblock %}

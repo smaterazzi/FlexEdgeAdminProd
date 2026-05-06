@@ -2989,10 +2989,50 @@ def scope_leases(scope_id):
     One row per (MAC, IP) pair, with which nodes saw the lease. Cross-checks
     against reservations so the UI can flag a lease that deviates from its
     tracked reservation.
+
+    When called with `?scan_id=X` and the scan is still running, the page
+    renders an in-progress watcher (progress bar + 10-line log) that polls
+    /scan/status. When the scan is `done`, the route consumes the report
+    and renders the enriched view (Discovery column + untracked card).
+    Failures flash and fall through to the plain leases view.
     """
     scope = _scope_or_404(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
+
+    # Subnet-scan UX — handle ?scan_id=X. Either render the watcher
+    # (state=running), consume + enrich (state=done), or fall through
+    # cleanly with a flash on failure / expiry.
+    scan_id = (request.args.get("scan_id") or "").strip()
+    scan_report = None
+    scan_running = None
+    if scan_id:
+        from webapp.dhcp_scan_jobs import get_status, consume_report, discard
+        user_email = (session.get("user") or {}).get("email", "")
+        status = get_status(scan_id, user_email=user_email)
+        if status is None:
+            flash("Scan job not found or expired — start a new one.", "info")
+        elif status["state"] == "running":
+            scan_running = status
+        elif status["state"] == "failed":
+            flash(f"Subnet scan failed: {status.get('error') or 'unknown error'}",
+                  "danger")
+            discard(scan_id, user_email=user_email)
+        else:  # done
+            scan_report = consume_report(scan_id, user_email=user_email)
+            if scan_report is None:
+                flash("Scan results expired before they could be loaded.",
+                      "warning")
+            else:
+                _log_activity(
+                    "scan", "subnet_sweep", "ok",
+                    f"{scope.engine_name}/{scan_report.subnet_cidr}",
+                    f"targets={scan_report.targets} "
+                    f"icmp={scan_report.icmp_replies} "
+                    f"arp={scan_report.arp_replies} "
+                    f"duration={scan_report.duration_ms}ms "
+                    f"via node{scan_report.source_node_index}",
+                )
 
     # Phase B.2: scope.domain_id (populated by Phase B.1 backfill) is
     # the canonical scope FK. tenant_id stays populated until B.3.
@@ -3007,6 +3047,21 @@ def scope_leases(scope_id):
 
     reservations = (DhcpReservation.query.filter_by(scope_id=scope.id).all())
     res_by_mac = {r.mac_address: r for r in reservations}
+    res_by_ip = {r.ip_address: r for r in reservations}
+
+    # When the watcher is rendering, skip the (slow) lease read + render
+    # the page in "scanning" mode. The polling JS reloads the page on
+    # completion, at which point the full lease read happens.
+    if scan_running is not None:
+        now = datetime.now(timezone.utc)
+        return render_template(
+            "dhcp/leases.html",
+            scope=scope, leases=[], nodes=creds, fetch_errors={},
+            now=now, lease_file_path=LEASE_FILE,
+            leases_other_subnets=0, subnet_filter_cidr="",
+            scan_report=None, scan_running=scan_running,
+            untracked_rows=[],
+        )
 
     per_node_results: dict[int, list] = {}
     fetch_errors: dict[int, str] = {}
@@ -3066,6 +3121,50 @@ def scope_leases(scope_id):
             row["reservation_ip"] = ""
             row["reservation_matches"] = None
 
+    # If we just consumed a scan report, fold the L3/L2 results into
+    # every lease row + build the "untracked" list for the secondary
+    # card below the lease table.
+    untracked_rows = []
+    if scan_report is not None:
+        from webapp.dhcp_subnet_scan import classify
+        leased_ips: set[str] = set()
+        for row in merged:
+            ip = row.get("ip", "")
+            leased_ips.add(ip)
+            hit = scan_report.results.get(ip)
+            row["scan_state"] = classify(
+                has_lease=True,
+                lease_active=(row.get("binding_state") == "active"),
+                icmp_reply=bool(hit and hit.icmp_reply),
+                arp_reply=bool(hit and hit.arp_reply),
+            )
+            row["scan_icmp"] = bool(hit and hit.icmp_reply)
+            row["scan_arp"] = bool(hit and hit.arp_reply)
+
+        for ip, hit in scan_report.results.items():
+            if ip in leased_ips:
+                continue
+            if not (hit.icmp_reply or hit.arp_reply):
+                continue
+            res = res_by_ip.get(ip)
+            untracked_rows.append({
+                "ip": ip,
+                "mac": hit.mac,
+                "scan_icmp": hit.icmp_reply,
+                "scan_arp": hit.arp_reply,
+                "scan_state": classify(
+                    has_lease=False, lease_active=False,
+                    icmp_reply=hit.icmp_reply, arp_reply=hit.arp_reply,
+                ),
+                "reservation_id": res.id if res else None,
+                "reservation_host": res.smc_host_name if res else "",
+            })
+        try:
+            untracked_rows.sort(
+                key=lambda r: tuple(int(p) for p in r["ip"].split(".")))
+        except Exception:
+            pass
+
     now = datetime.now(timezone.utc)
     return render_template(
         "dhcp/leases.html",
@@ -3074,7 +3173,139 @@ def scope_leases(scope_id):
         now=now, lease_file_path=LEASE_FILE,
         leases_other_subnets=leases_other_subnets,
         subnet_filter_cidr=str(network) if network is not None else "",
+        scan_report=scan_report, scan_running=None,
+        untracked_rows=untracked_rows,
     )
+
+
+@dhcp_bp.route("/scopes/<int:scope_id>/scan", methods=["POST"])
+@admin_required
+def scope_scan(scope_id):
+    """Start a background subnet scan from the cluster's primary node.
+
+    Form fields:
+      range_mode      one of {scope, subnet, custom}. Default: subnet for
+                      <=/24, scope for >/24.
+      custom_start    IPv4 (only when range_mode=custom)
+      custom_end      IPv4 (only when range_mode=custom)
+      accept_warning  '1' acknowledges that >256 hosts will be scanned
+
+    On success, redirects to /leases?scan_id=X. The leases page polls
+    /scan/status and switches to the enriched view on completion.
+    """
+    scope = _scope_or_404(scope_id)
+    if not scope:
+        return redirect(url_for("dhcp.scopes_list"))
+
+    creds = (DhcpEngineCredential.query
+             .filter_by(domain_id=scope.domain_id,
+                        engine_name=scope.engine_name)
+             .order_by(DhcpEngineCredential.node_index).all())
+    if not creds:
+        flash(f"No SSH credentials enrolled for {scope.engine_name}. "
+              f"Enroll each cluster node in Credentials first.", "warning")
+        return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+
+    primary = next(
+        (c for c in creds
+         if (c.last_verify_status or "").lower() == "ok"),
+        creds[0],
+    )
+
+    range_mode = (request.form.get("range_mode") or "subnet").strip().lower()
+    custom_start = (request.form.get("custom_start") or "").strip()
+    custom_end = (request.form.get("custom_end") or "").strip()
+    accept_warning = request.form.get("accept_warning") == "1"
+
+    from webapp.dhcp_subnet_scan import (
+        enumerate_subnet_targets, enumerate_range_targets,
+        MAX_HOSTS, WARN_THRESHOLD_HOSTS,
+    )
+
+    try:
+        if range_mode == "scope":
+            if not (scope.dhcp_pool_start and scope.dhcp_pool_end):
+                flash("Scope has no pool range defined — pick "
+                      "Full subnet or Custom range instead.", "warning")
+                return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+            ip_list = enumerate_range_targets(
+                scope.dhcp_pool_start, scope.dhcp_pool_end,
+                gateway=scope.gateway or "",
+                subnet_cidr=scope.subnet_cidr or "",
+            )
+        elif range_mode == "custom":
+            if not (custom_start and custom_end):
+                flash("Custom range requires both start and end IPs.",
+                      "warning")
+                return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+            ip_list = enumerate_range_targets(
+                custom_start, custom_end,
+                gateway=scope.gateway or "",
+                subnet_cidr=scope.subnet_cidr or "",
+            )
+        else:  # subnet
+            if not scope.subnet_cidr:
+                flash("Scope has no subnet CIDR — pick a Custom range.",
+                      "warning")
+                return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+            ip_list = enumerate_subnet_targets(
+                scope.subnet_cidr, gateway=scope.gateway or "")
+    except ValueError as exc:
+        flash(f"Invalid scan range: {exc}", "danger")
+        return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+
+    if not ip_list:
+        flash("Resolved range is empty — nothing to scan.", "warning")
+        return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+    if len(ip_list) > MAX_HOSTS:
+        flash(f"Range too large ({len(ip_list)} hosts > {MAX_HOSTS} cap). "
+              f"Narrow the range and try again.", "danger")
+        return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+    if len(ip_list) > WARN_THRESHOLD_HOSTS and not accept_warning:
+        flash(f"Selected range has {len(ip_list)} hosts (> {WARN_THRESHOLD_HOSTS}). "
+              f"Tick the confirm box and re-submit.", "warning")
+        return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
+
+    from webapp.dhcp_scan_jobs import start_scan
+    user_email = (session.get("user") or {}).get("email", "")
+    scan_id = start_scan(
+        target=_cred_to_target(primary),
+        cred=_cred_to_payload(primary),
+        ip_list=ip_list,
+        subnet_cidr=scope.subnet_cidr or "",
+        scope_id=scope.id,
+        user_email=user_email,
+        source_node_index=primary.node_index,
+        source_node_hostname=primary.hostname,
+    )
+    _log_activity(
+        "scan", "subnet_sweep_started", "ok",
+        f"{scope.engine_name}/{scope.subnet_cidr}",
+        f"mode={range_mode} targets={len(ip_list)} "
+        f"via node{primary.node_index} scan_id={scan_id[:8]}",
+    )
+    return redirect(url_for("dhcp.scope_leases",
+                            scope_id=scope.id, scan_id=scan_id))
+
+
+@dhcp_bp.route("/scopes/<int:scope_id>/scan/status")
+@admin_required
+def scope_scan_status(scope_id):
+    """JSON poll target. Polled every ~800ms by the leases watcher.
+
+    Returns 404 when the scan_id is unknown / expired / owned by a
+    different user. Returns the full status dict otherwise (state,
+    progress, total, log_tail, etc. — see dhcp_scan_jobs.get_status).
+    """
+    scan_id = (request.args.get("id") or "").strip()
+    if not scan_id:
+        return jsonify({"error": "missing id"}), 400
+    from webapp.dhcp_scan_jobs import get_status
+    user_email = (session.get("user") or {}).get("email", "")
+    status = get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(status)
 
 
 _SMC_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
