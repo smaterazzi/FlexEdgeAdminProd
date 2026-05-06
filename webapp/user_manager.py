@@ -52,6 +52,13 @@ def _get_profiles_from_db(email: str) -> list:
     `domain.api_key` (Phase A absorbed those onto api_keys); SMC admin
     domain name from `domain.smc_domain_name`.
 
+    Super Admin special case: per the role spec, Super Admin sees every
+    Domain "including ones added later" — so they're not gated on
+    explicit UserDomainAccess rows. Every active Domain with an active
+    ApiKey appears in their profile list. This also self-heals the
+    bootstrap-admin scenario where the Multi-Domain Revamp backfill
+    didn't produce UDA rows for the original sole admin.
+
     The returned `tenant` key holds `domain.slug` (Phase A preserved each
     legacy Tenant.slug onto its derived Domain), so `cli/connect.py
     --tenant prod` keeps resolving the same context as before.
@@ -60,15 +67,11 @@ def _get_profiles_from_db(email: str) -> list:
     if not user:
         return []
 
-    profiles = []
-    for access in user.domain_accesses:
-        d = access.domain
-        if d is None or not d.is_active:
-            continue
+    def _to_profile(d):
         k = d.api_key
         if k is None or not k.is_active:
-            continue
-        profiles.append({
+            return None
+        return {
             "name": d.display_name,
             "smc_url": k.smc_url,
             "api_key": k.decrypted_key,
@@ -76,7 +79,25 @@ def _get_profiles_from_db(email: str) -> list:
             "timeout": k.timeout,
             "domain": d.smc_domain_name,
             "tenant": d.slug,
-        })
+        }
+
+    if getattr(user, "is_super_admin", False):
+        from webapp.models import Domain
+        profiles = []
+        for d in Domain.query.filter_by(is_active=True).all():
+            p = _to_profile(d)
+            if p is not None:
+                profiles.append(p)
+        return profiles
+
+    profiles = []
+    for access in user.domain_accesses:
+        d = access.domain
+        if d is None or not d.is_active:
+            continue
+        p = _to_profile(d)
+        if p is not None:
+            profiles.append(p)
     return profiles
 
 
