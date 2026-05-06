@@ -967,20 +967,12 @@ def _create_service_group(change, payload: dict) -> HandlerResult:
                          detail=f"ServiceGroup {name} with {len(member_names)} member(s){skip_note}")
 
 
-# Dispatch table consumed by `_handle_create`. New types: just add an
-# entry here + write a `_create_<type>` function.
-_CREATE_DISPATCH: dict = {
-    "host":           _create_host,
-    "network":        _create_network,
-    "address_range":  _create_address_range,
-    "fqdn":           _create_fqdn,
-    "tcp_service":    _create_tcp_service,
-    "udp_service":    _create_udp_service,
-    "group":          _create_group,
-    "service_group":  _create_service_group,
-    "rule":           _create_rule,
-    "nat_rule":       _create_nat_rule,
-}
+# Dispatch table consumed by `_handle_create`. The actual table is
+# defined further down — AFTER `_create_rule` and `_create_nat_rule`
+# are declared (those live below the update/delete/section handlers
+# because they need helpers like `_ensure_firewall_policy` that are
+# defined after the simpler element handlers). `_handle_create` looks
+# the dict up at call time, so its placement doesn't matter at import.
 
 
 @register_handler("update")
@@ -1431,6 +1423,23 @@ def _create_nat_rule(change, payload: dict) -> HandlerResult:
         success=True, applied=False,
         detail=f"NAT rule [{nat_type}] '{name}' in '{policy_name}'{warn}",
     )
+
+
+# Dispatch table consumed by `_handle_create`. Defined here — AFTER
+# every `_create_<type>` function — so module import succeeds. New
+# types: add an entry + write the `_create_<type>` above.
+_CREATE_DISPATCH: dict = {
+    "host":           _create_host,
+    "network":        _create_network,
+    "address_range":  _create_address_range,
+    "fqdn":           _create_fqdn,
+    "tcp_service":    _create_tcp_service,
+    "udp_service":    _create_udp_service,
+    "group":          _create_group,
+    "service_group":  _create_service_group,
+    "rule":           _create_rule,
+    "nat_rule":       _create_nat_rule,
+}
 
 
 @register_handler("install_ssh_rule")
