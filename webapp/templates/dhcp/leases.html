@@ -319,21 +319,10 @@
 {% endif %}
 
 {# ── Scan range modal ───────────────────────────────────────────────── #}
-{% set _subnet_size = 0 %}
-{% if scope.subnet_cidr %}
-  {% set _parts = scope.subnet_cidr.split('/') %}
-  {% if _parts|length == 2 %}
-    {% set _prefix = _parts[1]|int %}
-    {% if _prefix >= 0 and _prefix <= 32 %}
-      {% set _subnet_size = (2 ** (32 - _prefix)) - 2 %}
-    {% endif %}
-  {% endif %}
-{% endif %}
-{% set _pool_count = 0 %}
-{% if scope.dhcp_pool_start and scope.dhcp_pool_end %}
-  {# Approximate count for the modal description — exact list is built server-side. #}
-  {% set _pool_count = 1 %}
-{% endif %}
+{# subnet_size comes from the route — Jinja {% set %} inside a block does
+   not leak into other blocks (e.g. extra_js below), so the value lives
+   in the render context instead. #}
+{% set _subnet_size = subnet_size or 0 %}
 {% set _big_subnet = _subnet_size > 256 %}
 <div class="modal fade" id="scanRangeModal" tabindex="-1" aria-labelledby="scanRangeLabel" aria-hidden="true">
   <div class="modal-dialog modal-lg">
@@ -479,7 +468,7 @@ function _scanRangeUpdateUI() {
   // Show the >256-host warning when the chosen range likely exceeds it.
   // For 'subnet' we know the size from the server-rendered _big_subnet flag,
   // for 'custom' we conservatively show it (the server enforces the actual gate).
-  const subnetSize = parseInt({{ _subnet_size | tojson }}) || 0;
+  const subnetSize = parseInt({{ subnet_size | default(0) | tojson }}) || 0;
   let showWarn = false;
   if (mode === "subnet" && subnetSize > 256) showWarn = true;
   if (mode === "custom") showWarn = true;

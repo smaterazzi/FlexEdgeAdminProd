@@ -3054,6 +3054,17 @@ def scope_leases(scope_id):
     # completion, at which point the full lease read happens.
     if scan_running is not None:
         now = datetime.now(timezone.utc)
+        subnet_size_running = 0
+        if scope.subnet_cidr:
+            try:
+                import ipaddress as _ipa
+                subnet_size_running = max(
+                    0,
+                    _ipa.ip_network(scope.subnet_cidr,
+                                    strict=False).num_addresses - 2,
+                )
+            except Exception:
+                subnet_size_running = 0
         return render_template(
             "dhcp/leases.html",
             scope=scope, leases=[], nodes=creds, fetch_errors={},
@@ -3061,6 +3072,7 @@ def scope_leases(scope_id):
             leases_other_subnets=0, subnet_filter_cidr="",
             scan_report=None, scan_running=scan_running,
             untracked_rows=[],
+            subnet_size=subnet_size_running,
         )
 
     per_node_results: dict[int, list] = {}
@@ -3165,6 +3177,16 @@ def scope_leases(scope_id):
         except Exception:
             pass
 
+    # Subnet size — passed to the template so both the modal AND the
+    # extra_js polling block can read it without each block re-deriving
+    # (Jinja {% set %} is block-scoped; inheritance does not bridge it).
+    subnet_size = 0
+    if network is not None:
+        try:
+            subnet_size = max(0, network.num_addresses - 2)
+        except Exception:
+            subnet_size = 0
+
     now = datetime.now(timezone.utc)
     return render_template(
         "dhcp/leases.html",
@@ -3175,6 +3197,7 @@ def scope_leases(scope_id):
         subnet_filter_cidr=str(network) if network is not None else "",
         scan_report=scan_report, scan_running=None,
         untracked_rows=untracked_rows,
+        subnet_size=subnet_size,
     )
 
 
