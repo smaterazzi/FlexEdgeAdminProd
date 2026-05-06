@@ -3,7 +3,44 @@
 
 {% block content %}
 <div class="p-4">
-    <h4 class="mb-3"><i class="bi bi-bricks"></i> Clusters &amp; Engines</h4>
+    <div class="d-flex justify-content-between align-items-center mb-1">
+        <h4 class="mb-0"><i class="bi bi-bricks"></i> Clusters &amp; Engines</h4>
+        {% if cache_meta %}
+        {# Cache-freshness badge + Refresh button — same pattern as the
+           DHCP credentials freshness UX. ?refresh=1 bypasses the cache,
+           hits SMC live, and repopulates. #}
+        <div class="d-flex align-items-center gap-2 small">
+          {% if cache_meta.served_from_cache %}
+            {% set mins = (cache_meta.age_minutes)|round(0)|int %}
+            <span class="text-muted" title="Served from process cache. Click Refresh to force a live SMC fetch.">
+              <i class="bi bi-database-check"></i>
+              cached · {{ mins if mins else '<1' }} min ago
+            </span>
+          {% else %}
+            <span class="text-success"
+                  title="Just fetched from SMC; cached for the next 1 hour.">
+              <i class="bi bi-cloud-download"></i>
+              fresh from SMC
+            </span>
+          {% endif %}
+          <a href="{{ url_for('engines.clusters', refresh=1) }}"
+             class="btn btn-sm btn-outline-secondary"
+             title="Force a live SMC fetch and repopulate the cache.">
+            <i class="bi bi-arrow-clockwise"></i> Refresh from SMC
+          </a>
+        </div>
+        {% endif %}
+    </div>
+
+    {# Scope hint: this page is bound to one tenant + domain at a time. Engines
+       enrolled under other tenants only appear after switching profiles. #}
+    <div class="text-muted small mb-3">
+      <i class="bi bi-funnel"></i>
+      Showing engines for
+      <strong>{{ active_tenant.display_name if active_tenant else '—' }}</strong>.
+      <a href="{{ url_for('select_profile') }}" class="ms-1">Switch domain</a>
+      to see engines from other domains.
+    </div>
 
     {% if not engines %}
     <div class="alert alert-secondary">No engines visible to the current SMC profile.</div>
@@ -47,6 +84,18 @@
                            class="btn btn-sm btn-outline-primary">
                             <i class="bi bi-search"></i> Details
                         </a>
+                        {% if managed_engine_names and e.name in managed_engine_names %}
+                        <form method="post"
+                              action="{{ url_for('engines.cluster_forget', engine_name=e.name) }}"
+                              class="d-inline ms-1"
+                              onsubmit="return confirm('Forget engine {{ e.name }} on the FlexEdge side?\n\nThis deletes ALL stored DHCP-Manager credentials for this engine AND removes the SSH allow rule from SMC (with policy upload).\n\nThe engine itself stays in SMC and remains reachable through SMC Management Client. To re-manage it from FlexEdge later you would need to re-enroll its nodes.');">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                          <button class="btn btn-sm btn-outline-danger"
+                                  title="Delete FlexEdge-side state for this engine: stored credentials + the SSH allow rule. Engine is unaffected on SMC.">
+                            <i class="bi bi-x-octagon"></i> Forget
+                          </button>
+                        </form>
+                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}

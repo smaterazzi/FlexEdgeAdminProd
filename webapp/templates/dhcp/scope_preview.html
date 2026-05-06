@@ -1,0 +1,116 @@
+{% extends "base.html" %}
+{% block title %}Preview deploy — {{ scope.engine_name }} / {{ scope.subnet_cidr }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="small mb-2">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.dashboard') }}">DHCP</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scopes_list') }}">Scopes</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('dhcp.scope_detail', scope_id=scope.id) }}">{{ scope.engine_name }} / {{ scope.subnet_cidr }}</a></li>
+    <li class="breadcrumb-item active">Preview</li>
+  </ol>
+</nav>
+
+<h2 class="mb-3"><i class="bi bi-eye"></i> Deploy preview — dry-run</h2>
+
+<div class="alert alert-info">
+  This is a <strong>dry-run</strong>: FlexEdgeAdmin SSH'd into each cluster node and computed the
+  diff that a real Deploy would write to <code>/data/config/base/dhcp-server.conf</code>.
+  <strong>No file was modified.</strong> Reservation status is unchanged. Click Deploy below to
+  commit, or just navigate away to discard.
+</div>
+
+{% if not phase0_validated %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle"></i>
+  Phase 0 lab persistence test is not yet validated. The Deploy button is gated until you confirm
+  it on the dashboard, but you can run as many previews as you want — preview never writes.
+</div>
+{% endif %}
+
+<div class="card mb-3">
+  <div class="card-body row">
+    <div class="col-md-3">
+      <small class="text-muted d-block">Engine</small>
+      <strong>{{ scope.engine_name }}</strong>
+    </div>
+    <div class="col-md-3">
+      <small class="text-muted d-block">Interface</small>
+      <strong>{{ scope.interface_id }}</strong>
+    </div>
+    <div class="col-md-3">
+      <small class="text-muted d-block">Subnet</small>
+      <code>{{ scope.subnet_cidr }}</code>
+    </div>
+    <div class="col-md-3">
+      <small class="text-muted d-block">Result</small>
+      {% if result.overall_status == 'ok' %}
+        <span class="badge bg-success">All {{ result.successful_nodes }} node(s) ok</span>
+      {% elif result.overall_status == 'partial' %}
+        <span class="badge bg-warning text-dark">Partial — {{ result.successful_nodes }}/{{ result.nodes|length }} ok</span>
+      {% else %}
+        <span class="badge bg-danger">Failed — {{ result.failed_nodes }}/{{ result.nodes|length }} failed</span>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+{% for n in result.nodes %}
+<div class="card mb-3">
+  <div class="card-header d-flex justify-content-between align-items-center">
+    <div>
+      <strong>Node {{ n.node_index }}</strong>
+      {% if n.node_hostname %} — <code>{{ n.node_hostname }}</code>{% endif %}
+      {% if n.status == 'ok' %}
+        <span class="badge bg-success ms-2">would succeed</span>
+      {% else %}
+        <span class="badge bg-danger ms-2">would fail</span>
+      {% endif %}
+    </div>
+    <small class="text-muted">{{ n.duration_ms }} ms</small>
+  </div>
+  <div class="card-body">
+    {% if n.error %}
+      <div class="alert alert-danger small mb-2">
+        <strong>Error:</strong> {{ n.error }}
+      </div>
+    {% endif %}
+    {% if n.diff %}
+      <div class="row mb-2">
+        <div class="col-md-6 small">
+          <span class="text-muted">sha256 before:</span>
+          <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_before }}">{{ n.sha256_before or '(file missing)' }}</code>
+        </div>
+        <div class="col-md-6 small">
+          <span class="text-muted">sha256 after:</span>
+          <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_after }}">{{ n.sha256_after or '—' }}</code>
+        </div>
+      </div>
+      <pre class="json-detail mb-0" style="max-height:30rem;">{{ n.diff }}</pre>
+    {% else %}
+      <em class="text-muted small">(no diff to render)</em>
+    {% endif %}
+  </div>
+</div>
+{% endfor %}
+
+<div class="d-flex gap-2 mt-3 mb-5">
+  <a href="{{ url_for('dhcp.scope_detail', scope_id=scope.id) }}"
+     class="btn btn-outline-secondary">
+    <i class="bi bi-x-lg"></i> Discard preview
+  </a>
+  {% if result.overall_status in ('ok', 'partial') %}
+  <form method="post" action="{{ url_for('dhcp.scope_deploy', scope_id=scope.id) }}"
+        onsubmit="return confirm('Apply the diff above to every cluster node and reload dhcpd?');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-warning"
+            {% if not phase0_validated %}disabled title="Phase 0 not validated — gate on the dashboard"{% endif %}>
+      <i class="bi bi-rocket-takeoff"></i> Looks good — Deploy now
+    </button>
+  </form>
+  {% endif %}
+</div>
+
+</div>
+{% endblock %}

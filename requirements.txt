@@ -1,5 +1,7 @@
 flask>=3.0
 flask-sqlalchemy>=3.1
+flask-wtf>=1.2
+cachetools>=5.3
 fp-NGFW-SMC-python>=1.0.32
 cryptography>=42.0
 pyyaml

@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{% block title %}SMC Drift Detector{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0">
+      <i class="bi bi-binoculars"></i> SMC Drift Detector
+    </h2>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="small text-muted">
+        Tracked:
+        <span class="badge bg-success">{{ summary.clean }} clean</span>
+        {% if summary.drifted %}<span class="badge bg-warning text-dark">{{ summary.drifted }} drifted</span>{% endif %}
+        {% if summary.gone %}<span class="badge bg-danger">{{ summary.gone }} gone</span>{% endif %}
+        {% if summary.unknown %}<span class="badge bg-secondary">{{ summary.unknown }} unknown</span>{% endif %}
+      </span>
+      {% if can_scan %}
+      <form method="POST" action="{{ url_for('changes.drift_scan') }}"
+            onsubmit="return confirm('Run a fresh drift scan against every tracked SMC element in this Domain? This may take a while for large registries.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-primary">
+          <i class="bi bi-arrow-clockwise"></i> Scan now
+        </button>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+  <div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+  {% endfor %}
+  {% endwith %}
+
+  <div class="alert alert-info small">
+    <i class="bi bi-info-circle"></i>
+    The drift detector compares the SMC registry's recorded state against
+    a fresh fetch from SMC. Rows flagged
+    <span class="badge bg-warning text-dark">drifted</span> have changed
+    in SMC since FlexEdgeAdmin last touched them. Rows flagged
+    <span class="badge bg-danger">gone</span> were deleted out of band.
+    Use <strong>Reconcile</strong> to accept the current SMC state as the
+    new baseline, or push a corrective change through the
+    <a href="{{ url_for('changes.index') }}">queue</a>.
+    {% if summary.last_check_at %}
+    <br><span class="text-muted">Last scan: {{ summary.last_check_at.strftime("%Y-%m-%d %H:%M UTC") }}</span>
+    {% else %}
+    <br><span class="text-muted">No scan run yet — click <strong>Scan now</strong> to baseline.</span>
+    {% endif %}
+  </div>
+
+  <!-- Filter bar -->
+  <form method="get" class="card mb-3">
+    <div class="card-body py-2 px-3">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-3">
+          <label class="form-label small text-muted mb-1">State</label>
+          <select name="state" class="form-select form-select-sm">
+            <option value="active"   {% if filters.state == 'active' %}selected{% endif %}>Needs attention (drifted + gone)</option>
+            <option value="drifted"  {% if filters.state == 'drifted' %}selected{% endif %}>Drifted</option>
+            <option value="gone"     {% if filters.state == 'gone' %}selected{% endif %}>Gone</option>
+            <option value="clean"    {% if filters.state == 'clean' %}selected{% endif %}>Clean</option>
+            <option value="unknown"  {% if filters.state == 'unknown' %}selected{% endif %}>Unknown / never scanned</option>
+            <option value="all"      {% if filters.state == 'all' %}selected{% endif %}>All</option>
+          </select>
+        </div>
+        <div class="col-md-1 d-grid">
+          <button class="btn btn-sm btn-primary"><i class="bi bi-funnel"></i></button>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  {% if not rows %}
+  <div class="alert alert-success">
+    {% if filters.state == 'active' %}
+      No drift detected — every tracked SMC element matches its last seen state.
+    {% else %}
+      No rows match the current filter.
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0 align-middle">
+        <thead class="table-light">
+          <tr>
+            <th>State</th>
+            <th>Type</th>
+            <th>Name</th>
+            <th>FlexEdge-managed</th>
+            <th>Last check</th>
+            <th>Detail</th>
+            <th class="text-end">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for r in rows %}
+          <tr>
+            <td>
+              {% if r.drift_state == 'clean' %}
+                <span class="badge bg-success">clean</span>
+              {% elif r.drift_state == 'drifted' %}
+                <span class="badge bg-warning text-dark">drifted</span>
+              {% elif r.drift_state == 'gone' %}
+                <span class="badge bg-danger">gone</span>
+              {% else %}
+                <span class="badge bg-secondary">{{ r.drift_state }}</span>
+              {% endif %}
+            </td>
+            <td><code class="small">{{ r.smc_type }}</code></td>
+            <td>
+              <strong>{{ r.smc_name or '(unnamed)' }}</strong>
+              {% if r.is_to_be_deleted %}
+              <span class="badge bg-danger ms-1" title="Pending delete in queue">pending delete</span>
+              {% endif %}
+              <br><small class="text-muted">{{ r.smc_href }}</small>
+            </td>
+            <td>
+              {% if r.managed_by_flexedge %}
+                <i class="bi bi-check-circle text-success"></i> yes
+              {% else %}
+                <span class="text-muted">no (tracked only)</span>
+              {% endif %}
+            </td>
+            <td class="small text-muted">
+              {% if r.last_drift_check_at %}
+                {{ r.last_drift_check_at.strftime("%Y-%m-%d %H:%M") }}
+              {% else %}
+                never
+              {% endif %}
+            </td>
+            <td class="small">
+              {% if r.drift_detail %}
+                {{ r.drift_detail }}
+              {% else %}
+                <span class="text-muted">—</span>
+              {% endif %}
+            </td>
+            <td class="text-end">
+              {% if can_reconcile and r.drift_state == 'drifted' %}
+              <form method="POST" class="d-inline"
+                    action="{{ url_for('changes.drift_reconcile', smc_object_id=r.id) }}"
+                    onsubmit="return confirm('Accept the current SMC state of {{ r.smc_name|e }} as the new baseline? This clears the drift flag without changing SMC.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="btn btn-sm btn-outline-warning">
+                  <i class="bi bi-check2-circle"></i> Reconcile
+                </button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  {% if rows|length >= 1000 %}
+  <div class="alert alert-warning mt-3 small">
+    Showing the first 1000 rows — narrow the filter to see more.
+  </div>
+  {% endif %}
+  {% endif %}
+
+</div>
+{% endblock %}

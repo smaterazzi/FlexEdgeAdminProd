@@ -179,22 +179,62 @@ def _node_interfaces(all_ifaces: list[InterfaceInfo], nodeid: int) -> list[Inter
 
 
 def _routing_summary(engine, errors: list[str]) -> list[dict]:
-    """Return a flat list of routing entries: {network, gateway, type, comment}."""
+    """Return a flat list of routing entries: {name, level, ip, routing_node_element}.
+
+    All values are forced to plain strings INSIDE the SMC session — some
+    smc-python attributes (notably ``routing_node_element``) return live
+    SDK Element objects with lazy attribute access. If we let those
+    propagate to the template, Jinja's str() coercion happens after the
+    SMC session has closed → ``SMCConnectionError: No session found``.
+    """
     out: list[dict] = []
     try:
         for entry in engine.routing.all():
             try:
                 out.append({
-                    "name": getattr(entry, "name", "") or "",
-                    "level": getattr(entry, "level", "") or "",
-                    "ip": getattr(entry, "ip", "") or "",
-                    "routing_node_element": getattr(entry, "routing_node_element", "") or "",
+                    "name": _stringify(getattr(entry, "name", "")),
+                    "level": _stringify(getattr(entry, "level", "")),
+                    "ip": _stringify(getattr(entry, "ip", "")),
+                    "routing_node_element": _stringify(
+                        getattr(entry, "routing_node_element", "")),
                 })
-            except Exception:
+            except Exception as exc:
+                # Per-entry failure: log but keep going. Adding nothing for
+                # this entry is preferable to dropping the whole table.
+                log.debug("routing entry failed: %s", exc)
                 continue
     except Exception as exc:
         errors.append(f"routing: {exc}")
     return out
+
+
+def _stringify(value) -> str:
+    """Materialise any SDK value into a plain string at extraction time.
+
+    Handles three shapes:
+      - already a primitive (str/int/float/None) → repr
+      - an Element-like SDK object → prefer ``.name``, fall back to str()
+      - anything else → str()
+
+    Wrapped in a broad except because ``.name`` on a missing/lazy Element
+    can raise SMCConnectionError if accessed after the session is gone —
+    we want a placeholder string, not an exception.
+    """
+    if value is None or value == "":
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return str(value)
+    # SDK objects: try the canonical .name attribute first.
+    try:
+        nm = getattr(value, "name", None)
+        if nm:
+            return str(nm)
+    except Exception:
+        pass
+    try:
+        return str(value)
+    except Exception as exc:
+        return f"<unrenderable: {type(value).__name__}: {exc}>"
 
 
 def _contact_addresses(engine, errors: list[str]) -> list[dict]:
@@ -276,6 +316,16 @@ def list_clusters(cfg) -> list[EngineSummary]:
                     typeof=entry.get("type", ""),
                 ))
     out.sort(key=lambda s: s.name.lower())
+
+    # Q21 lazy registry — register every engine seen. Best-effort.
+    try:
+        from shared.smc_registry import register_many
+        register_many(None, [
+            {"smc_type": "engine", "smc_href": s.href, "smc_name": s.name}
+            for s in out if s.href
+        ])
+    except Exception:
+        pass
     return out
 
 

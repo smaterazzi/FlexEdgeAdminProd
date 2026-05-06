@@ -29,9 +29,19 @@
                 </div>
                 <div class="card-body">
                     <div class="mb-3">
-                        <label class="form-label text-muted">Tenant</label>
-                        <div>{{ api_key.tenant.name }}</div>
+                        <label class="form-label text-muted">SMC Server</label>
+                        <div><code>{{ api_key.smc_url or '—' }}</code></div>
                     </div>
+
+                    {% if created_domain %}
+                    <div class="mb-3">
+                        <label class="form-label text-muted">Auto-created Domain</label>
+                        <div>
+                            <strong>{{ created_domain.display_name }}</strong>
+                            <span class="text-muted">— slug <code>{{ created_domain.slug }}</code></span>
+                        </div>
+                    </div>
+                    {% endif %}
 
                     <div class="mb-3">
                         <label class="form-label text-muted">API Key</label>
@@ -49,6 +59,11 @@
                         <a href="{{ url_for('admin.api_keys') }}" class="btn btn-primary">
                             <i class="bi bi-arrow-left me-1"></i>Back to API Keys
                         </a>
+                        {% if created_domain %}
+                        <a href="{{ url_for('admin.domain_edit', id=created_domain.id) }}" class="btn btn-outline-info">
+                            <i class="bi bi-diagram-3 me-1"></i>Edit Domain
+                        </a>
+                        {% endif %}
                         <a href="{{ url_for('admin.users') }}" class="btn btn-outline-secondary">
                             Assign to User
                         </a>

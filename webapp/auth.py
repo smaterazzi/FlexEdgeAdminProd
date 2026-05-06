@@ -141,10 +141,17 @@ def callback():
         session.clear()
         return render_template("auth/login.html")
 
-    # If user has exactly one profile, pre-select it and skip profile page
+    # If user has exactly one profile, pre-select it and skip the picker.
+    # After the Multi-Domain Revamp each profile already pins its
+    # smc_domain_name, so we set active_domain here too and land the user
+    # straight on the dashboard — no /select-domain detour.
     if len(profiles) == 1:
-        session["active_profile"] = profiles[0]
-        return redirect(url_for("select_domain"))
+        only = profiles[0]
+        session["active_profile"] = only
+        session["active_domain"] = (only.get("domain") or "").strip() or "Shared Domain"
+        log.info("User %s auto-selected sole profile '%s' (smc-domain '%s')",
+                 email, only.get("name"), session["active_domain"])
+        return redirect(url_for("index"))
 
     return redirect(url_for("select_profile"))
 

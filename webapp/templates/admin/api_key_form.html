@@ -14,7 +14,7 @@
 
 <div class="p-4">
     <div class="row justify-content-center">
-        <div class="col-md-8 col-lg-6">
+        <div class="col-md-9 col-lg-8">
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% for category, message in messages %}
             <div class="alert alert-{{ category }} mb-3">{{ message }}</div>
@@ -30,41 +30,115 @@
                         <i class="bi bi-info-circle me-1"></i>
                         Paste the API key from your SMC Management Client
                         (Administration &rarr; Access Rights &rarr; API Clients).
-                        The key will be encrypted and stored securely.
+                        The key will be encrypted and stored securely. A Domain
+                        for this API key is auto-created at the bottom of the form.
                     </div>
 
                     <form method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                        <h6 class="border-bottom border-secondary pb-2 mb-3">Identity</h6>
                         <div class="mb-3">
                             <label for="name" class="form-label">Key Name</label>
                             <input type="text" class="form-control bg-dark border-secondary text-light"
                                    id="name" name="name" required
                                    placeholder="e.g., Production Admin Key">
-                        </div>
-
-                        <div class="mb-3">
-                            <label for="tenant_id" class="form-label">Tenant</label>
-                            <select class="form-select bg-dark border-secondary text-light"
-                                    id="tenant_id" name="tenant_id" required>
-                                <option value="">Select a tenant...</option>
-                                {% for t in tenants %}
-                                <option value="{{ t.id }}">{{ t.name }} ({{ t.slug }})</option>
-                                {% endfor %}
-                            </select>
+                            <div class="form-text">A human-readable label. Shown in admin UI + Domain display name.</div>
                         </div>
 
                         <div class="mb-4">
-                            <label for="api_key" class="form-label">API Key</label>
+                            <label for="api_key" class="form-label">API Key (plaintext)</label>
                             <input type="password" class="form-control bg-dark border-secondary text-light"
                                    id="api_key" name="api_key" required
                                    placeholder="Paste the SMC API key here">
                             <div class="form-text">
-                                This will be encrypted before storage. You will see it one more time after creation.
+                                Encrypted before storage. You'll see it one more time after creation.
                             </div>
                         </div>
 
-                        <div class="d-flex gap-2">
+                        <h6 class="border-bottom border-secondary pb-2 mb-3">SMC Server</h6>
+
+                        <div class="mb-3">
+                            <label for="smc_url" class="form-label">SMC URL</label>
+                            <input type="url" class="form-control bg-dark border-secondary text-light"
+                                   id="smc_url" name="smc_url" required
+                                   placeholder="https://smc.example.com:8082"
+                                   list="known-smc-urls">
+                            {% if existing_tenants %}
+                            <datalist id="known-smc-urls">
+                                {% for t in existing_tenants %}
+                                <option value="{{ t.smc_url }}">{{ t.name }}</option>
+                                {% endfor %}
+                            </datalist>
+                            {% endif %}
+                            <div class="form-text">
+                                Server URL the SDK talks to. If a Tenant with this URL already exists
+                                it'll be reused — otherwise a backing record is created automatically.
+                            </div>
+                        </div>
+
+                        <div class="row">
+                            <div class="col-md-4 mb-3">
+                                <label for="timeout" class="form-label">Timeout (s)</label>
+                                <input type="number" class="form-control bg-dark border-secondary text-light"
+                                       id="timeout" name="timeout"
+                                       value="120" min="10" max="600">
+                            </div>
+                            <div class="col-md-4 mb-3">
+                                <label for="api_version" class="form-label">API Version</label>
+                                <input type="text" class="form-control bg-dark border-secondary text-light"
+                                       id="api_version" name="api_version"
+                                       placeholder="(autodetect)">
+                            </div>
+                            <div class="col-md-4 mb-3 d-flex align-items-end">
+                                <div class="form-check">
+                                    <input class="form-check-input" type="checkbox"
+                                           id="verify_ssl" name="verify_ssl">
+                                    <label class="form-check-label" for="verify_ssl">
+                                        Verify SSL
+                                    </label>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div class="mb-4">
+                            <label for="flexedge_source_ip" class="form-label">FlexEdge Source IP <span class="text-muted">(optional)</span></label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="flexedge_source_ip" name="flexedge_source_ip"
+                                   placeholder="e.g., 172.16.199.72">
+                            <div class="form-text">
+                                The IP this FlexEdgeAdmin instance uses when reaching engines via SSH (DHCP Manager).
+                                Leave blank to set later from the DHCP Manager → Credentials page.
+                            </div>
+                        </div>
+
+                        <h6 class="border-bottom border-secondary pb-2 mb-3">Default Domain</h6>
+                        <p class="text-muted small mb-3">
+                            A Domain represents one (API key, SMC admin domain) pair — operators see it
+                            in the Domain switcher. One is auto-created with this API key.
+                        </p>
+
+                        <div class="row">
+                            <div class="col-md-7 mb-3">
+                                <label for="smc_domain_name" class="form-label">SMC Admin Domain Name</label>
+                                <input type="text" class="form-control bg-dark border-secondary text-light"
+                                       id="smc_domain_name" name="smc_domain_name"
+                                       value="Shared Domain"
+                                       placeholder="Shared Domain">
+                                <div class="form-text">SMC's own domain name — must match exactly.</div>
+                            </div>
+                            <div class="col-md-5 mb-3">
+                                <label for="domain_slug" class="form-label">Domain Slug <span class="text-muted">(optional)</span></label>
+                                <input type="text" class="form-control bg-dark border-secondary text-light"
+                                       id="domain_slug" name="domain_slug" pattern="[a-z0-9\-_]*"
+                                       placeholder="(auto)">
+                                <div class="form-text">Used as <code>--tenant &lt;slug&gt;</code> in CLI.</div>
+                            </div>
+                        </div>
+
+                        <div class="d-flex gap-2 mt-2">
                             <button type="submit" class="btn btn-primary">
-                                <i class="bi bi-lock me-1"></i>Create & Encrypt
+                                <i class="bi bi-lock me-1"></i>Create &amp; Encrypt
                             </button>
                             <a href="{{ url_for('admin.api_keys') }}" class="btn btn-outline-secondary">Cancel</a>
                         </div>

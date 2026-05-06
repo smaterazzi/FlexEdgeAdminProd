@@ -26,6 +26,27 @@ from smc.elements.service import TCPService
 from smc.policy.layer3 import FirewallPolicy
 from smc.policy.rule_elements import Action, LogOptions
 
+# SMC raises specific exception types we want to distinguish (NotFound is an
+# idempotent "already gone", everything else is a real failure). Names have
+# been stable across the smc-python versions we support; fall back to a
+# string-pattern check if the import shape changes.
+try:
+    from smc.api.exceptions import ElementNotFound  # type: ignore[attr-defined]
+except ImportError:                                  # pragma: no cover
+    ElementNotFound = type("ElementNotFound", (Exception,), {})
+
+
+def _is_not_found(exc: Exception) -> bool:
+    """True if ``exc`` is the SMC 'element not found' shape.
+
+    Defensive: covers the typed exception above and the fallback case where
+    smc-python wrapped a 404 into a generic exception with a known message.
+    """
+    if isinstance(exc, ElementNotFound):
+        return True
+    msg = str(exc).lower()
+    return ("not found" in msg or "404" in msg or "no such element" in msg)
+
 from webapp.smc_tls_client import (
     SMCConfig, smc_session, smc_error_detail, get_engine_active_policy,
 )
@@ -47,21 +68,47 @@ __all__ = [
     "find_active_policy", "find_ssh_access_rule",
     "add_ssh_access_rule", "remove_ssh_access_rule",
     "policy_upload",
+    "update_source_host_address", "add_source_host_to_rule",
 ]
 
 
 # ── MAC marker: round-trip MAC through Host.comment ────────────────────────
 
-# The marker lives on its own line at the end of the comment. Anything before
-# it is treated as the operator's free-form notes and preserved on update.
-MAC_MARKER_RE = re.compile(r"\[flexedge:mac=([0-9a-fA-F:.\-]{11,17})\]")
+# Matches `[flexedge:mac=...]` (case-insensitive prefix, optional internal
+# whitespace, MAC body in any common separator form). The MAC body itself
+# is loose — `normalize_mac` is the strict gate. `IGNORECASE` covers operators
+# who pasted from a template that uppercased the marker prefix.
+MAC_MARKER_RE = re.compile(
+    r"\[\s*flexedge\s*:\s*mac\s*=\s*([0-9a-fA-F:.\-]{11,17})\s*\]",
+    re.IGNORECASE,
+)
 
 
 def normalize_mac(mac: str) -> str:
     """Normalise to lowercase colon-separated form (aa:bb:cc:dd:ee:ff).
 
-    Accepts `-`, `.`, or `:` separators and any case.
-    Raises ValueError if the input does not parse as a 48-bit MAC.
+    Accepted input formats (case-insensitive, separators are stripped
+    via a single hex-only regex pass — anything non-hex between 12 hex
+    digits is fine):
+
+      - colon-separated:    ``aa:bb:cc:dd:ee:ff`` / ``AA:BB:CC:DD:EE:FF``
+      - dash-separated:     ``aa-bb-cc-dd-ee-ff`` / ``AA-BB-CC-DD-EE-FF``
+      - Cisco dotted-quad:  ``aabb.ccdd.eeff``    / ``AABB.CCDD.EEFF``
+      - bare hex (no sep):  ``aabbccddeeff``      / ``AABBCCDDEEFF``
+      - mixed weirdness:    ``aa.bb-cc:dd ee ff`` (still works — separators
+                             are stripped before length is checked)
+
+    Raises ``ValueError`` if the input does not contain exactly 12 hex
+    digits after non-hex characters are stripped. Rejected examples:
+
+      - ``11:22:33:44:55``        — only 5 octets (10 hex digits)
+      - ``aa:bb:cc:dd:ee:ff:11``  — 7 octets (14 hex digits)
+      - ``GG:HH:II:JJ:KK:LL``     — non-hex characters
+      - ``""`` or ``None``        — empty input
+
+    Output is always lowercase colon form, suitable for use in the
+    FlexEdge MAC marker (`[flexedge:mac=...]`) and in ISC dhcpd
+    ``hardware ethernet`` directives.
     """
     hex_only = re.sub(r"[^0-9a-fA-F]", "", mac or "")
     if len(hex_only) != 12:
@@ -78,14 +125,40 @@ def is_valid_mac(mac: str) -> bool:
         return False
 
 
+def _strip_markers(text: str) -> str:
+    """Remove every flexedge marker (MAC + audit) and clean up whitespace
+    artefacts left behind (double spaces, consecutive blank lines,
+    trailing whitespace).
+    """
+    cleaned = MAC_MARKER_RE.sub("", text or "")
+    # Also strip the Q21 audit marker so the operator-visible comment
+    # stays clean. Coexists with the MAC marker — both are safe to
+    # strip together.
+    try:
+        from webapp.smc_audit_marker import _AUDIT_MARKER_RE  # type: ignore
+        cleaned = _AUDIT_MARKER_RE.sub("", cleaned)
+    except Exception:
+        # smc_audit_marker is webapp-only; smc_dhcp_client is also webapp,
+        # so this should always import. Defensive fallback if it ever moves.
+        pass
+    # Marker mid-line leaves an artefact (e.g. "foo [marker] bar" → "foo  bar").
+    # Compress runs of horizontal whitespace down to one space, trim line
+    # ends, and collapse blank-line runs.
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.rstrip()
+
+
 def pack_mac_into_comment(user_comment: str, mac: str) -> str:
     """Produce a Host.comment that carries the MAC alongside operator notes.
 
-    The existing `[flexedge:mac=...]` marker (if any) is stripped before the
-    new one is appended, so callers can use this as idempotent "set MAC".
+    Every existing `[flexedge:mac=...]` marker is stripped before the new
+    one is appended — even if the operator left a malformed or duplicate
+    marker behind. Callers can use this as idempotent "set MAC".
     """
     mac_norm = normalize_mac(mac)
-    base = MAC_MARKER_RE.sub("", user_comment or "").rstrip()
+    base = _strip_markers(user_comment or "")
     if base:
         return f"{base}\n[flexedge:mac={mac_norm}]"
     return f"[flexedge:mac={mac_norm}]"
@@ -94,18 +167,43 @@ def pack_mac_into_comment(user_comment: str, mac: str) -> str:
 def unpack_mac_from_comment(comment: str) -> tuple[str, str | None]:
     """Split a Host.comment into (user_comment_without_marker, mac_or_None).
 
-    MAC is returned normalised, or None if no marker is present.
+    MAC is returned normalised, or None if no usable marker is present.
+
+    Edge cases (logged at WARNING so operators can find them in the log):
+      - Multiple markers: the LAST one wins (most recently set). Earlier
+        markers are dropped so they don't survive a round-trip silently.
+      - Malformed MAC inside a syntactically valid marker: the marker is
+        stripped from the returned user_comment AND mac is returned as
+        None — i.e. the bad marker can't survive a future update either.
+      - No marker: pass-through with mac=None.
     """
     if not comment:
         return "", None
-    match = MAC_MARKER_RE.search(comment)
-    if not match:
+    matches = MAC_MARKER_RE.findall(comment)
+    if not matches:
         return comment, None
+
+    if len(matches) > 1:
+        logger.warning(
+            "Host comment contained %d FlexEdge MAC markers; using the "
+            "last one and stripping the rest. Earlier candidates: %r",
+            len(matches), matches[:-1],
+        )
+
+    last_raw = matches[-1]
+    mac_norm: str | None = None
     try:
-        mac_norm = normalize_mac(match.group(1))
+        mac_norm = normalize_mac(last_raw)
     except ValueError:
-        return comment, None
-    cleaned = MAC_MARKER_RE.sub("", comment).rstrip()
+        logger.warning(
+            "Malformed MAC inside FlexEdge marker — discarding marker. "
+            "Raw value was %r; full comment first 120 chars: %r",
+            last_raw, (comment or "")[:120],
+        )
+
+    # Always strip ALL markers from the returned user_comment, valid or not,
+    # so a malformed marker doesn't survive into a re-pack as user-text.
+    cleaned = _strip_markers(comment)
     return cleaned, mac_norm
 
 
@@ -202,24 +300,179 @@ def _find_level_dhcp(level_payload: dict) -> tuple[dict, str, str] | None:
     return None
 
 
+def _split_inline_range(value: str) -> tuple[str, str]:
+    """Parse an inline 'start-end' string. Returns ('', '') if it's not
+    that shape (e.g. an element name like 'GUYFW-DHCP-Pool')."""
+    if isinstance(value, str) and "-" in value:
+        # Heuristic: an inline range looks like A.B.C.D-A.B.C.E (two
+        # IP-shaped halves around the dash). Anything else is treated as
+        # an element name to be resolved.
+        parts = [p.strip() for p in value.split("-", 1)]
+        if len(parts) == 2 and all(p.count(".") == 3 and p.replace(".", "").isdigit()
+                                   for p in parts):
+            return parts[0], parts[1]
+    return "", ""
+
+
+def _resolve_address_range_element(ref) -> tuple[str, str]:
+    """Resolve a reference to an SMC Address-Range element to (start, end).
+
+    SMC stores DHCP pools in two ways:
+      * Inline string: "10.1.1.100-10.1.1.200" (most common)
+      * Reference to a network element of type AddressRange — the field
+        carries either an href (full URL) or the element name.
+
+    This helper handles the second case. Caller MUST already be inside
+    `smc_session(cfg)`.
+    """
+    if not ref:
+        return "", ""
+    try:
+        from smc.elements.network import AddressRange
+        ar = None
+        if isinstance(ref, str):
+            if ref.startswith("http"):
+                # href form — fetch via from_href
+                ar = AddressRange.from_href(ref)
+            else:
+                # name form — look it up by name
+                ar = AddressRange(ref)
+        elif isinstance(ref, dict):
+            # Some SMC payloads embed the element with name + href fields
+            href = ref.get("href")
+            name = ref.get("name")
+            if href:
+                ar = AddressRange.from_href(href)
+            elif name:
+                ar = AddressRange(name)
+        if ar is None:
+            return "", ""
+        ip_range = ""
+        try:
+            ip_range = ar.data.get("ip_range", "") or ""
+        except Exception:
+            ip_range = getattr(ar, "ip_range", "") or ""
+        return _split_inline_range(ip_range)
+    except Exception as exc:
+        logger.warning("AddressRange lookup failed for %r: %s", ref, exc)
+        return "", ""
+
+
+def _resolve_pool_range(level_payload: dict, dhcp_cfg: dict) -> tuple[str, str]:
+    """Resolve a DHCP pool start/end from any of the SMC payload shapes.
+
+    Order of attempts:
+      1. ``dhcp_range_per_node`` list (per-node inline ranges).
+      2. Top-level ``dhcp_address_range`` string in inline ``start-end`` form.
+      3. Element references (``dhcp_address_range_ref``,
+         ``address_range_ref``, or ``dhcp_address_range`` carrying an
+         element name instead of an inline range) → resolve via
+         AddressRange element fetch.
+
+    Returns ('', '') if no shape matches — the scope is recorded with an
+    empty pool and the operator gets a "missing pool" hint in the UI.
+    """
+    # Shape 1: per-node ranges
+    ranges = (level_payload.get("dhcp_range_per_node")
+              or dhcp_cfg.get("dhcp_range_per_node")
+              or [])
+    if ranges:
+        first = ranges[0]
+        if isinstance(first, dict):
+            inline = first.get("dhcp_address_range", "") or ""
+            s, e = _split_inline_range(inline)
+            if s:
+                return s, e
+            # Per-node entry might also reference an element
+            for k in ("dhcp_address_range_ref", "address_range_ref",
+                      "address_range"):
+                if first.get(k):
+                    s, e = _resolve_address_range_element(first[k])
+                    if s:
+                        return s, e
+            # Some payloads store the element name in dhcp_address_range
+            # itself when it's not an inline string
+            if inline and not first.get("dhcp_address_range_ref"):
+                s, e = _resolve_address_range_element(inline)
+                if s:
+                    return s, e
+        else:
+            s, e = _split_inline_range(str(first))
+            if s:
+                return s, e
+
+    # Shape 2: top-level inline string
+    raw = dhcp_cfg.get("dhcp_address_range", "")
+    s, e = _split_inline_range(raw)
+    if s:
+        return s, e
+
+    # Shape 3: explicit element reference fields. SMC uses different names
+    # across versions / engine kinds:
+    #   * `dhcp_range_ref`        — observed on Forcepoint NGFW 7.1 (e.g.
+    #     "https://.../elements/address_range/50995"). The pool is an
+    #     AddressRange network element, the inline `dhcp_address_range`
+    #     and `dhcp_range_per_node` fields stay empty.
+    #   * `dhcp_address_range_ref` / `address_range_ref` — older shapes
+    #     seen on different SMC builds. Kept for safety.
+    for key in ("dhcp_range_ref", "dhcp_address_range_ref", "address_range_ref"):
+        ref = dhcp_cfg.get(key)
+        if ref:
+            s, e = _resolve_address_range_element(ref)
+            if s:
+                return s, e
+
+    # Shape 3b: dhcp_address_range carrying an element name (no inline dash
+    # OR a single token that isn't an IP). Try resolving as an AddressRange.
+    if isinstance(raw, str) and raw and not _looks_like_ip(raw):
+        s, e = _resolve_address_range_element(raw)
+        if s:
+            return s, e
+
+    return "", ""
+
+
+def _looks_like_ip(s: str) -> bool:
+    if not isinstance(s, str):
+        return False
+    parts = s.split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
 def _build_scope(engine_name: str, iface_id: str,
                  level_payload: dict, dhcp_cfg: dict,
                  address: str, network: str) -> DhcpScopeInfo:
     """Construct a DhcpScopeInfo from a resolved DHCP-active interface level."""
-    pool_start = ""
-    pool_end = ""
-    # Pool can be at the top (older shape) or inside dhcp_cfg (newer shape)
-    ranges = (level_payload.get("dhcp_range_per_node")
-              or dhcp_cfg.get("dhcp_range_per_node")
-              or [])
-    single_range = dhcp_cfg.get("dhcp_address_range", "")
-    if ranges:
-        first = ranges[0] if ranges else {}
-        pool_range = first.get("dhcp_address_range", "") if isinstance(first, dict) else str(first)
-        if "-" in pool_range:
-            pool_start, pool_end = [p.strip() for p in pool_range.split("-", 1)]
-    elif "-" in single_range:
-        pool_start, pool_end = [p.strip() for p in single_range.split("-", 1)]
+    pool_start, pool_end = _resolve_pool_range(level_payload, dhcp_cfg)
+
+    # Diagnostic dump: log dhcp_cfg keys for every scope so we can see
+    # what shapes SMC sends across engines. Cheap (1 INFO line per scope
+    # at discovery time, not per request) and invaluable when a pool
+    # resolves to empty on a previously-unseen SMC field name.
+    def _safe_keys(obj):
+        try:
+            return sorted(str(k) for k in obj.keys())
+        except Exception:
+            return [type(obj).__name__]
+
+    logger.info(
+        "DHCP scope build %s/%s pool=%r-%r cfg_keys=%s top_keys=%s",
+        engine_name, iface_id, pool_start, pool_end,
+        _safe_keys(dhcp_cfg), _safe_keys(level_payload),
+    )
+    if not pool_start:
+        # If resolution failed, dump the actual cfg values too (one extra
+        # line per failed scope) so we can target the right field name.
+        try:
+            import json as _json
+            logger.warning(
+                "DHCP pool UNRESOLVED %s/%s — dhcp_cfg=%s",
+                engine_name, iface_id,
+                _json.dumps(dhcp_cfg, default=str)[:1500],
+            )
+        except Exception as exc:
+            logger.warning("DHCP pool unresolved %s/%s (and dump failed: %s)",
+                        engine_name, iface_id, exc)
 
     cidr = ""
     gateway = ""
@@ -310,26 +563,58 @@ def list_scopes_for_engine(engine_name: str) -> list[DhcpScopeInfo]:
     engine = Engine(engine_name)
     scopes: list[DhcpScopeInfo] = []
     visited = 0
+    failed = 0
     for phys in engine.physical_interface:
+        # Wrap EACH physical-interface iteration so a single bad payload
+        # doesn't abort the whole traversal silently. Without this guard
+        # we hit a real problem on 2026-04-30: GUYFW interface 2 walked
+        # cleanly, then interface 0's traversal raised partway through,
+        # the loop unwound, and the operator saw "0 scopes discovered"
+        # with no clue why.
         try:
-            data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
-        except Exception:
-            data = {}
-        visited += 1
-        got = _walk_interface(data, engine_name)
-        vlans = (data.get("vlanInterfaces") or data.get("vlan_interfaces") or [])
-        dhcp_here = _find_level_dhcp(data) is not None
-        logger.info(
-            "DHCP discovery: engine=%s interface_id=%s dhcp_here=%s vlan_count=%d scopes=%d",
-            engine_name,
-            data.get("interface_id"),
-            dhcp_here,
-            len(vlans),
-            len(got),
+            try:
+                data = phys.data.data if hasattr(phys.data, "data") else dict(phys.data)
+            except Exception:
+                data = {}
+            visited += 1
+            got = _walk_interface(data, engine_name)
+            vlans = (data.get("vlanInterfaces") or data.get("vlan_interfaces") or [])
+            dhcp_here = _find_level_dhcp(data) is not None
+            logger.info(
+                "DHCP discovery: engine=%s interface_id=%s dhcp_here=%s vlan_count=%d scopes=%d",
+                engine_name,
+                data.get("interface_id"),
+                dhcp_here,
+                len(vlans),
+                len(got),
+            )
+            scopes.extend(got)
+        except Exception as exc:
+            failed += 1
+            iface_id_hint = ""
+            try:
+                iface_id_hint = str(phys.data.get("interface_id"))
+            except Exception:
+                iface_id_hint = "?"
+            logger.exception(
+                "DHCP discovery: engine=%s interface_id=%s FAILED — skipping. %s",
+                engine_name, iface_id_hint, exc,
+            )
+    logger.info(
+        "DHCP discovery: engine=%s visited=%d total_scopes=%d failed_interfaces=%d",
+        engine_name, visited, len(scopes), failed,
+    )
+    # Q21 lazy registry population — register the engine once we've
+    # confirmed it exists. Best-effort, never raises.
+    try:
+        from shared.smc_registry import register_smc_object_seen
+        register_smc_object_seen(
+            None, smc_type="engine",
+            smc_href=engine.href, smc_name=engine.name,
+            managed_by_flexedge=False,
         )
-        scopes.extend(got)
-    logger.info("DHCP discovery: engine=%s visited=%d total_scopes=%d",
-                engine_name, visited, len(scopes))
+    except Exception:
+        pass
     return scopes
 
 
@@ -631,7 +916,18 @@ def host_get(name: str) -> DhcpHostView | None:
     try:
         host = Host(name)
         host.href  # force load; raises if missing
-        return _host_to_view(host)
+        view = _host_to_view(host)
+        # Q21 lazy registry population — best-effort, never raises.
+        try:
+            from shared.smc_registry import register_smc_object_seen
+            register_smc_object_seen(
+                None, smc_type="host",
+                smc_href=view.href, smc_name=view.name,
+                managed_by_flexedge=False,
+            )
+        except Exception:
+            pass
+        return view
     except Exception:
         return None
 
@@ -681,12 +977,30 @@ def host_update(name: str, *,
 
 
 def host_delete(name: str) -> bool:
+    """Delete an SMC Host. Idempotent on missing element.
+
+    Returns:
+      True  — Host existed and was successfully deleted.
+      False — Host did not exist (delete is a no-op; safe for callers that
+              just want to ensure the Host is gone).
+
+    Raises:
+      Whatever SMC raised for *real* failures (permission denied, locked,
+      delete-references-failed, network errors). Callers that want
+      best-effort cleanup should wrap in try/except and log; callers that
+      track DB state must NOT swallow these silently — a real failure
+      means the SMC Host is still present and a DB delete would orphan it.
+    """
     try:
         Host(name).delete()
         return True
     except Exception as exc:
-        logger.info("Host delete failed for %s: %s", name, smc_error_detail(exc))
-        return False
+        if _is_not_found(exc):
+            logger.info("Host %s already absent on delete (idempotent).", name)
+            return False
+        logger.warning("Host delete FAILED for %s (real error, NOT not-found): %s",
+                       name, smc_error_detail(exc))
+        raise
 
 
 def host_list_by_scope(subnet_cidr: str) -> list[DhcpHostView]:
@@ -696,6 +1010,10 @@ def host_list_by_scope(subnet_cidr: str) -> list[DhcpHostView]:
     subnet filtering on Host. This is fine for typical domain sizes
     (< a few thousand hosts); if it becomes a bottleneck, add a filter on
     the comment marker instead.
+
+    Per-host parse errors are logged at WARNING (not silently swallowed),
+    so a single corrupt Host record leaves a breadcrumb in the log instead
+    of silently dropping out of sync results.
     """
     try:
         net = ipaddress.ip_network(subnet_cidr, strict=False)
@@ -703,10 +1021,15 @@ def host_list_by_scope(subnet_cidr: str) -> list[DhcpHostView]:
         return []
 
     views: list[DhcpHostView] = []
+    skipped_with_error = 0
     for host in Host.objects.all():
         try:
             view = _host_to_view(host)
-        except Exception:
+        except Exception as exc:
+            skipped_with_error += 1
+            logger.warning("host_list_by_scope: failed to parse Host "
+                           "(name=%r): %s — skipping",
+                           getattr(host, "name", "?"), exc)
             continue
         if not view.address:
             continue
@@ -714,7 +1037,13 @@ def host_list_by_scope(subnet_cidr: str) -> list[DhcpHostView]:
             if ipaddress.ip_address(view.address) in net:
                 views.append(view)
         except ValueError:
+            logger.warning("host_list_by_scope: Host %s has invalid address %r — skipping",
+                           view.name, view.address)
             continue
+    if skipped_with_error:
+        logger.warning("host_list_by_scope: %d Host element(s) failed to parse "
+                       "for scope %s — DB sync may be incomplete.",
+                       skipped_with_error, subnet_cidr)
     return views
 
 
@@ -770,16 +1099,65 @@ def find_active_policy(engine_name: str) -> str:
 
 def find_ssh_access_rule(policy_name: str, rule_name: str) -> dict | None:
     """Locate our managed rule by exact name. Returns
-    {name, href, is_disabled, comment} or None if missing.
+    {name, href, is_disabled, comment, destination_names, sources, rule_obj}
+    or None if missing.
+
+    ``sources`` is a list of ``{name, address}`` dicts — the actual Host
+    element name AND its IPv4 address as currently configured in SMC.
+    Used by the install pre-flight to detect when the source Host's
+    address has drifted from what the operator currently expects.
+
+    ``rule_obj`` is the live SDK object so callers can re-assert state
+    (e.g. flip is_disabled back) without re-iterating.
+
+    All reads are best-effort: SDK shape varies between versions, so a
+    failure to walk one collection is logged at WARNING and the
+    corresponding field comes back empty rather than raising.
     """
     policy = FirewallPolicy(policy_name)
     for rule in policy.fw_ipv4_access_rules.all():
         if rule.name == rule_name:
+            dst_names: list[str] = []
+            try:
+                dests = rule.destinations.all() if hasattr(rule, "destinations") else []
+                for d in dests:
+                    n = getattr(d, "name", None) or str(d)
+                    if n:
+                        dst_names.append(n)
+            except Exception as exc:
+                logger.warning("find_ssh_access_rule: failed to read "
+                               "destinations of %s: %s", rule_name, exc)
+            # Sources need the IP address per element so the wizard can
+            # tell the operator "the rule allows source 1.2.3.4 but you
+            # picked 5.6.7.8 — choose Add or Overwrite". The Host's
+            # `.address` attribute is fetched lazily by the SDK; we're
+            # inside an smc_session so it resolves immediately.
+            sources_info: list[dict] = []
+            try:
+                src_iter = rule.sources.all() if hasattr(rule, "sources") else []
+                for s in src_iter:
+                    name = getattr(s, "name", None) or ""
+                    addr = ""
+                    try:
+                        a = getattr(s, "address", None)
+                        if a:
+                            addr = str(a)
+                    except Exception as inner_exc:
+                        logger.debug("find_ssh_access_rule: source %s "
+                                     "address lookup failed: %s",
+                                     name, inner_exc)
+                    sources_info.append({"name": name, "address": addr})
+            except Exception as exc:
+                logger.warning("find_ssh_access_rule: failed to read "
+                               "sources of %s: %s", rule_name, exc)
             return {
                 "name": rule.name,
                 "href": rule.href,
                 "is_disabled": rule.is_disabled,
                 "comment": rule.comment or "",
+                "destination_names": dst_names,
+                "sources": sources_info,
+                "rule_obj": rule,
             }
     return None
 
@@ -814,6 +1192,41 @@ def add_ssh_access_rule(policy_name: str, rule_name: str,
 
     existing = find_ssh_access_rule(policy_name, rule_name)
     if existing:
+        # Re-assert state on already-present rule (M1):
+        #   1. If disabled out of band, re-enable so the policy upload
+        #      actually opens the path.
+        #   2. If destinations don't match the requested set, warn — but
+        #      don't silently rewrite the rule (an operator may have
+        #      added/removed IPs deliberately).
+        if existing.get("is_disabled"):
+            try:
+                existing["rule_obj"].is_disabled = False
+                existing["rule_obj"].save()
+                logger.info("Re-enabled SSH access rule %s in policy %s "
+                            "(was disabled out of band).",
+                            rule_name, policy_name)
+            except Exception as exc:
+                logger.warning("Found rule %s disabled but could not re-enable "
+                               "it: %s — operator must enable manually.",
+                               rule_name, exc)
+
+        expected_dst_names = {f"{rule_name}-dst-{i}" for i in range(len(destination_ips))}
+        actual_dst_names = set(existing.get("destination_names") or [])
+        managed_actual = {n for n in actual_dst_names if n.startswith(f"{rule_name}-dst-")}
+        if managed_actual and managed_actual != expected_dst_names:
+            missing = expected_dst_names - managed_actual
+            extra = managed_actual - expected_dst_names
+            parts: list[str] = []
+            if missing:
+                parts.append(f"missing: {sorted(missing)}")
+            if extra:
+                parts.append(f"unexpected: {sorted(extra)}")
+            logger.warning(
+                "SSH access rule %s destinations drifted from the requested "
+                "set (%s). Operator review recommended — re-run install with "
+                "the desired IPs OR remove + reinstall to reset.",
+                rule_name, "; ".join(parts),
+            )
         return existing["href"]
 
     src_host = _ensure_host_for_ip(f"{rule_name}-src", source_ip)
@@ -894,3 +1307,131 @@ def policy_upload(engine_name: str, policy_name: str | None = None) -> str:
     if policy_name:
         return str(engine.upload(policy=policy_name))
     return str(engine.upload())
+
+
+# ── Source-IP drift handlers ────────────────────────────────────────────
+#
+# When the tenant's `flexedge_source_ip` changes, the existing rule's
+# source Host element no longer matches FEA's egress. Per operator spec,
+# we DO NOT create duplicate rules — we either:
+#   * OVERWRITE  — change the existing source Host's IP in place
+#   * ADD        — keep the existing source Host and add a new one
+#
+# Both paths leave the rule's name + href intact, so the
+# DhcpEngineSshAccess record stays in sync with one rule per engine.
+
+def update_source_host_address(rule_name: str, new_source_ip: str) -> str:
+    """OVERWRITE path: change the existing source Host's IP in place.
+
+    The canonical source Host is named ``<rule_name>-src``. We update
+    its ``address`` attribute and call ``update()`` so the same rule
+    now matches traffic from ``new_source_ip``. The rule itself is
+    untouched.
+
+    Falls back to ``-src-0`` for rules that may have been created with
+    the multi-source naming convention.
+
+    Returns the Host name that was updated. Raises if no source Host
+    can be found.
+    """
+    candidates = [f"{rule_name}-src", f"{rule_name}-src-0"]
+    for name in candidates:
+        try:
+            host = Host(name)
+            _ = host.address      # force a fetch to confirm the host exists
+            host.update(address=new_source_ip)
+            logger.info("Updated source Host %s → %s for rule %s",
+                        name, new_source_ip, rule_name)
+            return name
+        except Exception as exc:
+            if _is_not_found(exc):
+                continue
+            raise
+    raise RuntimeError(
+        f"Could not find a source Host for rule {rule_name!r}. "
+        f"Looked for {', '.join(candidates)}. The rule may have been "
+        f"created with a custom source element — fix manually in "
+        f"SMC Management Client."
+    )
+
+
+def add_source_host_to_rule(policy_name: str, rule_name: str,
+                            new_source_ip: str) -> str:
+    """ADD path: add a new source Host to the existing rule's sources.
+
+    The rule keeps all its current sources AND gets the new one. Useful
+    during a transition where both old and new FEA source IPs should be
+    allowed simultaneously (e.g. NAT cutover).
+
+    The new Host is named ``<rule_name>-src-<N>`` where N is the next
+    free index, so re-clicking with the same source IP would create
+    another entry — operators are expected to ADD only when explicitly
+    rotating, not as a routine.
+
+    Returns the new Host name. Raises if the rule isn't found, or if
+    smc-python rejects the source-list update.
+    """
+    policy = FirewallPolicy(policy_name)
+    target = None
+    for rule in policy.fw_ipv4_access_rules.all():
+        if rule.name == rule_name:
+            target = rule
+            break
+    if target is None:
+        raise RuntimeError(
+            f"Rule {rule_name!r} not found in policy {policy_name!r}"
+        )
+
+    # Pick the next free `-src-<N>` index. Bounded loop to refuse
+    # runaway accumulation if the operator clicks ADD many times.
+    next_idx = 0
+    while next_idx < 32:
+        candidate = f"{rule_name}-src-{next_idx}"
+        try:
+            existing = Host(candidate)
+            _ = existing.address
+            next_idx += 1
+        except Exception as exc:
+            if _is_not_found(exc):
+                break
+            raise
+    if next_idx >= 32:
+        raise RuntimeError(
+            f"Already 32+ source Hosts on rule {rule_name!r}. "
+            f"This looks wrong — review the rule manually in SMC GUI."
+        )
+
+    new_host_name = f"{rule_name}-src-{next_idx}"
+    Host.create(name=new_host_name, address=new_source_ip)
+    new_host = Host(new_host_name)
+
+    # Read current sources, append, write back. smc-python rule
+    # mutation is version-sensitive — try the most-compatible shape
+    # first, then fall back, then clean up the orphan Host on full failure.
+    try:
+        existing_sources = list(target.sources.all())
+    except Exception:
+        existing_sources = []
+    new_sources = existing_sources + [new_host]
+
+    try:
+        target.update(sources={"src": [s.href for s in new_sources]})
+    except Exception as exc1:
+        try:
+            target.sources = new_sources
+            target.update()
+        except Exception as exc2:
+            try:
+                Host(new_host_name).delete()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Could not add source to rule {rule_name!r}: "
+                f"primary attempt: {exc1}; fallback: {exc2}. "
+                f"The new Host element has been cleaned up. "
+                f"Add the source manually in SMC GUI if needed."
+            ) from exc2
+
+    logger.info("Added source Host %s (%s) to rule %s in policy %s",
+                new_host_name, new_source_ip, rule_name, policy_name)
+    return new_host_name

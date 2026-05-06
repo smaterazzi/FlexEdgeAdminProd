@@ -9,9 +9,16 @@
             <li class="breadcrumb-item active">Users</li>
         </ol>
     </nav>
-    <a href="{{ url_for('admin.user_new') }}" class="btn btn-primary btn-sm">
-        <i class="bi bi-plus-circle me-1"></i>Add User
-    </a>
+    <div class="d-flex gap-2">
+        {% if is_domain_admin %}
+        <a href="{{ url_for('admin.invite_operator') }}" class="btn btn-outline-info btn-sm">
+            <i class="bi bi-person-plus me-1"></i>Invite Operator
+        </a>
+        {% endif %}
+        <a href="{{ url_for('admin.user_new') }}" class="btn btn-primary btn-sm">
+            <i class="bi bi-plus-circle me-1"></i>Add User
+        </a>
+    </div>
 </div>
 
 <div class="p-4">
@@ -31,7 +38,7 @@
                     <th>Email</th>
                     <th>Display Name</th>
                     <th>Role</th>
-                    <th>Tenant Access</th>
+                    <th>Domain Access</th>
                     <th>Status</th>
                     <th style="width:140px;">Actions</th>
                 </tr>
@@ -49,8 +56,13 @@
                         {% endif %}
                     </td>
                     <td>
-                        {% for access in u.tenant_accesses %}
-                        <span class="badge bg-secondary me-1">{{ access.tenant.name }}</span>
+                        {% for access in u.domain_accesses %}
+                        {% if access.domain %}
+                        <span class="badge {% if access.is_default %}bg-info{% else %}bg-secondary{% endif %} me-1"
+                              title="slug: {{ access.domain.slug }}{% if access.is_default %} (default){% endif %}">
+                            {{ access.domain.display_name }}{% if access.is_default %} <i class="bi bi-star-fill" style="font-size:0.65rem;"></i>{% endif %}
+                        </span>
+                        {% endif %}
                         {% else %}
                         <span class="text-muted" style="font-size:0.8rem;">None</span>
                         {% endfor %}
@@ -69,6 +81,7 @@
                         {% if u.is_active %}
                         <form method="POST" action="{{ url_for('admin.user_delete', id=u.id) }}" class="d-inline"
                               onsubmit="return confirm('Deactivate user {{ u.email }}?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
                                 <i class="bi bi-trash"></i>
                             </button>

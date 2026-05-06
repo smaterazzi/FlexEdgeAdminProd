@@ -3,7 +3,20 @@
 
 {% block content %}
 <div class="p-4">
-<h2 class="mb-4"><i class="bi bi-journal-text"></i> Activity Log</h2>
+<div class="d-flex justify-content-between align-items-center mb-4">
+  <h2 class="mb-0"><i class="bi bi-journal-text"></i> Activity Log</h2>
+  <form method="post" action="{{ url_for('dhcp.system_sweep_logs') }}"
+        class="d-flex align-items-center gap-2"
+        onsubmit="return confirm('Delete activity / deployment rows older than the chosen retention window? Phase 0 validation rows are always preserved.');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label class="small text-muted mb-0">Retention (days):</label>
+    <input type="number" name="retention_days" value="90" min="1" max="3650"
+           class="form-control form-control-sm" style="width:6rem;">
+    <button class="btn btn-sm btn-outline-warning" title="Delete rows older than the retention cutoff">
+      <i class="bi bi-trash"></i> Sweep old
+    </button>
+  </form>
+</div>
 
 {% if logs %}
 <div class="card">

@@ -244,22 +244,31 @@ def register_routes(app):
 
     @sock.route("/engines/nodes/<int:cred_id>/ws", endpoint="engines.node_terminal_ws")
     def node_terminal_ws(ws, cred_id: int):
+        log.info("[term-ws] entering handler cred_id=%s", cred_id)
         if "user" not in flask_session:
+            log.warning("[term-ws] no user in session — closing 4401")
             ws.close(reason=4401, message="not authenticated")
             return
         email = (flask_session["user"].get("email") or "").lower()
         if not _is_admin(email):
+            log.warning("[term-ws] %s not admin — closing 4403", email)
             ws.close(reason=4403, message="admin role required")
             return
 
         cred = db.session.get(DhcpEngineCredential, cred_id)
         if cred is None:
+            log.warning("[term-ws] cred %s not found — closing 4404", cred_id)
             ws.close(reason=4404, message="credential not found")
             return
         if cred.last_verify_status != "ok":
+            log.warning("[term-ws] cred %s status=%s — closing 4424",
+                        cred_id, cred.last_verify_status)
             ws.close(reason=4424,
                      message="credential not verified — re-enroll in /dhcp/credentials")
             return
+
+        log.info("[term-ws] auth ok for %s → %s/node_id=%s host=%s:%s",
+                 email, cred.engine_name, cred.node_id, cred.hostname, cred.ssh_port)
 
         # Enforce one session per user
         _evict_existing_session(email)
@@ -277,15 +286,18 @@ def register_routes(app):
         )
         db.session.add(audit)
         db.session.commit()
+        log.info("[term-ws] audit row %s created", audit.id)
 
         bridge = TerminalBridge(ws, cred, email, audit, source_ip)
         with _sessions_lock:
             _active_by_user[email] = bridge
 
         try:
+            log.info("[term-ws] calling open_ssh() → %s:%s", cred.hostname, cred.ssh_port or 22)
             bridge.open_ssh()
+            log.info("[term-ws] open_ssh() returned — entering bridge loop")
         except Exception as exc:
-            log.warning("SSH connect failed for %s/%s: %s",
+            log.warning("[term-ws] SSH connect failed for %s/%s: %s",
                         cred.engine_name, cred.node_id, exc)
             try:
                 ws.send(f"\r\n*** SSH connection failed: {exc} ***\r\n")
@@ -295,3 +307,4 @@ def register_routes(app):
             return
 
         bridge.run()
+        log.info("[term-ws] bridge loop ended for cred_id=%s", cred_id)

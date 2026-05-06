@@ -16,16 +16,24 @@
     <i class="bi bi-diagram-3"></i>
     <code>{{ scope.subnet_cidr }}</code>
     <small class="text-muted">on {{ scope.engine_name }} / interface {{ scope.interface_id }}</small>
+    {% if bypass_active('dhcp_reservation') %}
+    <span class="badge bg-info text-dark align-middle ms-2"
+          title="Reservation create / edit / delete on this scope will commit immediately to SMC (bypass queue mode). Audit log records the action; no queue review.">
+      <i class="bi bi-fast-forward"></i> Bypass active
+    </span>
+    {% endif %}
   </h2>
   <div>
     {% if scope.enabled_in_flexedge %}
       <span class="badge bg-success align-middle me-2">Enabled</span>
       <form method="post" action="{{ url_for('dhcp.scope_disable', scope_id=scope.id) }}" class="d-inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="btn btn-sm btn-outline-secondary">Disable</button>
       </form>
     {% else %}
       <span class="badge bg-secondary align-middle me-2">Disabled</span>
       <form method="post" action="{{ url_for('dhcp.scope_enable', scope_id=scope.id) }}" class="d-inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         <button class="btn btn-sm btn-success">Enable</button>
       </form>
     {% endif %}
@@ -70,17 +78,28 @@
       <i class="bi bi-clipboard-data"></i> View leases
     </a>
     <form method="post" action="{{ url_for('dhcp.scope_sync_hosts', scope_id=scope.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button class="btn btn-outline-secondary" title="Reconcile with SMC Host elements">
         <i class="bi bi-arrow-clockwise"></i> Sync from SMC
       </button>
     </form>
-    <form method="post" action="{{ url_for('dhcp.scope_deploy', scope_id=scope.id) }}" class="d-inline">
-      <button class="btn btn-warning" title="Phase 4 pending — logs intent only">
+    <form method="post" action="{{ url_for('dhcp.scope_preview', scope_id=scope.id) }}" class="d-inline">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-outline-info" title="Read the current file from each node and show the diff that a Deploy would write — but write nothing.">
+        <i class="bi bi-eye"></i> Preview
+      </button>
+    </form>
+    <form method="post" action="{{ url_for('dhcp.scope_deploy', scope_id=scope.id) }}" class="d-inline"
+          onsubmit="return confirm('Push this scope\'s reservations to every cluster node and signal the dhcpd to reload? Click Cancel and use Preview to see the diff first.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-warning" title="Write reservations to /data/config/base/dhcp-server.conf on every node">
         <i class="bi bi-rocket-takeoff"></i> Deploy to engine
       </button>
     </form>
-    <form method="post" action="{{ url_for('dhcp.scope_resync', scope_id=scope.id) }}" class="d-inline">
-      <button class="btn btn-outline-warning" title="Manual re-sync — Phase 4 pending">
+    <form method="post" action="{{ url_for('dhcp.scope_resync', scope_id=scope.id) }}" class="d-inline"
+          onsubmit="return confirm('Re-apply the same reservations to every cluster node? Use this after an SMC policy upload to restore the FlexEdge block if the engine recreated dhcp-server.conf.');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-outline-warning" title="Re-apply reservations after an SMC policy upload">
         <i class="bi bi-arrow-repeat"></i> Re-sync
       </button>
     </form>
@@ -94,18 +113,72 @@
 <div class="card mb-4">
   <div class="card-header"><h5 class="mb-0">Reservations</h5></div>
   {% if reservations %}
+  {# Bulk-action bar — checkboxes in the table below are associated via
+     HTML5 `form="bulk-form"` so the per-row Delete forms inside <td>
+     stay independent (no nested forms, no formaction tricks). #}
+  <form method="post" id="bulk-form"
+        action="{{ url_for('dhcp.reservations_bulk_delete', scope_id=scope.id) }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="d-flex align-items-center gap-3 px-3 py-2 border-bottom">
+      <span class="small text-muted" id="bulk-count">0 selected</span>
+      <label class="form-check form-check-inline small text-muted mb-0">
+        <input type="checkbox" name="delete_host" value="1" class="form-check-input"
+               form="bulk-form">
+        also delete SMC Host elements
+      </label>
+      <button type="submit" id="bulk-delete-btn"
+              class="btn btn-sm btn-outline-danger ms-auto" disabled>
+        <i class="bi bi-trash"></i> Delete selected
+      </button>
+    </div>
+  </form>
   <div class="table-responsive">
     <table class="table table-hover mb-0">
       <thead>
         <tr>
+          <th style="width:32px;" class="text-center">
+            <input type="checkbox" id="bulk-select-all"
+                   class="form-check-input"
+                   title="Select / deselect all on this page">
+          </th>
           <th>Name</th><th>IP</th><th>MAC</th><th>Status</th><th>Last synced</th><th></th>
         </tr>
       </thead>
       <tbody>
         {% for r in reservations %}
-        <tr>
+        {% set _tbd = is_smc_to_be_deleted(r.smc_host_href) or is_smc_to_be_deleted(r.smc_host_name) %}
+        {% set _drift = smc_drift_state(r.smc_host_href) or smc_drift_state(r.smc_host_name) %}
+        <tr {% if _tbd %}class="smc-to-be-deleted"{% endif %}>
+          <td class="text-center">
+            {# `form="bulk-form"` ties this checkbox to the bulk form ABOVE
+               the table. The per-row delete form below stays independent. #}
+            <input type="checkbox" class="form-check-input bulk-select-row"
+                   name="reservation_id" value="{{ r.id }}"
+                   form="bulk-form">
+          </td>
           <td>
             <strong>{{ r.smc_host_name }}</strong>
+            {% if _tbd %}
+            <span class="badge-to-be-deleted"
+                  title="Delete queued — awaiting Global Admin confirm. Visit Change Queue to confirm or revoke.">
+              <i class="bi bi-trash"></i> to be deleted
+            </span>
+            {% endif %}
+            {% if _drift == 'drifted' %}
+            <a href="{{ url_for('changes.drift_index') }}"
+               class="badge bg-warning text-dark text-decoration-none ms-1"
+               style="font-size:0.65rem;font-weight:normal;"
+               title="This SMC element has been modified outside FlexEdgeAdmin. Click to review drift.">
+              <i class="bi bi-binoculars"></i> drifted
+            </a>
+            {% elif _drift == 'gone' %}
+            <a href="{{ url_for('changes.drift_index') }}"
+               class="badge bg-danger text-decoration-none ms-1"
+               style="font-size:0.65rem;font-weight:normal;"
+               title="This SMC element no longer exists in SMC. Click to review.">
+              <i class="bi bi-x-circle"></i> gone from SMC
+            </a>
+            {% endif %}
             {% if r.source and r.source.startswith('migration:') %}
             <span class="badge bg-secondary ms-1"
                   style="font-size:0.65rem;font-weight:normal;"
@@ -123,6 +196,16 @@
               <span class="badge bg-warning text-dark">out-of-sync</span>
             {% elif r.status == 'pending' %}
               <span class="badge bg-info text-dark">pending</span>
+            {% elif r.status == 'queued' %}
+              <span class="badge bg-secondary"
+                    title="Submitted to the Change Queue. Operators must visit /changes/ to push; admins auto-push.">
+                <i class="bi bi-hourglass-split"></i> queued
+              </span>
+            {% elif r.status == 'push_failed' %}
+              <span class="badge bg-danger"
+                    title="{{ r.last_error }}">
+                <i class="bi bi-exclamation-triangle-fill"></i> push failed
+              </span>
             {% elif r.status == 'error' %}
               <span class="badge bg-danger" title="{{ r.last_error }}">error</span>
             {% else %}
@@ -133,6 +216,16 @@
             {{ r.last_synced_at.strftime('%Y-%m-%d %H:%M') if r.last_synced_at else '—' }}
           </td>
           <td>
+            {% if r.status == 'push_failed' %}
+            <form method="post" action="{{ url_for('dhcp.reservation_retry_push', reservation_id=r.id) }}"
+                  class="d-inline">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+              <button class="btn btn-sm btn-outline-warning"
+                      title="Retry push: {{ r.last_error[:120] }}">
+                <i class="bi bi-arrow-clockwise"></i> Retry
+              </button>
+            </form>
+            {% endif %}
             <a href="{{ url_for('dhcp.reservation_edit', reservation_id=r.id) }}"
                class="btn btn-sm btn-outline-primary">
               <i class="bi bi-pencil"></i>
@@ -140,6 +233,7 @@
             <form method="post" action="{{ url_for('dhcp.reservation_delete', reservation_id=r.id) }}"
                   class="d-inline"
                   onsubmit="return confirm('Delete reservation {{ r.smc_host_name }}?\\nNote: this also deletes the Host object in SMC if the checkbox is set.');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <label class="form-check form-check-inline small text-muted me-1">
                 <input type="checkbox" name="delete_host" value="1" class="form-check-input"> delete Host too
               </label>
@@ -147,6 +241,14 @@
             </form>
           </td>
         </tr>
+        {% if r.status == 'push_failed' and r.last_error %}
+        <tr class="bg-danger bg-opacity-10">
+          <td colspan="7" class="small text-danger py-1 px-3">
+            <i class="bi bi-exclamation-triangle"></i>
+            <strong>SMC error:</strong> {{ r.last_error }}
+          </td>
+        </tr>
+        {% endif %}
         {% endfor %}
       </tbody>
     </table>
@@ -185,7 +287,14 @@
           </td>
           <td>{{ d.reservations_count }}</td>
           <td class="small">{{ d.duration_ms }} ms</td>
-          <td class="small text-truncate" style="max-width:280px" title="{{ d.error }}">{{ d.error }}</td>
+          <td class="small text-truncate" style="max-width:280px"
+              title="{% if d.error %}ERROR: {{ d.error }}{% endif %}{% if d.error and d.reload_warning %}&#10;{% endif %}{% if d.reload_warning %}RELOAD WARNING: {{ d.reload_warning }}{% endif %}">
+            {% if d.error %}<span class="text-danger">{{ d.error }}</span>{% endif %}
+            {% if d.reload_warning %}
+              {% if d.error %}<br>{% endif %}
+              <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> {{ d.reload_warning }}</span>
+            {% endif %}
+          </td>
         </tr>
         {% endfor %}
       </tbody>
@@ -195,4 +304,49 @@
 {% endif %}
 
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script>
+(function () {
+    // ── Bulk-delete UI: select-all toggle + selection count + confirm ──
+    const selectAll  = document.getElementById('bulk-select-all');
+    const rowChecks  = document.querySelectorAll('.bulk-select-row');
+    const countEl    = document.getElementById('bulk-count');
+    const deleteBtn  = document.getElementById('bulk-delete-btn');
+    const bulkForm   = document.getElementById('bulk-form');
+    if (!selectAll || !deleteBtn || !bulkForm) return;
+
+    function refresh() {
+        const checked = Array.from(rowChecks).filter(c => c.checked);
+        countEl.textContent = checked.length + ' selected';
+        deleteBtn.disabled = checked.length === 0;
+        // tri-state-ish header: checked when all, unchecked when none
+        const total = rowChecks.length;
+        selectAll.checked = (checked.length > 0 && checked.length === total);
+        selectAll.indeterminate = (checked.length > 0 && checked.length < total);
+    }
+
+    selectAll.addEventListener('change', () => {
+        rowChecks.forEach(c => { c.checked = selectAll.checked; });
+        refresh();
+    });
+    rowChecks.forEach(c => c.addEventListener('change', refresh));
+
+    bulkForm.addEventListener('submit', (ev) => {
+        const checked = Array.from(rowChecks).filter(c => c.checked);
+        if (checked.length === 0) {
+            ev.preventDefault();
+            return;
+        }
+        const alsoHost = bulkForm.querySelector('input[name="delete_host"]').checked;
+        const msg = alsoHost
+            ? `Delete ${checked.length} reservation(s) AND remove their SMC Host elements?`
+            : `Delete ${checked.length} reservation(s)? SMC Host elements will be left in place.`;
+        if (!confirm(msg)) ev.preventDefault();
+    });
+
+    refresh();
+})();
+</script>
 {% endblock %}

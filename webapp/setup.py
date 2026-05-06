@@ -39,11 +39,18 @@ def setup():
         email = user_info["email"].lower().strip()
         display_name = user_info.get("name", email)
 
-        # Create the admin user
+        # Create the bootstrap user.
+        # is_super_admin=True flags this user as the platform's Super Admin
+        # per the four-tier role model (Change Management Q10, refined
+        # 2026-05-01) — they see every Domain (including ones added later)
+        # and are the only role allowed cross-Domain infrastructure ops
+        # (Tenant / API Key / Domain CRUD).
+        # role='admin' kept for legacy compat with `user_manager.is_admin()`.
         admin = User(
             email=email,
             display_name=display_name,
             role="admin",
+            is_super_admin=True,
             is_active=True,
         )
         db.session.add(admin)
@@ -52,8 +59,8 @@ def setup():
         # Mark setup as complete
         current_app.config["SETUP_REQUIRED"] = False
 
-        log.info("Setup complete — admin user created: %s", email)
-        flash(f"Welcome, {display_name}! Your admin account has been created.", "success")
+        log.info("Setup complete — Super Admin created: %s", email)
+        flash(f"Welcome, {display_name}! Your Super Admin account has been created.", "success")
         return redirect(url_for("admin.dashboard"))
 
     return render_template("admin/setup.html", user=user_info)

@@ -62,7 +62,12 @@ class DeployResult:
 
 @contextmanager
 def smc_session(cfg: SMCConfig):
-    """Context manager for an authenticated SMC session."""
+    """Context manager for an authenticated SMC session.
+
+    Serialised by the process-wide SMC lock — see ``shared/smc_lock.py``.
+    """
+    from shared.smc_lock import smc_global_lock
+
     login_kwargs = {
         "url": cfg.url,
         "api_key": cfg.api_key,
@@ -75,14 +80,15 @@ def smc_session(cfg: SMCConfig):
     if cfg.api_version:
         login_kwargs["api_version"] = cfg.api_version
 
-    session.login(**login_kwargs)
-    try:
-        yield
-    finally:
+    with smc_global_lock():
+        session.login(**login_kwargs)
         try:
-            session.logout()
-        except Exception:
-            pass
+            yield
+        finally:
+            try:
+                session.logout()
+            except Exception:
+                pass
 
 
 def smc_error_detail(exc: Exception) -> str:
@@ -139,7 +145,12 @@ def list_domains(url: str, api_key: str, api_version: str = "",
     """
     Return {domains, domain_scoped, api_client_name, admin_domain_href,
             admin_domain_id, visible_engines}.
+
+    Holds the process-wide SMC lock for the whole login → query → logout
+    cycle so concurrent admin-portal probes don't corrupt each other.
     """
+    from shared.smc_lock import smc_global_lock
+
     login_kwargs = {
         "url": url, "api_key": api_key, "verify": verify_ssl,
         "timeout": timeout, "retry_on_busy": True,
@@ -147,40 +158,46 @@ def list_domains(url: str, api_key: str, api_version: str = "",
     if api_version:
         login_kwargs["api_version"] = api_version
 
-    try:
-        session.login(**login_kwargs)
-    except Exception as exc:
-        raise RuntimeError(f"SMC login failed: {smc_error_detail(exc)}") from exc
+    with smc_global_lock():
+        try:
+            session.login(**login_kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"SMC login failed: {smc_error_detail(exc)}") from exc
 
-    try:
-        client_info = _get_api_client_domain_info()
         try:
-            from smc.administration.access_rights import AdminDomain
-        except ImportError:
-            from smc.core.engine import AdminDomain  # type: ignore
-        domains = [{"name": d.name, "href": getattr(d, "href", "")}
-                   for d in AdminDomain.objects.all()]
-        domain_scoped = len(domains) == 0 and not client_info["allowed_shared"]
-        return {
-            "domains": sorted(domains, key=lambda d: d["name"].lower()),
-            "domain_scoped": domain_scoped,
-            "api_client_name": client_info["api_client_name"],
-            "admin_domain_href": client_info["admin_domain_href"],
-            "admin_domain_id": client_info["admin_domain_id"],
-            "visible_engines": client_info["visible_engines"],
-        }
-    except Exception as e:
-        raise RuntimeError(f"Error listing domains: {smc_error_detail(e)}") from e
-    finally:
-        try:
-            session.logout()
-        except Exception:
-            pass
+            client_info = _get_api_client_domain_info()
+            try:
+                from smc.administration.access_rights import AdminDomain
+            except ImportError:
+                from smc.core.engine import AdminDomain  # type: ignore
+            domains = [{"name": d.name, "href": getattr(d, "href", "")}
+                       for d in AdminDomain.objects.all()]
+            domain_scoped = len(domains) == 0 and not client_info["allowed_shared"]
+            return {
+                "domains": sorted(domains, key=lambda d: d["name"].lower()),
+                "domain_scoped": domain_scoped,
+                "api_client_name": client_info["api_client_name"],
+                "admin_domain_href": client_info["admin_domain_href"],
+                "admin_domain_id": client_info["admin_domain_id"],
+                "visible_engines": client_info["visible_engines"],
+            }
+        except Exception as e:
+            raise RuntimeError(f"Error listing domains: {smc_error_detail(e)}") from e
+        finally:
+            try:
+                session.logout()
+            except Exception:
+                pass
 
 
 def validate_domain(url: str, api_key: str, domain: str, api_version: str = "",
                     verify_ssl: bool = False, timeout: int = 60) -> dict:
-    """Verify API key can log into a specific domain."""
+    """Verify API key can log into a specific domain.
+
+    Serialised under the process-wide SMC lock — see ``shared/smc_lock.py``.
+    """
+    from shared.smc_lock import smc_global_lock
+
     login_kwargs = {
         "url": url, "api_key": api_key, "domain": domain,
         "verify": verify_ssl, "timeout": timeout, "retry_on_busy": True,
@@ -188,22 +205,23 @@ def validate_domain(url: str, api_key: str, domain: str, api_version: str = "",
     if api_version:
         login_kwargs["api_version"] = api_version
 
-    try:
-        session.login(**login_kwargs)
-    except Exception as exc:
-        return {"valid": False, "detail": smc_error_detail(exc), "engines": 0}
-
-    try:
-        from smc.core.engine import Engine
-        count = sum(1 for _ in Engine.objects.all())
-        return {"valid": True, "detail": f"Logged in, {count} engine(s) visible", "engines": count}
-    except Exception as e:
-        return {"valid": True, "detail": f"Logged in but engine check failed: {e}", "engines": 0}
-    finally:
+    with smc_global_lock():
         try:
-            session.logout()
-        except Exception:
-            pass
+            session.login(**login_kwargs)
+        except Exception as exc:
+            return {"valid": False, "detail": smc_error_detail(exc), "engines": 0}
+
+        try:
+            from smc.core.engine import Engine
+            count = sum(1 for _ in Engine.objects.all())
+            return {"valid": True, "detail": f"Logged in, {count} engine(s) visible", "engines": count}
+        except Exception as e:
+            return {"valid": True, "detail": f"Logged in but engine check failed: {e}", "engines": 0}
+        finally:
+            try:
+                session.logout()
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +239,18 @@ def list_tls_credentials() -> list:
         except Exception:
             pass
         results.append(info)
+
+    # Q21 lazy registry — register every credential seen. Best-effort.
+    try:
+        from shared.smc_registry import register_many
+        register_many(None, [
+            {"smc_type": "tls_credential",
+             "smc_href": r.get("href", ""), "smc_name": r.get("name", "")}
+            for r in results if r.get("href")
+        ])
+    except Exception:
+        pass
+
     return results
 
 
@@ -436,6 +466,19 @@ def list_engines(debug: bool = False) -> list:
         logger.warning("Raw REST engine enumeration failed: %s", e)
 
     result = sorted(engines_by_href.values(), key=lambda e: e["name"].lower())
+
+    # Q21 lazy registry — register every engine seen. Best-effort.
+    try:
+        from shared.smc_registry import register_many
+        register_many(None, [
+            {"smc_type": e.get("type") or "engine",
+             "smc_href": e.get("href", ""),
+             "smc_name": e.get("name", "")}
+            for e in result if e.get("href")
+        ])
+    except Exception:
+        pass
+
     if not debug:
         # Strip the "sources" field for the public API unless debug was requested
         return [{k: v for k, v in e.items() if k != "sources"} for e in result]

@@ -142,11 +142,21 @@ def rule_name_for(engine_name: str) -> str:
 def install_ssh_rule(engine_name: str, source_ip: str,
                      destination_ips: list[str],
                      created_by_email: str = "",
-                     fea_hostname: str = "") -> RuleInstallResult:
-    """Pre-flight + create rule + push policy. Idempotent.
+                     fea_hostname: str = "",
+                     rule_name: str | None = None) -> RuleInstallResult:
+    """Pre-flight + create rule + push policy. Idempotent on the rule name.
 
     Accepts a LIST of destination IPs so a single rule can cover every
     node of a cluster. Caller MUST be inside an `smc_session` context.
+
+    Args:
+      rule_name: Optional override for the rule's SMC name. When None,
+        the canonical name ``rule_name_for(engine_name)`` is used. The
+        caller passes a versioned name (e.g.
+        ``flexedge-dhcp-mgmt-ssh-fw01-srcABCDEF``) when the tenant's
+        source IP has changed and a brand-new rule is wanted instead of
+        mutating the existing one — the canonical rule stays in place
+        for the operator to review and remove via SMC GUI.
     """
     pre = preflight(engine_name)
     if not pre.ok:
@@ -155,7 +165,7 @@ def install_ssh_rule(engine_name: str, source_ip: str,
         return RuleInstallResult(ok=False, policy_name=pre.policy_name,
                                  error="no destination IPs supplied")
 
-    name = rule_name_for(engine_name)
+    name = rule_name or rule_name_for(engine_name)
     existing = smc.find_ssh_access_rule(pre.policy_name, name)
     if existing:
         # Already in place — caller may still want to push policy if the
@@ -168,7 +178,8 @@ def install_ssh_rule(engine_name: str, source_ip: str,
 
     audit = (f"FlexEdgeAdmin auto-managed SSH allow rule. "
              f"Operator: {created_by_email or 'unknown'}. "
-             f"FlexEdge host: {fea_hostname or 'unknown'}.")
+             f"FlexEdge host: {fea_hostname or 'unknown'}. "
+             f"Source IP: {source_ip}.")
     try:
         href = smc.add_ssh_access_rule(
             policy_name=pre.policy_name,
@@ -222,6 +233,12 @@ class EnrollmentResult:
     host_fingerprint: str = ""
     error: str = ""
     failed_at_stage: str = ""    # 'enable_ssh' | 'change_pwd' | 'connect' | 'verify'
+    # Set by force_reset_password when the engine's host key changed
+    # during recovery (engine re-image vs MITM). Caller is expected to
+    # emit a loud audit log entry with both values so the change is
+    # never silent.
+    fingerprint_changed: bool = False
+    previous_fingerprint: str = ""
 
 
 def enroll_node(engine_name: str, node_index: int,
@@ -233,23 +250,39 @@ def enroll_node(engine_name: str, node_index: int,
 
     Caller is inside `smc_session`. The returned password should be
     persisted (Fernet-encrypted) by the Blueprint.
-    """
-    # Pre-stage: TCP probe so we fail fast if the rule push didn't open the path
-    ok, err = tcp_probe(target, timeout=tcp_probe_timeout)
-    if not ok:
-        return EnrollmentResult(
-            ok=False, failed_at_stage="connect",
-            error=f"TCP probe failed before enrollment: {err}. "
-                  f"Verify the SSH allow rule was installed and policy uploaded.",
-        )
 
-    # Stage 3a: enable SSH daemon
+    Order matters: enable SSH FIRST, then probe. On a fresh firewall where
+    SSH has never been enabled, the daemon isn't listening on port 22 yet,
+    so an upfront probe would always fail and we'd never reach the very
+    SMC call that turns it on. We probe AFTER enable_ssh, with brief
+    retries to let the daemon come up.
+    """
+    # Stage 3a: enable SSH daemon via SMC API
     try:
         smc.set_node_ssh_enabled(engine_name, node_index, True,
                                  comment=audit_comment)
     except Exception as exc:
         return EnrollmentResult(ok=False, failed_at_stage="enable_ssh",
                                 error=f"enable SSH on node failed: {exc}")
+
+    # Post-enable probe with retries — ssh daemon needs a moment to bind
+    # after SMC flips the flag (typically <1s, occasionally up to ~5s).
+    import time
+    last_err = ""
+    for attempt in range(6):  # 6 × 1s = 6s ceiling
+        ok, err = tcp_probe(target, timeout=tcp_probe_timeout)
+        if ok:
+            break
+        last_err = err
+        time.sleep(1)
+    else:
+        return EnrollmentResult(
+            ok=False, failed_at_stage="connect",
+            error=f"SSH daemon was enabled via SMC but the node is still "
+                  f"unreachable after 6s: {last_err}. "
+                  f"Verify the SSH allow rule is installed and policy uploaded "
+                  f"(the rule must list the node IP as a destination).",
+        )
 
     # Stage 3b: change password
     new_password = generate_password()
@@ -316,15 +349,33 @@ def force_reset_password(engine_name: str, node_index: int,
                                     host_fingerprint=existing_fingerprint)
         # Fingerprint mismatch usually means engine was re-imaged. Recover
         # by capturing a fresh fingerprint via TOFU and re-verifying.
+        # The caller MUST log this loudly: a fingerprint change papers
+        # over both legitimate re-image and a hypothetical MITM, so the
+        # audit trail is the only signal a defender has.
         if isinstance(err, str) and "host key mismatch" in err:
+            logger.warning(
+                "force_reset_password: host key fingerprint MISMATCH on "
+                "%s/node%d (%s). Recovering via TOFU. Old fingerprint: %s",
+                engine_name, node_index, target.hostname, existing_fingerprint,
+            )
             try:
                 new_fp = first_contact(target, new_password)
             except Exception as exc:
                 return EnrollmentResult(ok=False, failed_at_stage="connect",
                                         new_password=new_password,
-                                        error=f"re-fingerprint after rotation failed: {exc}")
+                                        error=f"re-fingerprint after rotation failed: {exc}",
+                                        fingerprint_changed=True,
+                                        previous_fingerprint=existing_fingerprint)
+            logger.warning(
+                "force_reset_password: new host fingerprint captured for "
+                "%s/node%d: %s (was %s) — engine re-imaged, or MITM. "
+                "Operator must verify out-of-band.",
+                engine_name, node_index, new_fp, existing_fingerprint,
+            )
             return EnrollmentResult(ok=True, new_password=new_password,
-                                    host_fingerprint=new_fp)
+                                    host_fingerprint=new_fp,
+                                    fingerprint_changed=True,
+                                    previous_fingerprint=existing_fingerprint)
         return EnrollmentResult(ok=False, failed_at_stage="verify",
                                 new_password=new_password,
                                 host_fingerprint=existing_fingerprint,

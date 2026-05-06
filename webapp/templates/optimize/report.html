@@ -176,6 +176,7 @@
     <div class="mb-3">
         <form method="post" action="{{ url_for('optimize_submit', policy_name=policy_name) }}"
               onsubmit="return confirm('Submit these {{ result.findings|length }} finding(s) for admin review?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn btn-primary btn-sm">
                 <i class="bi bi-send"></i> Submit for admin review
             </button>

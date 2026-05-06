@@ -44,22 +44,28 @@ from webapp.dhcp_ssh import (
     SSHTarget, SSHCredential,
     tcp_probe, verify_credential, run, get_file, put_file,
 )
+from webapp.dhcp_bootstrap import engine_bootstrap_lock as engine_op_lock
 
 log = logging.getLogger(__name__)
 
 CONF_PATH = "/data/config/base/dhcp-server.conf"
 
-# Delimiter markers — must round-trip through regex. Keep exactly one
-# space-separated metadata key=value pair per token after the prefix so
-# parsing stays predictable.
+# Delimiter markers. Each scope owns its own delimited block, anchored by
+# `scope_id=N` on both BEGIN and END lines, so a deploy on one scope never
+# touches another scope's reservations on the same engine.
 RESERVATIONS_BEGIN = "# FLEXEDGE-RESERVATIONS-BEGIN"
 RESERVATIONS_END = "# FLEXEDGE-RESERVATIONS-END"
 
-_RE_RESERVATIONS_BLOCK = re.compile(
-    r"\n?" + re.escape(RESERVATIONS_BEGIN) + r"[^\n]*\n.*?\n"
-    + re.escape(RESERVATIONS_END) + r"[^\n]*\n?",
-    re.DOTALL,
-)
+
+def _scope_block_re(scope_id: int) -> re.Pattern:
+    sid = re.escape(str(int(scope_id)))
+    return re.compile(
+        r"\n?" + re.escape(RESERVATIONS_BEGIN) + r" scope_id=" + sid
+        + r"(?:\s[^\n]*)?\n.*?\n"
+        + re.escape(RESERVATIONS_END) + r" scope_id=" + sid
+        + r"(?:\s[^\n]*)?\n?",
+        re.DOTALL,
+    )
 
 
 # ── Result types ─────────────────────────────────────────────────────────
@@ -97,17 +103,46 @@ class PushResult:
 
 # ── Pre-flight validation ────────────────────────────────────────────────
 
-def _check_preconditions(scope: DhcpScope) -> tuple[bool, str]:
+def _check_preconditions(scope: DhcpScope, dry_run: bool = False
+                         ) -> tuple[bool, str]:
     """Validate that a scope can be pushed.
 
     Returns (ok, reason). The reason is operator-facing.
+
+    Phase 0 gate: if no operator has marked Phase 0 (lab persistence test)
+    as validated, refuse to push — the engine may be silently overwriting
+    /data/config/base/dhcp-server.conf on policy refresh, in which case
+    every deploy looks ok but the reservations vanish on the next SMC
+    save. Operator confirms by clicking "I validated Phase 0" on the
+    DHCP Manager dashboard after running the lab procedure.
+
+    Dry-run bypasses the Phase 0 gate (a preview never writes the file,
+    so persistence concerns don't apply); the credential and SSH-rule
+    checks still apply because we need an authenticated SSH read to
+    fetch the current file.
     """
+    if not dry_run:
+        # Local import to avoid a circular dep — dhcp_manager imports dhcp_pusher.
+        from webapp.dhcp_manager import is_phase0_validated
+        if not is_phase0_validated():
+            return False, (
+                "Phase 0 lab persistence test has not been validated. Until "
+                "an operator confirms that engine policy refresh / upload / "
+                "reboot does NOT overwrite /data/config/base/dhcp-server.conf, "
+                "deploys are blocked to prevent silent reservation loss. "
+                "Run the procedure in docs/DHCP-Phase0-LabTest.md, then click "
+                "'I validated Phase 0' on the DHCP Manager dashboard. "
+                "(You can still use 'Preview' to see what a deploy would write.)"
+            )
+
     if not scope.enabled_in_flexedge:
         return False, ("scope is not opted into FlexEdge management — "
                        "enable it before deploying")
 
+    # Phase B.2: scope.domain_id is the canonical scope FK (Phase B.1
+    # backfilled it from the legacy tenant_id).
     creds = (DhcpEngineCredential.query
-             .filter_by(tenant_id=scope.tenant_id,
+             .filter_by(domain_id=scope.domain_id,
                         engine_name=scope.engine_name)
              .all())
     if not creds:
@@ -115,13 +150,16 @@ def _check_preconditions(scope: DhcpScope) -> tuple[bool, str]:
                        "go to DHCP Manager → Credentials and enroll the "
                        "cluster nodes first")
 
-    unverified = [c for c in creds if not c.verified_at]
+    unverified = [c for c in creds
+                  if not c.last_verified_at or c.last_verify_status != "ok"]
     if unverified:
         names = ", ".join(f"node {c.node_index}" for c in unverified)
-        return False, f"unverified credentials: {names}"
+        return False, (f"credentials need verification before deploy "
+                       f"({names}) — open DHCP Manager → Credentials and "
+                       f"click Verify on each affected row, then retry")
 
     rule = (DhcpEngineSshAccess.query
-            .filter_by(tenant_id=scope.tenant_id,
+            .filter_by(domain_id=scope.domain_id,
                        engine_name=scope.engine_name).first())
     if not rule:
         return False, ("SSH allow rule is missing in SMC — go to DHCP "
@@ -156,9 +194,14 @@ def render_reservations_block(scope: DhcpScope,
     else:
         body_lines = []
         for r in reservations:
-            host_name = _sanitize_host_name(
-                f"flexedge-{scope.id}-{r.id}-{r.smc_host_name}"
-            )[:63]   # ISC limits host names to 63 chars in practice
+            # Truncation-safe: ``flexedge-r<r.id>`` is always preserved at
+            # the front because the slug suffix is what gets cut. Since
+            # ``r.id`` is a globally unique primary key, two reservations
+            # can never produce the same host name even if their slugs are
+            # similar enough to be identical after truncation.
+            prefix = f"flexedge-r{int(r.id)}"
+            slug = _sanitize_host_name(r.smc_host_name)
+            host_name = f"{prefix}-{slug}"[:63] if slug else prefix
             mac = _normalize_mac(r.mac_address)
             body_lines.append(
                 f"host {host_name} {{ "
@@ -187,14 +230,15 @@ def render_reservations_block(scope: DhcpScope,
     return "\n".join(parts)
 
 
-def merge_into_conf(existing: str, new_block: str) -> str:
-    """Append (or replace) the FlexEdge reservations block in the file.
+def merge_into_conf(existing: str, new_block: str, scope_id: int) -> str:
+    """Append (or replace) THIS scope's FlexEdge reservations block.
 
-    If a previous FlexEdge block is present, replace it in place. Otherwise
-    append to the end. Existing SMC-managed content is left exactly as-is.
+    Only the block tagged with the matching ``scope_id`` is replaced —
+    blocks belonging to other scopes on the same engine are preserved
+    verbatim. Existing SMC-managed content is left exactly as-is.
     """
-    # Strip an existing block if present (anywhere in the file).
-    stripped = _RE_RESERVATIONS_BLOCK.sub("\n", existing).rstrip("\n")
+    pattern = _scope_block_re(scope_id)
+    stripped = pattern.sub("\n", existing).rstrip("\n")
 
     if not new_block.strip():
         return stripped + "\n"
@@ -234,10 +278,13 @@ def _reload_dhcpd(target: SSHTarget, cred: SSHCredential) -> str:
     Forcepoint engines run the daemon under a few possible names; we try
     them in order and stop at the first that signals at least one process.
     """
+    # Exact-match (-x) on argv[0] so we never HUP an unrelated process
+    # whose cmdline happens to contain the string (e.g. an editor session
+    # on dhcp-server.conf, a tail -f, etc.).
     candidates = [
         # name, command (must exit 0 if signal was sent to ≥1 process)
-        ("dhcp-server", "pkill -HUP -f dhcp-server"),
-        ("dhcpd",       "pkill -HUP dhcpd"),
+        ("dhcp-server", "pkill -HUP -x dhcp-server"),
+        ("dhcpd",       "pkill -HUP -x dhcpd"),
     ]
     for name, cmd in candidates:
         try:
@@ -261,11 +308,17 @@ def _push_to_node(scope: DhcpScope,
                   cred_row: DhcpEngineCredential,
                   reservations: list[DhcpReservation],
                   operator_email: str,
-                  action: str) -> NodeResult:
+                  action: str,
+                  dry_run: bool = False) -> NodeResult:
     """Push the rendered block to one node and record a DhcpDeployment row.
 
     Each per-node failure is captured but does NOT raise — the orchestrator
     decides aggregate status from all results.
+
+    When ``dry_run`` is True: read the current file, render the new content,
+    compute sha256 + unified diff, and return — but skip ``put_file``, the
+    post-write verify, and the dhcpd reload. Use this to surface the diff
+    in the UI before the operator commits.
     """
     started = time.monotonic()
     node = NodeResult(node_index=cred_row.node_index,
@@ -303,7 +356,7 @@ def _push_to_node(scope: DhcpScope,
         # 4. Render new content.
         new_block = render_reservations_block(scope, reservations,
                                               operator_email)
-        new_content = merge_into_conf(existing, new_block)
+        new_content = merge_into_conf(existing, new_block, scope.id)
         node.sha256_after = _sha256_text(new_content)
 
         if node.sha256_before == node.sha256_after:
@@ -313,6 +366,15 @@ def _push_to_node(scope: DhcpScope,
             return node
 
         node.diff = _unified_diff(existing, new_content)
+
+        # Dry-run stops here: we computed the diff but won't touch the
+        # file or trigger a reload. The DhcpDeployment row written by
+        # the orchestrator will carry action="dry_run" so it's clearly
+        # distinguishable in the audit log.
+        if dry_run:
+            node.status = "ok"
+            node.error = ""
+            return node
 
         # 5. Atomic write (mode 0644 — dhcpd reads as root).
         put_file(target, payload, CONF_PATH,
@@ -346,18 +408,31 @@ def _push_to_node(scope: DhcpScope,
 
 def push_scope_to_engine(scope_id: int,
                          operator_email: str,
-                         action: str = "push") -> PushResult:
+                         action: str = "push",
+                         dry_run: bool = False) -> PushResult:
     """Push a scope's FlexEdge-managed reservations to every node.
+
+    Serialised per-engine via ``engine_op_lock`` (shared with bootstrap
+    operations) so concurrent deploys on the same engine — or against
+    sibling scopes that share the same ``dhcp-server.conf`` file — cannot
+    race on the file. Returns a ``blocked`` result if another op holds
+    the lock past the timeout.
 
     Args:
         scope_id: ``DhcpScope`` primary key.
         operator_email: For audit trail in the file marker and DB rows.
         action: ``push`` for an operator-triggered deploy, ``resync`` for
-                a re-run that re-applies the same content.
+                a re-run that re-applies the same content, ``dry_run``
+                for a preview-only call.
+        dry_run: If True, runs the SSH read + render + diff path but
+                 SKIPS the file write and reload. Reservation row status
+                 is NOT mutated. Use to surface the diff in the UI for
+                 operator confirmation before committing.
 
     Returns a ``PushResult`` summarizing per-node outcomes. Reservation
     rows are flipped to ``status=synced`` on full success or
-    ``status=error`` on partial / total failure (with ``last_error``).
+    ``status=error`` on partial / total failure (with ``last_error``) —
+    except in dry-run, which leaves them alone.
     All ``DhcpDeployment`` rows are committed before returning.
     """
     scope: DhcpScope = DhcpScope.query.get(scope_id)
@@ -366,11 +441,27 @@ def push_scope_to_engine(scope_id: int,
                           overall_status="blocked",
                           blocked_reason=f"scope {scope_id} not found")
 
+    try:
+        with engine_op_lock(scope.engine_name, timeout=300):
+            return _push_scope_to_engine_locked(scope, operator_email,
+                                                action, dry_run)
+    except RuntimeError as exc:
+        return PushResult(scope_id=scope.id, engine_name=scope.engine_name,
+                          overall_status="blocked",
+                          blocked_reason=(f"another deploy or enrollment is "
+                                          f"in progress on this engine: {exc}"))
+
+
+def _push_scope_to_engine_locked(scope: DhcpScope,
+                                 operator_email: str,
+                                 action: str,
+                                 dry_run: bool) -> PushResult:
+    """Locked body of ``push_scope_to_engine`` — caller holds engine_op_lock."""
     result = PushResult(scope_id=scope.id, engine_name=scope.engine_name,
                         overall_status="failed")
 
-    # 1. Validate preconditions.
-    ok, reason = _check_preconditions(scope)
+    # 1. Validate preconditions. Dry-run bypasses Phase 0 only.
+    ok, reason = _check_preconditions(scope, dry_run=dry_run)
     if not ok:
         result.overall_status = "blocked"
         result.blocked_reason = reason
@@ -378,7 +469,7 @@ def push_scope_to_engine(scope_id: int,
 
     # 2. Gather credentials + reservations.
     creds = (DhcpEngineCredential.query
-             .filter_by(tenant_id=scope.tenant_id,
+             .filter_by(domain_id=scope.domain_id,
                         engine_name=scope.engine_name)
              .order_by(DhcpEngineCredential.node_index)
              .all())
@@ -388,30 +479,37 @@ def push_scope_to_engine(scope_id: int,
                     .all())
 
     log.info("Phase 4 push: scope=%s engine=%s nodes=%d reservations=%d "
-             "action=%s by=%s",
+             "action=%s dry_run=%s by=%s",
              scope.id, scope.engine_name, len(creds), len(reservations),
-             action, operator_email)
+             action, dry_run, operator_email)
+
+    audit_action = "dry_run" if dry_run else action
 
     # 3. Per-node push.
     for cred in creds:
         node_result = _push_to_node(scope, cred, reservations,
-                                    operator_email, action)
+                                    operator_email, action,
+                                    dry_run=dry_run)
         result.nodes.append(node_result)
 
-        # Persist a DhcpDeployment audit row.
+        # Persist a DhcpDeployment audit row. ``error`` and ``reload_warning``
+        # are *separate* concerns: ``error`` means the file write failed,
+        # ``reload_warning`` means the file was written but the dhcpd HUP
+        # didn't reach an active process. Both can be empty (full success).
         deploy = DhcpDeployment(
             scope_id=scope.id,
             engine_name=scope.engine_name,
             node_index=node_result.node_index,
             node_hostname=node_result.node_hostname,
-            action=action,
+            action=audit_action,
             status="ok" if node_result.status == "ok" else "failed",
             reservations_count=node_result.reservations_count,
             file_sha256_before=node_result.sha256_before,
             file_sha256_after=node_result.sha256_after,
             diff=node_result.diff,
             duration_ms=node_result.duration_ms,
-            error=node_result.error or node_result.reload_warning,
+            error=node_result.error,
+            reload_warning=node_result.reload_warning,
         )
         db.session.add(deploy)
 
@@ -425,21 +523,51 @@ def push_scope_to_engine(scope_id: int,
     else:
         result.overall_status = "failed"
 
-    # 5. Update reservation rows.
+    # Per-node SSH success is fresh state evidence; bump the cred row's
+    # state_refreshed_at on each cred whose node-result was ok. Skipped
+    # in dry-run because we only read, not act, but reads still prove
+    # connectivity so we DO bump there too.
     now = datetime.now(timezone.utc)
-    if result.overall_status == "ok":
-        for r in reservations:
-            r.status = "synced"
-            r.last_synced_at = now
-            r.last_error = ""
-    else:
-        # Leave already-synced rows alone; only flag this scope's pending ones.
-        for r in reservations:
-            if r.status == "pending":
-                r.status = "error"
-                r.last_error = (f"deploy {result.overall_status} — "
-                                f"{result.failed_nodes}/{len(result.nodes)} "
-                                f"nodes failed (see deployment log)")
+    cred_by_node_index = {c.node_index: c for c in creds}
+    any_node_ok = False
+    for node_result in result.nodes:
+        if node_result.status == "ok":
+            any_node_ok = True
+            c = cred_by_node_index.get(node_result.node_index)
+            if c is not None:
+                c.state_refreshed_at = now
+                c.last_verified_at = now
+                c.last_verify_status = "ok"
+                c.last_error = ""
+    # If at least one node verified, the rule was in policy too
+    # (preflight checked + the connect itself proved it).
+    if any_node_ok:
+        access = (DhcpEngineSshAccess.query
+                  .filter_by(domain_id=scope.domain_id,
+                             engine_name=scope.engine_name)
+                  .first())
+        if access:
+            access.state_refreshed_at = now
+            access.last_seen_in_policy_at = now
+
+    # 5. Update reservation rows — only when we actually wrote.
+    # Dry-run leaves reservation status alone so the operator can still
+    # see what's pending after a preview.
+    if not dry_run:
+        now = datetime.now(timezone.utc)
+        if result.overall_status == "ok":
+            for r in reservations:
+                r.status = "synced"
+                r.last_synced_at = now
+                r.last_error = ""
+        else:
+            # Leave already-synced rows alone; only flag this scope's pending ones.
+            for r in reservations:
+                if r.status == "pending":
+                    r.status = "error"
+                    r.last_error = (f"deploy {result.overall_status} — "
+                                    f"{result.failed_nodes}/{len(result.nodes)} "
+                                    f"nodes failed (see deployment log)")
 
     db.session.commit()
     return result
@@ -448,3 +576,15 @@ def push_scope_to_engine(scope_id: int,
 def resync_scope(scope_id: int, operator_email: str) -> PushResult:
     """Convenience wrapper: same as ``push`` but logged with action='resync'."""
     return push_scope_to_engine(scope_id, operator_email, action="resync")
+
+
+def preview_scope(scope_id: int, operator_email: str) -> PushResult:
+    """Dry-run: render + diff per node, but do not write or reload.
+
+    Returns the same ``PushResult`` shape as a real push so the caller
+    can render per-node diffs in the UI. Reservation rows are not
+    mutated. ``DhcpDeployment`` rows are still written, with
+    ``action="dry_run"`` for audit traceability.
+    """
+    return push_scope_to_engine(scope_id, operator_email,
+                                action="push", dry_run=True)

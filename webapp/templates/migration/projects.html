@@ -71,6 +71,7 @@
                     {% endif %}
                     <form method="POST" action="{{ url_for('migration_delete', project_id=p.id) }}"
                           onsubmit="return confirm('Delete project {{ p.name }}?')" class="d-inline">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <button type="submit" class="btn btn-outline-danger btn-sm">
                             <i class="bi bi-trash"></i>
                         </button>

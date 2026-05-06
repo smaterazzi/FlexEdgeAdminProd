@@ -44,7 +44,15 @@ def load_config(path=None):
 
 @contextmanager
 def smc_session(cfg=None):
-    """Context manager that logs in to SMC and yields the session."""
+    """Context manager that logs in to SMC and yields the session.
+
+    Serialised by the process-wide SMC lock — the smc-python SDK keeps
+    session state in a module-level singleton, so concurrent login/logout
+    from threaded gunicorn workers would corrupt each other. See
+    ``shared/smc_lock.py`` for the gory details.
+    """
+    from shared.smc_lock import smc_global_lock
+
     if cfg is None:
         cfg = load_config()
 
@@ -61,11 +69,15 @@ def smc_session(cfg=None):
     if cfg.get("retry_on_busy", True):
         login_kwargs["retry_on_busy"] = True
 
-    session.login(**login_kwargs)
-    try:
-        yield session
-    finally:
-        session.logout()
+    with smc_global_lock():
+        session.login(**login_kwargs)
+        try:
+            yield session
+        finally:
+            try:
+                session.logout()
+            except Exception as exc:
+                log.warning("smc_session: logout failed (ignored): %s", exc)
 
 
 # ── Href Resolution Cache ────────────────────────────────────────────────
@@ -178,6 +190,30 @@ def list_elements(type_key, filter_text=None, fgt_only=False):
         return [{"name": f"ERROR: {e}", "href": "", "type": type_key, "comment": ""}]
 
     results.sort(key=lambda r: r["name"].lower())
+
+    # Q21 lazy registry — register every element seen. Best-effort.
+    # Uses the explorer's `type_key` (singular form) as smc_type so the
+    # registry can group rows by what the operator actually browsed.
+    try:
+        from shared.smc_registry import register_many
+        # Map plural explorer keys to a singular smc_type label.
+        type_label = {
+            "hosts": "host", "networks": "network",
+            "address_ranges": "address_range", "fqdns": "fqdn",
+            "domain_names": "domain_name", "zones": "zone",
+            "groups": "group",
+            "tcp_services": "tcp_service", "udp_services": "udp_service",
+            "ip_services": "ip_service", "icmp_services": "icmp_service",
+            "service_groups": "service_group",
+        }.get(type_key, type_key)
+        register_many(None, [
+            {"smc_type": type_label,
+             "smc_href": r.get("href", ""), "smc_name": r.get("name", "")}
+            for r in results if r.get("href")
+        ])
+    except Exception:
+        pass
+
     return results
 
 
@@ -493,6 +529,8 @@ def list_domains(cfg):
     Returns a sorted list of {name, href} dicts.
     On failure returns [{name: 'Shared Domain', href: ''}] as a safe fallback.
     """
+    from shared.smc_lock import smc_global_lock
+
     login_kwargs = {
         "url": cfg["smc_url"],
         "api_key": cfg["api_key"],
@@ -506,59 +544,36 @@ def list_domains(cfg):
     # Deliberately omit 'domain' so we land on the root / Shared Domain
     # and can enumerate all admin domains.
 
-    session.login(**login_kwargs)
-    try:
+    with smc_global_lock():
+        session.login(**login_kwargs)
         try:
-            from smc.administration.access_rights import AdminDomain
-        except ImportError:
-            # Older library versions may use a different path
-            from smc.core.engine import AdminDomain  # type: ignore
+            try:
+                from smc.administration.access_rights import AdminDomain
+            except ImportError:
+                # Older library versions may use a different path
+                from smc.core.engine import AdminDomain  # type: ignore
 
-        domains = [
-            {"name": d.name, "href": getattr(d, "href", "")}
-            for d in AdminDomain.objects.all()
-        ]
-        # Always include Shared Domain so users without named domains can proceed
-        names = {d["name"] for d in domains}
-        if "Shared Domain" not in names:
-            domains.insert(0, {"name": "Shared Domain", "href": ""})
-        return sorted(domains, key=lambda d: d["name"].lower())
-    except Exception as exc:
-        log.error("Error listing admin domains: %s", exc)
-        return [{"name": "Shared Domain", "href": ""}]
-    finally:
-        session.logout()
+            domains = [
+                {"name": d.name, "href": getattr(d, "href", "")}
+                for d in AdminDomain.objects.all()
+            ]
+            # Always include Shared Domain so users without named domains can proceed
+            names = {d["name"] for d in domains}
+            if "Shared Domain" not in names:
+                domains.insert(0, {"name": "Shared Domain", "href": ""})
+            return sorted(domains, key=lambda d: d["name"].lower())
+        except Exception as exc:
+            log.error("Error listing admin domains: %s", exc)
+            return [{"name": "Shared Domain", "href": ""}]
+        finally:
+            try:
+                session.logout()
+            except Exception:
+                pass
 
 
-# ── Sandbox / Dry-Run ────────────────────────────────────────────────────
-
-def sandbox_rules_check(policy_name="Migration from Fortinet"):
-    """
-    Read the existing policy rules and return a validation report.
-    Checks: rule count, disabled rules, unresolved references, section structure.
-    """
-    rules = get_policy_rules(policy_name)
-    sections = [r for r in rules if r.get("is_section")]
-    access_rules = [r for r in rules if not r.get("is_section")]
-    disabled = [r for r in access_rules if r.get("is_disabled")]
-    no_name = [r for r in access_rules if not r.get("name")]
-
-    # Check for unresolved references (names that look like numeric IDs)
-    unresolved = []
-    for r in access_rules:
-        for field in ("sources", "destinations", "services"):
-            for name in r.get(field, []):
-                if name not in ("any", "none") and name.isdigit():
-                    unresolved.append({"rule": r["name"], "field": field, "value": name})
-
-    return {
-        "policy_name": policy_name,
-        "total_rules": len(access_rules),
-        "total_sections": len(sections),
-        "sections": [s["name"] for s in sections],
-        "disabled_rules": len(disabled),
-        "disabled_list": [r["name"] for r in disabled],
-        "unnamed_rules": len(no_name),
-        "unresolved_refs": unresolved,
-        "rules": access_rules,
-    }
+# Sandbox / Dry-Run feature removed 2026-04-30 — superseded by the
+# Optimizer (live findings on the policy) and the Migration Manager
+# (validates rules during the FortiGate import flow). The Sandbox
+# only counted disabled / unresolved / sectioned rules — both of the
+# replacements do strictly more.

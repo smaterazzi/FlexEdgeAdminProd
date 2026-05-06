@@ -40,17 +40,30 @@ log = logging.getLogger(__name__)
 
 def import_dhcp_reservations(parsed_objects, dedup_results, target_dict,
                              project_id):
-    """Apply the DHCP migration to SMC + the FlexEdge DB.
+    """Stage the DHCP migration to the FlexEdge change-management queue.
+
+    Phase E.2 (Q20) — the migration writer no longer calls SMC directly.
+    It enqueues one ``pending_changes`` row per selected reservation,
+    all sharing ``source_correlation_id="migration:<project_id>"`` so
+    they group cleanly on ``/changes/?source=migration:<project_id>``.
+    The operator presses "Submit" once (the validation flow already
+    happened pre-submit); pushing happens from the Change Queue page.
+
+    DB-side ``DhcpReservation`` rows are inserted in ``status='queued'``
+    so the operator sees their submission immediately on the scope
+    listing (Q16/a). On a successful push, the row transitions to
+    ``status='pending'`` (the existing post-create state).
 
     Args:
         parsed_objects:   Output of ``fgt_parser.parse_fortigate_config()``.
-        dedup_results:    Output of ``dedup_engine.run_dedup()``. Must
-                          include ``dhcp_reservations`` (Phase C output).
-        target_dict:      The migration project's ``target`` dict (used
-                          only for traceability — actual SMC connection
-                          comes from each target scope's tenant).
+        dedup_results:    Output of ``dedup_engine.run_dedup()``.
+        target_dict:      The migration project's ``target`` dict (kept
+                          for caller compatibility — no longer used since
+                          SMC connection is resolved at push time per
+                          row's domain).
         project_id:       Migration project id, stamped into
-                          ``DhcpReservation.source`` for traceability.
+                          ``DhcpReservation.source`` AND used as the
+                          batch correlation id.
 
     Returns a dict::
 
@@ -58,15 +71,15 @@ def import_dhcp_reservations(parsed_objects, dedup_results, target_dict,
             "entries":               [...log lines...],
             "scopes_processed":      int,
             "scopes_skipped":        int,
-            "reservations_created":  int,
-            "reservations_updated":  int,
+            "reservations_created":  int,    # enqueued create rows
+            "reservations_updated":  int,    # enqueued update rows
             "reservations_skipped":  int,
             "reservations_errors":   int,
+            "changes_enqueued":      int,    # total queue rows created
+            "correlation_id":        str,    # for /changes/ link
         }
-
-    The caller (``migration_import`` route) merges ``entries`` into the
-    overall import log.
     """
+    correlation_id = f"migration:{project_id}"
     out = {
         "entries": [],
         "scopes_processed": 0,
@@ -75,6 +88,8 @@ def import_dhcp_reservations(parsed_objects, dedup_results, target_dict,
         "reservations_updated": 0,
         "reservations_skipped": 0,
         "reservations_errors": 0,
+        "changes_enqueued": 0,
+        "correlation_id": correlation_id,
     }
 
     dhcp_dedup = (dedup_results or {}).get("dhcp_reservations") or []
@@ -83,13 +98,8 @@ def import_dhcp_reservations(parsed_objects, dedup_results, target_dict,
                                "msg": "DHCP migration: nothing to import."})
         return out
 
-    # Lazy imports — keeps the module importable in tests / CLI contexts
-    # that don't have the full Flask + SMC stack on hand.
-    from smc_client import smc_session
-    from smc_dhcp_client import (
-        host_create, host_update, normalize_mac,
-    )
-    from webapp.models import DhcpScope, DhcpReservation, Tenant, ApiKey
+    from smc_dhcp_client import normalize_mac
+    from webapp.models import DhcpScope, DhcpReservation
     from shared.db import db
 
     for entry in dhcp_dedup:
@@ -130,91 +140,107 @@ def import_dhcp_reservations(parsed_objects, dedup_results, target_dict,
 
         out["scopes_processed"] += 1
 
-        # Resolve the SMC config from the scope's tenant + api_key.
-        tenant: Tenant = db.session.get(Tenant, scope.tenant_id)
-        api_key: ApiKey = db.session.get(ApiKey, scope.api_key_id)
-        if not tenant or not api_key or not tenant.is_active or not api_key.is_active:
+        # Validate Domain + ApiKey are present so the queue handler will
+        # be able to push later. Skip whole scope if not.
+        domain = scope.domain
+        api_key = domain.api_key if domain else None
+        if not domain or not api_key or not domain.is_active or not api_key.is_active:
             out["scopes_skipped"] += 1
             out["entries"].append({"level": "warning",
-                "msg": (f"DHCP FG#{fg_id}: scope {scope.id}'s tenant or "
-                        "api_key is missing/inactive — skipped.")})
+                "msg": (f"DHCP FG#{fg_id}: scope {scope.id}'s Domain or "
+                        "ApiKey is missing/inactive — skipped.")})
             continue
 
-        cfg = {
-            "smc_url": tenant.smc_url,
-            "api_key": api_key.decrypted_key,
-            "verify_ssl": tenant.verify_ssl,
-            "timeout": tenant.timeout,
-            "domain": tenant.default_domain,
-            "retry_on_busy": True,
-        }
-
-        # Process all reservations for this scope inside one SMC session.
         try:
-            with smc_session(cfg):
-                _process_scope_reservations(
-                    scope, selected, project_id, out,
-                    host_create, host_update, normalize_mac,
-                    db, DhcpReservation,
-                )
+            _enqueue_scope_reservations(
+                scope, selected, project_id, correlation_id, out,
+                normalize_mac, db, DhcpReservation,
+            )
             db.session.commit()
         except Exception as exc:
             db.session.rollback()
             out["entries"].append({"level": "error",
                 "msg": (f"DHCP FG#{fg_id} → {scope.engine_name}/"
-                        f"{scope.interface_id}: SMC session failed — {exc}")})
-            # The whole scope is now an error — count its selected reservations
-            # as errors so the summary numbers reflect reality.
+                        f"{scope.interface_id}: enqueue failed — {exc}")})
             out["reservations_errors"] += len(selected)
 
     out["entries"].append({"level": "info", "msg": (
-        f"DHCP migration done — created={out['reservations_created']} "
-        f"updated={out['reservations_updated']} "
+        f"DHCP migration staged — enqueued={out['changes_enqueued']} "
+        f"(created={out['reservations_created']} "
+        f"updated={out['reservations_updated']}) "
         f"skipped={out['reservations_skipped']} "
         f"errors={out['reservations_errors']} "
-        f"scopes={out['scopes_processed']}")})
+        f"scopes={out['scopes_processed']}. "
+        f"Visit /changes/?source={correlation_id} to review + push.")})
     return out
 
 
-def _process_scope_reservations(scope, selected, project_id, out,
-                                host_create, host_update, normalize_mac,
-                                db, DhcpReservation):
-    """Process reservations for one scope inside an open SMC session.
+def _enqueue_scope_reservations(scope, selected, project_id, correlation_id,
+                                out, normalize_mac, db, DhcpReservation):
+    """Stage reservations for one scope into the change-management queue.
 
-    Each reservation gets its own try/except so a single SMC error doesn't
-    abort the whole scope's batch — others still complete.
+    Phase E.2 (Q20) — no SMC mutations happen here. Each selected
+    reservation gets:
+      1. A ``DhcpReservation`` row inserted in ``status='queued'`` so
+         the operator sees it immediately on the scope listing.
+      2. A ``pending_changes`` row (``operation='create'`` for new,
+         ``operation='update'`` for conflict-overwrite) sharing
+         ``correlation_id``. Push happens later from ``/changes/``.
+
+    Per-row failures (validation, DB unique constraint) are isolated
+    via try/except — others still enqueue. There's no SMC rollback to
+    worry about because no SMC call happens at this stage.
     """
     source = f"migration:{project_id}"
+
+    from webapp.dhcp_reservation_queue import (
+        enqueue_reservation_create, enqueue_reservation_update,
+    )
+    from webapp.models import PendingChange
 
     for r in selected:
         action = r.get("action", "create")
         ip = r.get("ip", "")
         mac = normalize_mac(r.get("mac", ""))
         desc = (r.get("description") or "").strip()
+        comment = desc or f"FortiGate migration #{project_id}"
 
         try:
             if action == "create":
                 host_name = _make_host_name(scope, ip, mac, desc, project_id)
-                view = host_create(
-                    name=host_name,
-                    address=ip,
-                    mac_address=mac,
-                    comment=desc or f"FortiGate migration #{project_id}",
-                )
+
+                # Insert DhcpReservation in queued state.
                 row = DhcpReservation(
                     scope_id=scope.id,
-                    smc_host_name=view.name,
-                    smc_host_href=view.href,
-                    ip_address=view.address,
+                    smc_host_name=host_name,
+                    smc_host_href="",
+                    ip_address=ip,
                     mac_address=mac,
-                    status="pending",
+                    status="queued",
                     source=source,
                 )
                 db.session.add(row)
+                db.session.flush()    # get row.id, surface dedupe IntegrityError
+
+                # Enqueue. The helper sets `source_correlation_id` to
+                # `dhcp_reservation:<row.id>` by default; we override it
+                # below to the migration batch id so all rows group on
+                # /changes/.
+                change = enqueue_reservation_create(
+                    scope=scope, reservation=row,
+                    name=host_name, address=ip, mac_address=mac,
+                    ipv6_address="", secondary=[],
+                    tools_profile_ref="", comment=comment,
+                )
+                change.source_correlation_id = correlation_id
+                db.session.flush()
+
                 out["reservations_created"] += 1
+                out["changes_enqueued"] += 1
                 out["entries"].append({"level": "info",
-                    "msg": f"  ✓ Created Host {view.name} "
-                           f"({ip} / {mac}) on scope {scope.id}"})
+                    "msg": (f"  ✓ Queued create Host {host_name} "
+                            f"({ip} / {mac}) on scope {scope.id} "
+                            f"(change #{change.id})")})
 
             elif action in ("skip", "reuse"):
                 out["reservations_skipped"] += 1
@@ -222,48 +248,65 @@ def _process_scope_reservations(scope, selected, project_id, out,
                     "msg": f"  − Skipped {ip} / {mac} (already migrated)"})
 
             elif action in ("conflict_skip", "conflict_overwrite"):
-                # User flipped a conflict to selected=True → treat as overwrite
-                # on the existing Host the dedup matched (smc_match.host_name).
+                # Overwrite path: the dedup output identified an existing
+                # Host with the same identity. We enqueue an `update` for
+                # that Host's IP / MAC.
                 match = r.get("smc_match") or {}
                 existing_name = match.get("host_name", "")
                 if not existing_name:
                     out["reservations_errors"] += 1
                     out["entries"].append({"level": "error",
-                        "msg": f"  ✗ {ip} / {mac}: conflict overwrite requested "
-                               "but no existing Host name in dedup — fix manually."})
+                        "msg": (f"  ✗ {ip} / {mac}: conflict overwrite "
+                                f"requested but no existing Host name in "
+                                f"dedup — fix manually.")})
                     continue
 
-                # Overwrite path: update the existing Host's IP + MAC marker,
-                # update or upsert the DhcpReservation row.
-                view = host_update(
-                    name=existing_name,
-                    address=ip,
-                    mac_address=mac,
-                    comment=desc or f"FortiGate migration #{project_id} (overwrote conflict)",
-                )
+                # Find or create the local DhcpReservation row that maps
+                # to the existing SMC Host.
                 existing_row = (DhcpReservation.query
                                 .filter_by(scope_id=scope.id,
                                            smc_host_name=existing_name)
                                 .first())
-                if existing_row:
-                    existing_row.ip_address = view.address
-                    existing_row.mac_address = mac
-                    existing_row.status = "pending"
+                if existing_row is None:
+                    # We're going to update an SMC Host we don't have a
+                    # local row for. Stamp a row in pending state with
+                    # the pre-existing href (we don't have it without
+                    # SMC fetch — leave blank, the queue handler will
+                    # need to look it up by name on push).
+                    existing_row = DhcpReservation(
+                        scope_id=scope.id,
+                        smc_host_name=existing_name,
+                        smc_host_href=match.get("host_href", "") or "",
+                        ip_address=ip,
+                        mac_address=mac,
+                        status="queued",
+                        source=source,
+                    )
+                    db.session.add(existing_row)
+                    db.session.flush()
+                else:
+                    existing_row.status = "queued"
                     existing_row.last_error = ""
                     existing_row.source = source
-                else:
-                    db.session.add(DhcpReservation(
-                        scope_id=scope.id,
-                        smc_host_name=view.name,
-                        smc_host_href=view.href,
-                        ip_address=view.address,
-                        mac_address=mac,
-                        status="pending",
-                        source=source,
-                    ))
+                    existing_row.ip_address = ip
+                    existing_row.mac_address = mac
+
+                change = enqueue_reservation_update(
+                    reservation=existing_row,
+                    address=ip, mac_address=mac,
+                    ipv6_address="", secondary=[],
+                    tools_profile_ref="",
+                    comment=f"{comment} (overwrote conflict)",
+                    previous_address=match.get("ip", ""),
+                )
+                change.source_correlation_id = correlation_id
+                db.session.flush()
+
                 out["reservations_updated"] += 1
+                out["changes_enqueued"] += 1
                 out["entries"].append({"level": "warning",
-                    "msg": f"  ⚙ Overwrote {existing_name}: now {ip} / {mac}"})
+                    "msg": (f"  ⚙ Queued overwrite of {existing_name}: "
+                            f"now {ip} / {mac} (change #{change.id})")})
 
             else:
                 out["reservations_skipped"] += 1

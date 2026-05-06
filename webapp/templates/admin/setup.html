@@ -100,6 +100,7 @@
         </div>
 
         <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <button type="submit" class="btn btn-primary w-100 py-2">
                 <i class="bi bi-rocket-takeoff me-2"></i>Create Admin Account & Start
             </button>

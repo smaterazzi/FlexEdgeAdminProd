@@ -1,0 +1,109 @@
+{% extends "base.html" %}
+{% block title %}{{ 'Edit' if domain else 'New' }} Domain{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.domains') }}">Domains</a></li>
+            <li class="breadcrumb-item active">{{ 'Edit' if domain else 'New' }}</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    <div class="row justify-content-center">
+        <div class="col-md-8 col-lg-7">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% for category, message in messages %}
+            <div class="alert alert-{{ category }} mb-3">{{ message }}</div>
+            {% endfor %}
+            {% endwith %}
+
+            <div class="card bg-dark border-secondary">
+                <div class="card-header">
+                    <h5 class="mb-0">
+                        <i class="bi bi-diagram-3"></i>
+                        {{ 'Edit Domain' if domain else 'Add Domain' }}
+                    </h5>
+                </div>
+                <div class="card-body">
+                    <form method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                        {% if not api_keys %}
+                        <div class="alert alert-warning mb-3" style="font-size:0.85rem;">
+                            <i class="bi bi-exclamation-triangle me-1"></i>
+                            No active API keys exist. <a href="{{ url_for('admin.api_key_new') }}">Create one</a> first —
+                            a Domain points at an API key (which carries the SMC server URL).
+                        </div>
+                        {% endif %}
+
+                        <div class="mb-3">
+                            <label for="api_key_id" class="form-label">API Key</label>
+                            <select class="form-select bg-dark border-secondary text-light"
+                                    id="api_key_id" name="api_key_id" required>
+                                {% for k in api_keys %}
+                                <option value="{{ k.id }}"
+                                        data-smc-url="{{ k.smc_url or '' }}"
+                                        {% if domain and domain.api_key_id == k.id %}selected{% endif %}>
+                                    {{ k.name }}{% if k.smc_url %} — {{ k.smc_url }}{% endif %}
+                                </option>
+                                {% endfor %}
+                            </select>
+                            <div class="form-text">
+                                The API key carries the SMC server URL + credential. One ApiKey can host
+                                multiple Domains, each pointing at a different SMC admin domain.
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="smc_domain_name" class="form-label">SMC Admin Domain Name</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="smc_domain_name" name="smc_domain_name" required
+                                   value="{{ domain.smc_domain_name if domain else 'Shared Domain' }}"
+                                   placeholder="Shared Domain">
+                            <div class="form-text">
+                                The exact domain name as configured in SMC (e.g. <code>Shared Domain</code>,
+                                <code>Customer-A</code>). Must match what the API key is authorized for.
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="display_name" class="form-label">Display Name</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="display_name" name="display_name"
+                                   value="{{ domain.display_name if domain else '' }}"
+                                   placeholder="(auto-generated from API key + SMC domain)">
+                            <div class="form-text">
+                                Shown in the top-right Domain switcher. Leave blank for the default
+                                <code>&lt;ApiKey name&gt; · &lt;SMC domain&gt;</code>.
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label for="slug" class="form-label">Slug</label>
+                            <input type="text" class="form-control bg-dark border-secondary text-light"
+                                   id="slug" name="slug" pattern="[a-z0-9\-_]*"
+                                   value="{{ domain.slug if domain else '' }}"
+                                   placeholder="(auto-generated)">
+                            <div class="form-text">
+                                Lowercase identifier used as <code>--tenant &lt;slug&gt;</code> in the CLI for
+                                back-compat. Auto-generated from display name when blank. Must be unique.
+                            </div>
+                        </div>
+
+                        <div class="d-flex gap-2 mt-4">
+                            <button type="submit" class="btn btn-primary" {% if not api_keys %}disabled{% endif %}>
+                                <i class="bi bi-check-circle me-1"></i>{{ 'Save' if domain else 'Create' }}
+                            </button>
+                            <a href="{{ url_for('admin.domains') }}" class="btn btn-outline-secondary">Cancel</a>
+                        </div>
+                    </form>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}

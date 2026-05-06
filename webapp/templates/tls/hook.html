@@ -19,6 +19,7 @@
                         <i class="bi bi-clipboard"></i> Copy
                     </button>
                     <form method="post" action="{{ url_for('tls.hook_install') }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="api_url" value="{{ api_url }}">
                         <button type="submit" class="btn btn-warning"
                                 onclick="return confirm('Install to /etc/letsencrypt/renewal-hooks/deploy/?')">

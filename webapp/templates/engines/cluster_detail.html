@@ -35,19 +35,43 @@
     </div>
     {% endif %}
 
+    <!-- ── Search bar — full-text filter across every tab's table ─────── -->
+    <div class="card mb-3">
+      <div class="card-body py-2">
+        <div class="d-flex gap-2 align-items-center">
+          <i class="bi bi-funnel text-muted"></i>
+          <input id="cluster-search" type="search"
+                 class="form-control form-control-sm"
+                 placeholder='Filter rows… e.g. "vlan 100", "primary AND mgt", "10.0.0 OR 192.168"'
+                 autocomplete="off">
+          <button id="cluster-search-clear" type="button"
+                  class="btn btn-sm btn-outline-secondary" style="display:none;"
+                  title="Clear filter (Esc)">
+            <i class="bi bi-x-lg"></i>
+          </button>
+        </div>
+        <div class="small text-muted mt-1">
+          Multi-term: separate with <code>AND</code> (all must match) or
+          <code>OR</code> (any matches). Implicit <code>AND</code> when no
+          operator. Case-insensitive. Filters every tab; matching tokens are
+          highlighted; tab counts show <span class="text-warning">filtered/total</span>.
+        </div>
+      </div>
+    </div>
+
     <!-- ── Cluster summary tab nav ───────────────────────────── -->
     <ul class="nav nav-tabs mt-3" id="clusterTabs" role="tablist">
         <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-nodes">
-            <i class="bi bi-hdd-stack"></i> Nodes ({{ detail.nodes|length }})
+            <i class="bi bi-hdd-stack"></i> Nodes <span class="tab-count">({{ detail.nodes|length }})</span>
         </button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-interfaces">
-            <i class="bi bi-ethernet"></i> Interfaces ({{ detail.interfaces|length }})
+            <i class="bi bi-ethernet"></i> Interfaces <span class="tab-count">({{ detail.interfaces|length }})</span>
         </button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-routing">
-            <i class="bi bi-signpost"></i> Routing ({{ detail.routing|length }})
+            <i class="bi bi-signpost"></i> Routing <span class="tab-count">({{ detail.routing|length }})</span>
         </button></li>
         <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-contact">
-            <i class="bi bi-globe"></i> Contact addresses ({{ detail.contact_addresses|length }})
+            <i class="bi bi-globe"></i> Contact addresses <span class="tab-count">({{ detail.contact_addresses|length }})</span>
         </button></li>
     </ul>
 
@@ -59,7 +83,7 @@
             <div class="text-muted">No nodes returned by SMC.</div>
             {% else %}
             <div class="table-responsive">
-                <table class="table table-sm table-dark align-middle mb-0">
+                <table class="table table-sm table-dark align-middle mb-0 searchable-table">
                     <thead>
                         <tr>
                             <th style="width:3rem;">ID</th>
@@ -138,7 +162,7 @@
             <div class="text-muted">No interfaces returned by SMC.</div>
             {% else %}
             <div class="table-responsive">
-                <table class="table table-sm table-dark align-middle mb-0">
+                <table class="table table-sm table-dark align-middle mb-0 searchable-table">
                     <thead>
                         <tr>
                             <th>Interface</th>
@@ -190,7 +214,7 @@
             <div class="text-muted">No routing entries returned by SMC.</div>
             {% else %}
             <div class="table-responsive">
-                <table class="table table-sm table-dark align-middle mb-0">
+                <table class="table table-sm table-dark align-middle mb-0 searchable-table">
                     <thead>
                         <tr>
                             <th>Name</th>
@@ -220,7 +244,7 @@
             <div class="text-muted">No contact addresses returned by SMC (or unsupported on this version).</div>
             {% else %}
             <div class="table-responsive">
-                <table class="table table-sm table-dark align-middle mb-0">
+                <table class="table table-sm table-dark align-middle mb-0 searchable-table">
                     <thead>
                         <tr>
                             <th>Interface</th>
@@ -246,4 +270,181 @@
 
     </div>
 </div>
+
+<style>
+mark.search-hit {
+  background-color: #ffeb3b;
+  color: #000;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+.tab-count.filtered {
+  color: #ffc107;
+  font-weight: 600;
+}
+</style>
+
+<script>
+(function() {
+  // ── Cluster detail full-text filter ─────────────────────────────────
+  // - Tokenises the query on whitespace, treating `AND` / `OR` (case
+  //   insensitive) as operators between tokens.
+  // - Filters every `<tbody>` row of every `.searchable-table` on the
+  //   page (across all tabs — so matches in hidden tabs become visible
+  //   when the user switches).
+  // - Highlights matched substrings using <mark.search-hit>; idempotent
+  //   across re-searches by stripping previous marks first.
+  // - Updates each tab's count badge to "filtered/total" when active,
+  //   resets to "(total)" when the query is empty.
+
+  const input    = document.getElementById("cluster-search");
+  const clearBtn = document.getElementById("cluster-search-clear");
+  if (!input) return;
+
+  const tables = Array.from(document.querySelectorAll(".searchable-table"));
+  // Cache a stable reference to each tab's count <span> element + its
+  // original "(N)" text — so we can restore it cleanly when filter empties.
+  const tabCountFor = new Map();   // tableEl -> {span, originalText, total}
+  for (const tbl of tables) {
+    const pane = tbl.closest(".tab-pane");
+    if (!pane) continue;
+    const btn = document.querySelector(`button[data-bs-target="#${pane.id}"]`);
+    const span = btn ? btn.querySelector(".tab-count") : null;
+    if (!span) continue;
+    const total = tbl.querySelectorAll("tbody > tr").length;
+    tabCountFor.set(tbl, { span, originalText: span.textContent, total });
+  }
+
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function parseQuery(q) {
+    const parts = q.trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return { tokens: [], op: "AND" };
+    let op = "AND";
+    let sawAnd = false, sawOr = false;
+    const tokens = [];
+    for (const p of parts) {
+      const u = p.toUpperCase();
+      if (u === "AND") { sawAnd = true; op = "AND"; continue; }
+      if (u === "OR")  { sawOr  = true; op = "OR";  continue; }
+      tokens.push(p.toLowerCase());
+    }
+    // Mixed operators: AND wins (less surprising than OR taking precedence).
+    if (sawAnd && sawOr) op = "AND";
+    return { tokens, op };
+  }
+
+  function clearHighlights(rowEl) {
+    rowEl.querySelectorAll("mark.search-hit").forEach(m => {
+      m.replaceWith(document.createTextNode(m.textContent));
+    });
+    rowEl.normalize();
+  }
+
+  function highlightTokens(rowEl, tokens) {
+    if (!tokens.length) return;
+    const re = new RegExp(tokens.map(escapeRegex).join("|"), "gi");
+    // Walk all text nodes once, collect them, then mutate (mutating during
+    // walk would skip nodes).
+    const walker = document.createTreeWalker(rowEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.textContent.trim()) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode;
+        // Don't highlight inside an existing mark.search-hit, and skip
+        // <script>/<style> bodies just in case.
+        if (p && p.tagName === "MARK" && p.classList.contains("search-hit")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (p && (p.tagName === "SCRIPT" || p.tagName === "STYLE")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes = [];
+    let n;
+    while ((n = walker.nextNode())) nodes.push(n);
+    for (const tn of nodes) {
+      const text = tn.textContent;
+      re.lastIndex = 0;
+      if (!re.test(text)) continue;
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let lastIdx = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > lastIdx) {
+          frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+        }
+        const mk = document.createElement("mark");
+        mk.className = "search-hit";
+        mk.textContent = m[0];
+        frag.appendChild(mk);
+        lastIdx = m.index + m[0].length;
+      }
+      if (lastIdx < text.length) {
+        frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+      }
+      tn.parentNode.replaceChild(frag, tn);
+    }
+  }
+
+  function applyFilter() {
+    const q = input.value;
+    const { tokens, op } = parseQuery(q);
+    clearBtn.style.display = q ? "" : "none";
+
+    for (const tbl of tables) {
+      let visible = 0;
+      const rows = tbl.querySelectorAll("tbody > tr");
+      for (const row of rows) {
+        clearHighlights(row);
+        const text = row.textContent.toLowerCase();
+        const match = !tokens.length
+          ? true
+          : (op === "AND"
+              ? tokens.every(t => text.includes(t))
+              : tokens.some(t => text.includes(t)));
+        if (match) {
+          row.style.display = "";
+          visible++;
+          if (tokens.length) highlightTokens(row, tokens);
+        } else {
+          row.style.display = "none";
+        }
+      }
+      const meta = tabCountFor.get(tbl);
+      if (meta) {
+        if (tokens.length && visible !== meta.total) {
+          meta.span.textContent = `(${visible} of ${meta.total})`;
+          meta.span.classList.add("filtered");
+        } else {
+          meta.span.textContent = meta.originalText;
+          meta.span.classList.remove("filtered");
+        }
+      }
+    }
+  }
+
+  // Debounce — typing in a 200-row table can be sluggish without it.
+  let debounceTimer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(applyFilter, 80);
+  });
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      input.value = "";
+      applyFilter();
+    }
+  });
+  clearBtn.addEventListener("click", () => {
+    input.value = "";
+    applyFilter();
+    input.focus();
+  });
+})();
+</script>
 {% endblock %}

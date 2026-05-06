@@ -23,17 +23,19 @@
 </h2>
 
 <form method="post" class="row g-3">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="col-md-6">
-    <label class="form-label">Name <span class="text-danger">*</span></label>
+    <label class="form-label">Name <small class="text-muted">(optional — derived from scope+IP if blank)</small></label>
     {% if reservation %}
       <input type="text" class="form-control" value="{{ reservation.smc_host_name }}" disabled>
       <div class="form-text">Host name is the SMC element key — cannot be renamed here.</div>
     {% else %}
-      <input type="text" class="form-control" name="name" required
+      <input type="text" class="form-control" name="name"
              value="{{ form_values.get('name', '') }}"
-             placeholder="e.g. printer-finance-01"
+             placeholder="(auto: dhcp-{{ scope.engine_name|lower }}-&lt;ip-dashed&gt;)"
              pattern="[A-Za-z0-9_.\-]+" maxlength="256">
-      <div class="form-text">Used as the SMC Host object name. Must be unique in the domain.</div>
+      <div class="form-text">Used as the SMC Host object name. Leave blank to auto-derive
+      from scope context (per Q16 Round 3); type a friendly name to override.</div>
     {% endif %}
   </div>
 

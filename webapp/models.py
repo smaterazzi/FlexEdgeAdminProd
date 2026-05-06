@@ -1,12 +1,15 @@
 """
 FlexEdgeAdmin — SQLAlchemy models.
 
-Tables:
-  tenants              SMC server connections
+Tables (admin / control plane):
+  tenants              SMC server connections (LEGACY — being absorbed into api_keys; dropped in Phase B)
   users                Authenticated users (from Azure AD)
-  api_keys             Encrypted SMC API keys
-  user_tenant_access   Junction: which users can access which tenants with which keys
+  api_keys             Encrypted SMC API keys + server-level config (smc_url, verify_ssl, timeout, …)
+  domains              Operator-facing scope unit — one row per (api_key, smc_domain_name)
+  user_domain_access   Junction: which users can use which Domains
+  user_tenant_access   LEGACY — kept until Phase B cutover; backfilled into user_domain_access at boot.
 
+Tables (features):
   managed_certificates TLS Manager — certbot-tracked certificates
   tls_deployments      TLS Manager — cert → engine deployments
   tls_deployment_logs  Per-deployment audit log
@@ -20,6 +23,14 @@ Tables:
   dhcp_engine_ssh_access   DHCP Manager — managed SSH-allow rule per engine (created in SMC)
 
   optimization_submissions  Rule-optimizer findings submitted for admin review
+
+Multi-Domain Revamp — Phase A status (2026-04-29):
+  * ApiKey absorbs the smc_url / verify_ssl / timeout / api_version / flexedge_source_ip
+    fields previously on Tenant (the Tenant entity is going away in Phase B).
+  * Domain + UserDomainAccess are the new operator-facing entities.
+  * Phase A backfills these from the legacy tables and lets old + new coexist.
+  * Phase B (later) drops tenants, user_tenant_access, and tenant_id/api_key_id from
+    every feature table — replaced by domain_id everywhere.
 """
 
 from datetime import datetime, timezone
@@ -74,7 +85,6 @@ class Tenant(db.Model):
 
     # Relationships
     api_keys = db.relationship("ApiKey", back_populates="tenant", lazy="dynamic")
-    user_accesses = db.relationship("UserTenantAccess", back_populates="tenant", lazy="dynamic")
 
     def __repr__(self):
         return f"<Tenant {self.slug!r}>"
@@ -86,13 +96,36 @@ class User(db.Model):
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     email = db.Column(db.String(255), unique=True, nullable=False, index=True)
     display_name = db.Column(db.String(255), default="", nullable=False)
+    # `role` is the legacy global role marker ("admin" | "viewer"). Kept for
+    # now so legacy `user_manager.is_admin()` callers keep resolving the
+    # same answer; replaced functionally by `is_super_admin` + per-Domain
+    # `UserDomainAccess.role`.
     role = db.Column(db.String(32), default="viewer", nullable=False)
+    # Four-tier role model (Change Management Q10, refined 2026-05-01):
+    #   SUPER ADMIN     — User.is_super_admin=True. The bootstrap admin
+    #                     (or anyone they explicitly promote). Sees every
+    #                     Domain (no UserDomainAccess row needed) and is
+    #                     the only role allowed cross-Domain infrastructure
+    #                     ops (Tenant / API Key / Domain CRUD). Singular by
+    #                     default — the setup wizard sets this on the first
+    #                     user; further Super Admins are deliberately rare.
+    #   GLOBAL ADMIN    — UserDomainAccess.role='global_admin'. Per-Domain.
+    #                     Confirm/Revoke `to_be_deleted` queue items, manage
+    #                     Domain Admin / Operator role assignments within
+    #                     that Domain. Visible only on Domains they're
+    #                     explicitly assigned to.
+    #   DOMAIN ADMIN    — UserDomainAccess.role='admin'. Per-Domain. Full
+    #                     CRUD on Domain-scoped objects, invite operators.
+    #   DOMAIN OPERATOR — UserDomainAccess.role='operator'. Per-Domain. CRU
+    #                     only; deletes go through the queue tagged
+    #                     `to_be_deleted` for Global/Super Admin to confirm.
+    is_super_admin = db.Column(db.Boolean, default=False, nullable=False)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     # Relationships
-    tenant_accesses = db.relationship("UserTenantAccess", back_populates="user", lazy="joined")
+    domain_accesses = db.relationship("UserDomainAccess", back_populates="user", lazy="joined")
     created_api_keys = db.relationship("ApiKey", back_populates="created_by", lazy="dynamic")
 
     def __repr__(self):
@@ -106,16 +139,29 @@ class ApiKey(db.Model):
     name = db.Column(db.String(255), nullable=False)
     encrypted_key = db.Column(EncryptedString, nullable=False)
     key_hash = db.Column(db.String(64), nullable=False, index=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+
+    # Server-level config — absorbed from Tenant during the Multi-Domain Revamp
+    # Phase A (2026-04-29). Each ApiKey inherently knows the SMC server it talks
+    # to. The Tenant table is being removed in Phase B once the cutover lands.
+    smc_url = db.Column(db.String(512), nullable=True)              # NOT NULL after backfill
+    verify_ssl = db.Column(db.Boolean, default=False, nullable=False)
+    timeout = db.Column(db.Integer, default=120, nullable=False)
+    api_version = db.Column(db.String(16), nullable=True)
+    flexedge_source_ip = db.Column(db.String(45), default="", nullable=False)
+
+    # LEGACY: tenant_id stays during Phase A so the old Tenant relationship
+    # keeps working until the cutover. Dropped in Phase B.
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+
     created_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     last_used_at = db.Column(db.DateTime, nullable=True)
 
     # Relationships
-    tenant = db.relationship("Tenant", back_populates="api_keys")
+    tenant = db.relationship("Tenant", back_populates="api_keys")  # LEGACY (kept until tenants table is dropped)
     created_by = db.relationship("User", back_populates="created_api_keys")
-    user_accesses = db.relationship("UserTenantAccess", back_populates="api_key", lazy="dynamic")
+    domains = db.relationship("Domain", back_populates="api_key", lazy="dynamic", cascade="all, delete-orphan")
 
     def set_key(self, plaintext: str):
         """Set the API key plaintext. Encrypts and hashes automatically."""
@@ -128,30 +174,91 @@ class ApiKey(db.Model):
         return self.encrypted_key  # EncryptedString handles decryption
 
     def __repr__(self):
-        return f"<ApiKey {self.name!r} tenant={self.tenant_id}>"
+        return f"<ApiKey {self.name!r} smc_url={self.smc_url!r}>"
 
 
-class UserTenantAccess(db.Model):
-    __tablename__ = "user_tenant_access"
+# Multi-Domain Revamp Phase B.3 step 2: UserTenantAccess removed.
+# The legacy table was dropped after every callsite migrated to
+# UserDomainAccess (committed cf5c46b).
+
+
+# ── Multi-Domain Revamp: new operator-facing entities ──────────────────────
+
+class Domain(db.Model):
+    """Operator-facing scope unit. One Domain = one (server, smc-domain, key)
+    triple. Replaces the old "Profile" concept.
+
+    Carries `slug` for CLI back-compat: `cli/connect.py --tenant <slug>`
+    keeps working — the slug now resolves a Domain instead of a Tenant.
+    During the Phase A migration each existing Tenant.slug is preserved on
+    its derived Domain so existing operator scripts don't break.
+    """
+    __tablename__ = "domains"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    smc_domain_name = db.Column(db.String(255), nullable=False)
+    display_name = db.Column(db.String(255), nullable=False)
+    slug = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("api_key_id", "smc_domain_name", name="uq_api_key_smc_domain"),
+    )
+
+    # Relationships
+    api_key = db.relationship("ApiKey", back_populates="domains")
+    user_accesses = db.relationship(
+        "UserDomainAccess", back_populates="domain", lazy="dynamic",
+        cascade="all, delete-orphan",
+    )
+
+    def __repr__(self):
+        return f"<Domain {self.slug!r} smc={self.smc_domain_name!r}>"
+
+
+class UserDomainAccess(db.Model):
+    """Replaces UserTenantAccess. Each row grants a User access to one Domain.
+    The `is_default` flag picks the auto-selected Domain on login (only one
+    default per user enforced application-side).
+
+    `role` is the per-Domain role (Change Management Q10, refined 2026-05-01):
+      * `global_admin` — full power within this Domain INCLUDING the
+                         Confirm/Revoke buttons for `to_be_deleted` queue
+                         items. Can promote/demote Domain Admin and Operator
+                         within the same Domain. Limited to the assigned
+                         Domain — for cross-Domain visibility, see
+                         `User.is_super_admin`.
+      * `admin`        — Domain Admin: full CRUD on Domain-scoped objects,
+                         can invite Operators (per Q13). Cannot Confirm
+                         deletes; that's Global Admin / Super Admin only.
+      * `operator`     — Domain Operator: CRU only; deletes go to the
+                         queue tagged `to_be_deleted` awaiting a Global /
+                         Super Admin confirm/revoke.
+    Default is `admin` so existing assignments preserve today's behavior.
+    """
+    __tablename__ = "user_domain_access"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=False)
+    role = db.Column(db.String(16), default="admin", nullable=False)
+    # role values: 'global_admin' | 'admin' | 'operator'
     is_default = db.Column(db.Boolean, default=False, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
 
     __table_args__ = (
-        db.UniqueConstraint("user_id", "tenant_id", "api_key_id", name="uq_user_tenant_key"),
+        db.UniqueConstraint("user_id", "domain_id", name="uq_user_domain"),
     )
 
     # Relationships
-    user = db.relationship("User", back_populates="tenant_accesses")
-    tenant = db.relationship("Tenant", back_populates="user_accesses")
-    api_key = db.relationship("ApiKey", back_populates="user_accesses")
+    user = db.relationship("User", back_populates="domain_accesses")
+    domain = db.relationship("Domain", back_populates="user_accesses")
 
     def __repr__(self):
-        return f"<UserTenantAccess user={self.user_id} tenant={self.tenant_id}>"
+        return f"<UserDomainAccess user={self.user_id} domain={self.domain_id}>"
 
 
 class ManagedCertificate(db.Model):
@@ -178,8 +285,14 @@ class TLSDeployment(db.Model):
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
     certificate_id = db.Column(db.Integer, db.ForeignKey("managed_certificates.id", ondelete="CASCADE"), nullable=False)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    # Phase B: domain_id is the canonical scope FK. tenant_id + api_key_id
+    # remain populated by the migration backfill so existing code keeps
+    # reading them until callsites are switched, but new writes only need
+    # domain_id (the migration fills the legacy columns from domain.api_key
+    # via a trigger-equivalent in app code).
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True)
 
     engine_name = db.Column(db.String(256), nullable=False)
     service_name = db.Column(db.String(256), nullable=False)
@@ -200,8 +313,9 @@ class TLSDeployment(db.Model):
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
 
     certificate = db.relationship("ManagedCertificate", back_populates="deployments")
-    tenant = db.relationship("Tenant")
-    api_key = db.relationship("ApiKey")
+    domain = db.relationship("Domain")
+    tenant = db.relationship("Tenant")           # LEGACY
+    api_key = db.relationship("ApiKey", foreign_keys=[api_key_id])  # LEGACY (use domain.api_key instead)
     logs = db.relationship("TLSDeploymentLog", back_populates="deployment",
                            lazy="dynamic", cascade="all, delete-orphan")
 
@@ -228,12 +342,17 @@ class TLSActivityLog(db.Model):
     __tablename__ = "tls_activity_logs"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Phase B: optional domain_id so the unified Logs view can filter per-domain.
+    # NULL on legacy rows (predate Phase B); set on every new entry.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="SET NULL"), nullable=True)
     category = db.Column(db.String(32), nullable=False)
     action = db.Column(db.String(64), nullable=False)
     status = db.Column(db.String(16), nullable=False)
     target = db.Column(db.String(256), default="", nullable=False)
     detail = db.Column(db.Text, default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+    domain = db.relationship("Domain")
 
 
 # ── DHCP Manager models ─────────────────────────────────────────────────
@@ -248,8 +367,11 @@ class DhcpScope(db.Model):
     __tablename__ = "dhcp_scopes"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    # Phase B: domain_id is canonical. tenant_id + api_key_id stay populated
+    # by the migration backfill until callsites are switched.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True)
 
     engine_name = db.Column(db.String(256), nullable=False)
     interface_id = db.Column(db.String(32), nullable=False)      # "2" or "2.100" for VLAN
@@ -268,11 +390,15 @@ class DhcpScope(db.Model):
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     __table_args__ = (
+        # LEGACY uniqueness — kept until Phase B3 drops tenant_id.
         db.UniqueConstraint("tenant_id", "engine_name", "interface_id", name="uq_dhcp_scope_engine_if"),
+        # NEW canonical uniqueness — same logical constraint expressed via domain_id.
+        db.UniqueConstraint("domain_id", "engine_name", "interface_id", name="uq_dhcp_scope_domain_if"),
     )
 
-    tenant = db.relationship("Tenant")
-    api_key = db.relationship("ApiKey")
+    domain = db.relationship("Domain")
+    tenant = db.relationship("Tenant")           # LEGACY
+    api_key = db.relationship("ApiKey", foreign_keys=[api_key_id])  # LEGACY (use domain.api_key)
     reservations = db.relationship("DhcpReservation", back_populates="scope",
                                    lazy="dynamic", cascade="all, delete-orphan")
     deployments = db.relationship("DhcpDeployment", back_populates="scope",
@@ -301,13 +427,28 @@ class DhcpReservation(db.Model):
     ip_address = db.Column(db.String(45), nullable=False)
     mac_address = db.Column(db.String(17), nullable=False)       # aa:bb:cc:dd:ee:ff
 
-    status = db.Column(db.String(32), default="pending", nullable=False)  # pending|synced|out_of_sync|error
+    status = db.Column(db.String(32), default="pending", nullable=False)
+    # status ∈ pending|synced|out_of_sync|error|queued|push_failed
+    #   queued       Phase E.2 — operator submitted a create/update; the
+    #                corresponding PendingChange is in QUEUED state. The
+    #                SMC Host doesn't exist yet (smc_host_href is empty).
+    #   push_failed  Phase E.2 — push attempted, SMC rejected. last_error
+    #                holds the formatted SMC error; the row offers a
+    #                Retry button on the scope listing.
     last_synced_at = db.Column(db.DateTime, nullable=True)
     last_error = db.Column(db.Text, default="", nullable=False)
     # Origin of this row — empty for manually-added, "migration:<project_id>"
     # for FortiGate-import-generated rows. Used for the "From migration"
     # badge in the DHCP Manager UI and for traceability.
     source = db.Column(db.String(64), default="", nullable=False)
+    # Phase E.2 — link to the PendingChange row that controls this
+    # reservation when status ∈ ('queued', 'push_failed'). Cleared on
+    # successful push. NULL otherwise.
+    pending_change_id = db.Column(
+        db.Integer,
+        db.ForeignKey("pending_changes.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
@@ -317,6 +458,10 @@ class DhcpReservation(db.Model):
     )
 
     scope = db.relationship("DhcpScope", back_populates="reservations")
+    pending_change = db.relationship(
+        "PendingChange", foreign_keys=[pending_change_id],
+        post_update=True,
+    )
 
     def __repr__(self):
         return f"<DhcpReservation {self.mac_address} → {self.ip_address} scope={self.scope_id}>"
@@ -343,6 +488,12 @@ class DhcpDeployment(db.Model):
     diff = db.Column(db.Text, default="", nullable=False)
     duration_ms = db.Column(db.Integer, default=0, nullable=False)
     error = db.Column(db.Text, default="", nullable=False)
+    # Reload warning is a *secondary* signal — file write succeeded but the
+    # dhcpd HUP didn't reach an active process. The deployment is still
+    # considered ``status="ok"`` (operator can force a reload via SMC policy
+    # refresh). Kept separate from ``error`` so the audit log doesn't
+    # conflate "we wrote nothing" with "we wrote but didn't reload".
+    reload_warning = db.Column(db.Text, default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
 
     scope = db.relationship("DhcpScope", back_populates="deployments")
@@ -367,8 +518,11 @@ class DhcpEngineCredential(db.Model):
     __tablename__ = "dhcp_engine_credentials"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    # Phase B: domain_id is canonical. tenant_id + api_key_id stay during
+    # transition; backfilled by the migration.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True)
 
     engine_name = db.Column(db.String(256), nullable=False)
     node_index = db.Column(db.Integer, default=0, nullable=False)
@@ -385,15 +539,22 @@ class DhcpEngineCredential(db.Model):
     last_verified_at = db.Column(db.DateTime, nullable=True)
     last_verify_status = db.Column(db.String(32), default="unverified", nullable=False)  # ok|failed|unverified
     last_error = db.Column(db.Text, default="", nullable=False)
+    # Cache freshness — set whenever an op verifies this credential's state
+    # (enroll, verify, force-reset, refresh, deploy with successful SSH).
+    # Compared against now() to decide whether to surface a "stale, refresh
+    # needed" warning. NULL on rows created before this column existed.
+    state_refreshed_at = db.Column(db.DateTime, nullable=True, default=_utcnow)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     __table_args__ = (
-        db.UniqueConstraint("tenant_id", "engine_name", "node_id", name="uq_dhcp_cred_engine_node"),
+        db.UniqueConstraint("tenant_id", "engine_name", "node_id", name="uq_dhcp_cred_engine_node"),    # LEGACY
+        db.UniqueConstraint("domain_id", "engine_name", "node_id", name="uq_dhcp_cred_domain_node"),    # NEW
     )
 
-    tenant = db.relationship("Tenant")
-    api_key = db.relationship("ApiKey")
+    domain = db.relationship("Domain")
+    tenant = db.relationship("Tenant")           # LEGACY
+    api_key = db.relationship("ApiKey", foreign_keys=[api_key_id])  # LEGACY (use domain.api_key)
 
     def __repr__(self):
         return f"<DhcpEngineCredential {self.engine_name}/node{self.node_index}@{self.hostname}>"
@@ -413,8 +574,11 @@ class DhcpEngineSshAccess(db.Model):
     __tablename__ = "dhcp_engine_ssh_access"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
-    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    # Phase B: domain_id is canonical. tenant_id + api_key_id stay during
+    # transition; backfilled by the migration.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
+    api_key_id = db.Column(db.Integer, db.ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True)
 
     engine_name = db.Column(db.String(256), nullable=False)
     policy_name = db.Column(db.String(256), default="", nullable=False)
@@ -425,15 +589,21 @@ class DhcpEngineSshAccess(db.Model):
 
     created_by_email = db.Column(db.String(255), default="", nullable=False)
     last_seen_in_policy_at = db.Column(db.DateTime, nullable=True)
+    # Cache freshness — set when the rule is verified present in SMC policy
+    # (install, refresh, deploy preflight). Drives the same stale/refresh UX
+    # as DhcpEngineCredential.state_refreshed_at.
+    state_refreshed_at = db.Column(db.DateTime, nullable=True, default=_utcnow)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
 
     __table_args__ = (
-        db.UniqueConstraint("tenant_id", "engine_name", name="uq_dhcp_ssh_access_engine"),
+        db.UniqueConstraint("tenant_id", "engine_name", name="uq_dhcp_ssh_access_engine"),    # LEGACY
+        db.UniqueConstraint("domain_id", "engine_name", name="uq_dhcp_ssh_access_domain"),    # NEW
     )
 
-    tenant = db.relationship("Tenant")
-    api_key = db.relationship("ApiKey")
+    domain = db.relationship("Domain")
+    tenant = db.relationship("Tenant")           # LEGACY
+    api_key = db.relationship("ApiKey", foreign_keys=[api_key_id])  # LEGACY (use domain.api_key)
 
     def __repr__(self):
         return f"<DhcpEngineSshAccess {self.engine_name} rule={self.rule_name!r}>"
@@ -444,12 +614,17 @@ class DhcpActivityLog(db.Model):
     __tablename__ = "dhcp_activity_logs"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    # Phase B: optional domain_id for the unified Logs view filter.
+    # NULL on legacy rows; set on every new entry.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="SET NULL"), nullable=True)
     category = db.Column(db.String(32), nullable=False)          # scope|reservation|ssh|deploy|system
     action = db.Column(db.String(64), nullable=False)
     status = db.Column(db.String(16), nullable=False)            # ok|failed|info
     target = db.Column(db.String(256), default="", nullable=False)
     detail = db.Column(db.Text, default="", nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+
+    domain = db.relationship("Domain")
 
 
 class EngineTerminalSession(db.Model):
@@ -492,7 +667,10 @@ class OptimizationSubmission(db.Model):
     __tablename__ = "optimization_submissions"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
-    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False)
+    # Phase B: domain_id is canonical. tenant_id stays during transition;
+    # backfilled by the migration.
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"), nullable=True)
+    tenant_id = db.Column(db.Integer, db.ForeignKey("tenants.id", ondelete="CASCADE"), nullable=True)
     policy_name = db.Column(db.String(255), nullable=False)
 
     submitted_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -506,12 +684,348 @@ class OptimizationSubmission(db.Model):
     reviewed_at = db.Column(db.DateTime, nullable=True)
     admin_notes = db.Column(db.Text, default="", nullable=False)
 
-    tenant = db.relationship("Tenant")
+    domain = db.relationship("Domain")
+    tenant = db.relationship("Tenant")           # LEGACY
     submitted_by = db.relationship("User", foreign_keys=[submitted_by_id])
     reviewed_by = db.relationship("User", foreign_keys=[reviewed_by_id])
 
     def __repr__(self):
         return f"<OptimizationSubmission #{self.id} policy={self.policy_name!r} status={self.status}>"
+
+
+# ── Platform-wide log management (replaces per-feature activity tables) ──
+#
+# Standing rule (memory: feedback_logging_standing_rule, 2026-04-29): every
+# feature must funnel its audit + operational entries through one platform
+# log system, NOT hand-rolled per-feature tables.
+#
+# `platform_logs` is the unified target. Legacy tables (dhcp_activity_logs,
+# tls_activity_logs) are backfilled into it once at boot, then made read-only
+# for the existing per-feature reader views — but every NEW write goes here.
+#
+# `platform_settings` is a generic key/value table; the log management
+# subsystem uses the keys: log_mode, log_retention_days,
+# feature_log_<feature_name>.
+
+class PlatformLog(db.Model):
+    """One unified audit + operational log row for every feature.
+
+    `level`:
+      * `audit` — user-triggered ops (always persisted)
+      * `op` — operational details (persisted only when log_mode = verbose)
+
+    `feature` is the feature-registry name ("dhcp", "tls", "engines",
+    "migration", "admin", "auth", "optimizer"). The Logs settings page
+    drives a per-feature on/off toggle keyed by this name.
+
+    `source_correlation_id` groups a batch of related entries — e.g. a
+    migration import #42 emits dozens of entries that share the same id
+    so the Logs page can collapse them into one expandable group.
+    """
+    __tablename__ = "platform_logs"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    timestamp = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    level = db.Column(db.String(16), default="audit", nullable=False, index=True)
+    feature = db.Column(db.String(64), nullable=False, index=True)
+    action = db.Column(db.String(128), nullable=False)
+    status = db.Column(db.String(16), default="ok", nullable=False)
+    user_email = db.Column(db.String(256), nullable=True)
+    target = db.Column(db.String(512), default="", nullable=False)
+    detail = db.Column(db.Text, default="", nullable=False)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="SET NULL"),
+                          nullable=True, index=True)
+    source_correlation_id = db.Column(db.String(64), nullable=True, index=True)
+
+    domain = db.relationship("Domain")
+
+    def __repr__(self):
+        return (f"<PlatformLog #{self.id} {self.feature}:{self.action} "
+                f"({self.status})>")
+
+
+class PlatformSetting(db.Model):
+    """Generic key/value config table used by the log management subsystem.
+
+    Known keys:
+      * `log_mode` — "normal" | "verbose"
+      * `log_retention_days` — integer string, default "90"
+      * `feature_log_<name>` — "on" | "off" (default ON when row absent)
+      * `legacy_logs_migrated` — "1" once the boot-time backfill has run
+    """
+    __tablename__ = "platform_settings"
+
+    key = db.Column(db.String(64), primary_key=True)
+    value = db.Column(db.Text, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow,
+                           onupdate=_utcnow, nullable=False)
+    updated_by_email = db.Column(db.String(256), nullable=True)
+
+    def __repr__(self):
+        return f"<PlatformSetting {self.key}={self.value!r}>"
+
+
+# ── Phase E.2 — Bypass Queue (per-domain capability + per-user override) ─
+
+class FeatureBypassSetting(db.Model):
+    """Per-domain, per-user "bypass queue" toggle.
+
+    Two row shapes coexist in this table:
+
+      1. **Domain capability** (`user_id IS NULL`) — gate that *allows*
+         Domain Admins of the domain to grant per-user bypass for the
+         feature. Toggling this on/off does NOT change operator
+         behavior on its own; it just enables the per-user UI.
+
+      2. **Per-user override** (`user_id IS NOT NULL`) — actually
+         changes behavior. When `enabled=True`, the route auto-pushes
+         the queue row inline (regardless of the user's role tier)
+         and deletes the row on success. Audit log entry stays.
+
+    Lookup hierarchy in `shared/queue_settings.should_bypass_queue`:
+      * Per-user row first (most specific wins).
+      * Otherwise: queue is the default (operators wait, admins
+        auto-push but keep the queue row visible).
+
+    Authority (enforced in routes, not the schema):
+      * Domain capability — Domain Admin in the domain, Global Admin,
+        Super Admin can toggle.
+      * Per-user override — same admins, but Domain Admin can only
+        edit when domain capability is ON for that feature.
+
+    Operators have no edit rights; they can only view their own
+    bypass status (read-only "Bypass active" badge in the UI).
+    """
+    __tablename__ = "feature_bypass_settings"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    # NULL → domain-capability row; otherwise per-user override.
+    user_id = db.Column(db.Integer,
+                        db.ForeignKey("users.id", ondelete="CASCADE"),
+                        nullable=True, index=True)
+    feature = db.Column(db.String(64), nullable=False, index=True)
+    enabled = db.Column(db.Boolean, default=False, nullable=False)
+
+    updated_at = db.Column(db.DateTime, default=_utcnow,
+                           onupdate=_utcnow, nullable=False)
+    updated_by_id = db.Column(db.Integer,
+                              db.ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True)
+
+    domain = db.relationship("Domain")
+    user = db.relationship("User", foreign_keys=[user_id])
+    updated_by = db.relationship("User", foreign_keys=[updated_by_id])
+
+    # SQLite treats NULL as distinct in UNIQUE constraints, so this
+    # composite catches duplicates only for per-user rows. The
+    # capability-row uniqueness ((domain_id, NULL, feature) → at most
+    # one) is enforced at the application layer in
+    # `shared/queue_settings.set_capability`.
+    __table_args__ = (
+        db.UniqueConstraint("domain_id", "user_id", "feature",
+                            name="uq_feature_bypass"),
+    )
+
+    def __repr__(self):
+        scope = "capability" if self.user_id is None else f"user={self.user_id}"
+        return (f"<FeatureBypassSetting domain={self.domain_id} "
+                f"feature={self.feature!r} {scope} enabled={self.enabled}>")
+
+
+# ── Change Management — Phase A schema ───────────────────────────────────
+#
+# Spec: docs/ChangeManagementProcess.md
+#
+# Two new tables introduce the two-phase commit model:
+#
+#   smc_objects     The "SMCRelated" registry. Every SMC element FlexEdgeAdmin
+#                   has read or written gets a row here. Drives drift
+#                   detection (Q6) and the queue's per-object sub-queue (the
+#                   ASSUMPTIONS hierarchical model).
+#
+#   pending_changes The queue itself. Each row is one mutating intent that
+#                   is QUEUED in the FEA DB but NOT yet sent to SMC. The
+#                   push runner (Phase C) drains this table.
+#
+# Phase A landing strategy: tables are created empty + defensively, no code
+# yet enqueues into them and no UI surfaces them. Behavior is unchanged.
+# Phases B-H wire them up.
+
+class SmcObject(db.Model):
+    """The `SMCRelated` registry — every SMC element FEA has touched.
+
+    `smc_href` is the SMC-side identity (URL path under the SMC API root).
+    Unique within a Domain. `smc_type` is the SMC element kind: 'host',
+    'engine', 'policy', 'rule', 'nat_rule', 'service', 'service_group',
+    'network', 'address_range', 'fqdn', 'zone', 'group', 'tls_credential',
+    'dhcp_scope_reservation', etc.
+
+    `last_seen_hash` is a stable digest of the SMC payload at the time we
+    last read it. Drift detection (Phase G) compares this against a fresh
+    SMC fetch — a mismatch surfaces as a drift card on the queue page.
+
+    `is_to_be_deleted` is set when a Domain Operator submits a delete
+    (Q10): the row stays in SMC (and in our other feature tables) but is
+    flagged across the UI awaiting a Global Admin confirm/revoke. The
+    actual delete only happens once the corresponding `pending_changes`
+    row reaches PUSHED state.
+
+    `managed_by_flexedge` distinguishes objects WE created (true) from
+    objects we only track (false). Drift on FEA-managed objects is more
+    surprising than drift on read-only tracked ones; the UI flags
+    accordingly.
+    """
+    __tablename__ = "smc_objects"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    smc_href = db.Column(db.String(1024), nullable=False)
+    smc_type = db.Column(db.String(64), nullable=False, index=True)
+    smc_name = db.Column(db.String(512), default="", nullable=False)
+
+    last_seen_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    last_seen_hash = db.Column(db.String(64), default="", nullable=False)
+
+    managed_by_flexedge = db.Column(db.Boolean, default=False, nullable=False)
+    is_to_be_deleted = db.Column(db.Boolean, default=False, nullable=False)
+
+    # Phase G — drift detector. Updated by `shared.smc_drift.scan_domain_drift`.
+    #   drift_state ∈ {'unknown', 'clean', 'drifted', 'gone'}
+    #   'unknown' = never scanned / hash not yet baselined
+    #   'clean'   = hash matches last scan
+    #   'drifted' = SMC element exists but its hash differs from last_seen_hash
+    #   'gone'    = SMC element no longer exists (404 from SMC)
+    # `drift_detail` carries a short human-readable summary ("address: 10.0.0.1
+    # → 10.0.0.5") for the queue UI.
+    drift_state = db.Column(db.String(16), default="unknown", nullable=False)
+    last_drift_check_at = db.Column(db.DateTime, nullable=True)
+    drift_detail = db.Column(db.String(512), default="", nullable=False)
+
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow,
+                           onupdate=_utcnow, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("domain_id", "smc_href", name="uq_smc_object_href"),
+    )
+
+    domain = db.relationship("Domain")
+    pending_changes = db.relationship(
+        "PendingChange", back_populates="smc_object",
+        lazy="dynamic", cascade="all, delete-orphan",
+    )
+
+    def __repr__(self):
+        return (f"<SmcObject #{self.id} {self.smc_type}:{self.smc_name!r} "
+                f"href={self.smc_href!r}>")
+
+
+class PendingChange(db.Model):
+    """Two-phase commit queue row — one mutating intent staged for review.
+
+    State machine (see ChangeManagementProcess.md § "Two-phase commit model"):
+
+        QUEUED ──Push──► PUSHED ──(engine activation)──► APPLIED
+           │               │
+           │               └── (SMC error) ──► PUSH_FAILED
+           │
+           └── (operator clicks Abort) ──► ABORTED
+           └── (loses a conflict resolution) ──► ABORTED
+
+    Hierarchical queue (the ASSUMPTIONS block):
+      * `created_at` — drives the MAIN-QUEUE time order (global view).
+      * `smc_object_id` — groups rows into a per-object sub-queue. Within
+        a sub-queue the order is FIFO by `created_at`.
+      * `scheduled_after` — explicit dependency (e.g. a section CREATE
+        must succeed before the rule CREATE that references it). The
+        push runner respects this on top of (sub-queue, created_at).
+
+    Migration import bulk (Q8):
+      * `scope='migration_review'` rows live in a separate review queue;
+        the operator validates them before promoting to `scope='main'`.
+
+    Conflict resolution (Q2):
+      * When a new change collides with an existing QUEUED change on the
+        same object, both rows get `state='conflict'` and `conflict_with_id`
+        cross-links them. The resolver (≥ Domain Admin) picks the winner;
+        the loser transitions to ABORTED with `push_error_text` describing
+        which row won.
+
+    Operator-submitted delete (Q10):
+      * `operation='to_be_deleted'` is the Domain Operator's request.
+      * The Global Admin confirm step transitions the same row to
+        `operation='delete'` + `state='queued'` (or directly to PUSHED
+        if confirm-and-push is one click). The revoke step transitions
+        it to ABORTED.
+    """
+    __tablename__ = "pending_changes"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    user_id = db.Column(db.Integer,
+                        db.ForeignKey("users.id", ondelete="SET NULL"),
+                        nullable=True, index=True)
+    smc_object_id = db.Column(db.Integer,
+                              db.ForeignKey("smc_objects.id", ondelete="SET NULL"),
+                              nullable=True, index=True)
+
+    # 'main' (production queue) | 'migration_review' (staging area for a
+    # migration import batch — operator validates before promoting).
+    scope = db.Column(db.String(32), default="main", nullable=False, index=True)
+
+    # 'create' | 'update' | 'delete' | 'to_be_deleted' | 'create_section'
+    # | 'upload_policy' | 'reload_dhcp'
+    operation = db.Column(db.String(32), nullable=False, index=True)
+
+    # JSON-encoded payload (full new state for create / diff for update /
+    # the scope+ip+mac triple for reservation reload / etc.). Schema
+    # depends on `operation`; documented per-operation in the push runner.
+    payload_json = db.Column(db.Text, default="{}", nullable=False)
+
+    feature_source = db.Column(db.String(32), nullable=False, index=True)
+    source_correlation_id = db.Column(db.String(64), nullable=True, index=True)
+
+    state = db.Column(db.String(32), default="queued", nullable=False, index=True)
+    # 'queued' | 'pushed' | 'applied' | 'aborted' | 'push_failed' | 'conflict'
+
+    scheduled_after = db.Column(db.Integer,
+                                db.ForeignKey("pending_changes.id",
+                                              ondelete="SET NULL"),
+                                nullable=True)
+    conflict_with_id = db.Column(db.Integer,
+                                 db.ForeignKey("pending_changes.id",
+                                               ondelete="SET NULL"),
+                                 nullable=True, index=True)
+
+    push_error_text = db.Column(db.Text, default="", nullable=False)
+    push_error_at = db.Column(db.DateTime, nullable=True)
+
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    transitioned_at = db.Column(db.DateTime, nullable=True)
+    transitioned_by_id = db.Column(db.Integer,
+                                   db.ForeignKey("users.id", ondelete="SET NULL"),
+                                   nullable=True)
+
+    domain = db.relationship("Domain")
+    user = db.relationship("User", foreign_keys=[user_id])
+    transitioned_by = db.relationship("User", foreign_keys=[transitioned_by_id])
+    smc_object = db.relationship("SmcObject", back_populates="pending_changes")
+    depends_on = db.relationship(
+        "PendingChange", remote_side=[id], foreign_keys=[scheduled_after],
+        post_update=True,
+    )
+
+    def __repr__(self):
+        return (f"<PendingChange #{self.id} {self.operation} "
+                f"scope={self.scope} state={self.state}>")
 
 
 def enable_wal_mode(app):

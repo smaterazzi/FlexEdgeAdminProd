@@ -79,6 +79,7 @@
                         </a>
                         <form method="post" action="{{ url_for('tls.deploy_delete', deployment_id=dep.id) }}" class="d-inline"
                               onsubmit="return confirm('Delete deployment {{ dep.service_name }}?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
                         </form>
                     </td>

@@ -11,6 +11,7 @@
   </div>
   <div class="card-body">
     <form method="post" action="{{ url_for('dhcp.scopes_discover') }}" class="row g-2">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <div class="col-md-3">
         <label class="form-label">Tenant</label>
         <select class="form-select" name="tenant_id" id="tenant-select" required>
@@ -86,6 +87,7 @@
             <form method="post" action="{{ url_for('dhcp.scope_delete', scope_id=s.id) }}"
                   class="d-inline"
                   onsubmit="return confirm('Remove this scope from FlexEdge tracking? (SMC is untouched.)');">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
               <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
             </form>
           </td>

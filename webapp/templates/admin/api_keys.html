@@ -59,19 +59,34 @@
                         {% if k.is_active %}
                         <form method="POST" action="{{ url_for('admin.api_key_revoke', id=k.id) }}" class="d-inline"
                               onsubmit="return confirm('Revoke API key &quot;{{ k.name }}&quot;? Active sessions will be logged out of SMC on the next request and need to re-select a profile.')">
-                            <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-outline-warning btn-sm py-0 px-2"
+                                    title="Soft-delete: marks the key inactive but keeps the row + audit history">
                                 <i class="bi bi-x-circle"></i> Revoke
                             </button>
                         </form>
                         {% else %}
                         <form method="POST" action="{{ url_for('admin.api_key_reactivate', id=k.id) }}" class="d-inline"
                               onsubmit="return confirm('Reactivate API key &quot;{{ k.name }}&quot;? It will become usable for SMC again immediately.')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button type="submit" class="btn btn-outline-success btn-sm py-0 px-2"
                                     title="Reactivate this key — it will become usable again">
                                 <i class="bi bi-arrow-counterclockwise"></i> Reactivate
                             </button>
                         </form>
                         {% endif %}
+                        {# Hard-delete — refused by the backend if any Domain
+                           still references this key. Cascade-delete (force=1)
+                           is intentionally NOT exposed in the UI — operator
+                           must clear dependent Domains first via /admin/domains. #}
+                        <form method="POST" action="{{ url_for('admin.api_key_delete', id=k.id) }}" class="d-inline ms-1"
+                              onsubmit="return confirm('Hard-delete API key &quot;{{ k.name }}&quot;?\n\nThis removes the row entirely (not just deactivates). Refused if any Domain still references it — delete those first in /admin/domains.\n\nProceed?');">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button type="submit" class="btn btn-outline-danger btn-sm py-0 px-2"
+                                    title="Hard-delete the API key. Refused if Domains still reference it.">
+                                <i class="bi bi-trash"></i>
+                            </button>
+                        </form>
                     </td>
                 </tr>
                 {% else %}

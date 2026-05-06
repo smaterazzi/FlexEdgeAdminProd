@@ -1,0 +1,189 @@
+{% extends "base.html" %}
+{% block title %}Change Queue{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0">
+      <i class="bi bi-stack"></i> Change Queue
+      {% if filters.scope == 'migration_review' %}
+        <span class="badge bg-info text-dark ms-2">Migration review</span>
+      {% endif %}
+    </h2>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="small text-muted">
+        Stats:
+        <span class="badge bg-warning text-dark">{{ stats.queued }} queued</span>
+        {% if stats.conflict %}<span class="badge bg-danger">{{ stats.conflict }} conflict</span>{% endif %}
+        {% if stats.push_failed %}<span class="badge bg-danger">{{ stats.push_failed }} failed</span>{% endif %}
+        <span class="badge bg-success">{{ stats.applied }} applied</span>
+        <span class="badge bg-secondary">{{ stats.aborted }} aborted</span>
+      </span>
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+  <div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+  {% endfor %}
+  {% endwith %}
+
+  {# Phase G — drift detector summary card. Shown when there's anything
+     non-clean to flag, or when the registry has rows and we've never scanned. #}
+  {% if drift and (drift.drifted or drift.gone or (drift.total and not drift.last_check_at)) %}
+  <div class="card mb-3 border-warning">
+    <div class="card-body py-2 px-3">
+      <div class="d-flex justify-content-between align-items-center">
+        <div>
+          <strong>
+            <i class="bi bi-binoculars text-warning"></i> SMC drift detected
+          </strong>
+          <span class="ms-2">
+            {% if drift.drifted %}<span class="badge bg-warning text-dark me-1">{{ drift.drifted }} drifted</span>{% endif %}
+            {% if drift.gone %}<span class="badge bg-danger me-1">{{ drift.gone }} gone</span>{% endif %}
+            {% if drift.unknown %}<span class="badge bg-secondary me-1">{{ drift.unknown }} unknown</span>{% endif %}
+            <span class="badge bg-success">{{ drift.clean }} clean</span>
+          </span>
+          <span class="ms-2 small text-muted">
+            {% if drift.last_check_at %}
+              Last scan {{ drift.last_check_at.strftime("%Y-%m-%d %H:%M UTC") }}
+            {% else %}
+              Never scanned
+            {% endif %}
+          </span>
+        </div>
+        <a href="{{ url_for('changes.drift_index') }}"
+           class="btn btn-sm btn-outline-warning">
+          <i class="bi bi-arrow-right"></i> Review drift
+        </a>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Filter bar -->
+  <form method="get" class="card mb-3">
+    <div class="card-body py-2 px-3">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">Scope</label>
+          <select name="scope" class="form-select form-select-sm">
+            <option value="main"              {% if filters.scope == 'main' %}selected{% endif %}>Main queue</option>
+            <option value="migration_review"  {% if filters.scope == 'migration_review' %}selected{% endif %}>Migration review</option>
+            <option value="all"               {% if filters.scope == 'all' %}selected{% endif %}>All</option>
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">State</label>
+          <select name="state" class="form-select form-select-sm">
+            <option value="active"      {% if filters.state == 'active' %}selected{% endif %}>Needs attention</option>
+            <option value="queued"      {% if filters.state == 'queued' %}selected{% endif %}>Queued</option>
+            <option value="conflict"    {% if filters.state == 'conflict' %}selected{% endif %}>Conflict</option>
+            <option value="push_failed" {% if filters.state == 'push_failed' %}selected{% endif %}>Push failed</option>
+            <option value="pushed"      {% if filters.state == 'pushed' %}selected{% endif %}>Pushed</option>
+            <option value="applied"     {% if filters.state == 'applied' %}selected{% endif %}>Applied</option>
+            <option value="aborted"     {% if filters.state == 'aborted' %}selected{% endif %}>Aborted</option>
+            <option value="all"         {% if filters.state == 'all' %}selected{% endif %}>All</option>
+          </select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label small text-muted mb-1">Source batch</label>
+          <select name="source" class="form-select form-select-sm">
+            <option value="">— all —</option>
+            {% for cid, n in correlation_buckets %}
+            <option value="{{ cid }}" {% if filters.source == cid %}selected{% endif %}>{{ cid }} ({{ n }} rows)</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label small text-muted mb-1">Search (payload + error + source)</label>
+          <input type="search" name="q" value="{{ filters.q }}"
+                 class="form-control form-control-sm"
+                 placeholder="hostname, IP, action…">
+        </div>
+        <div class="col-md-1">
+          <label class="form-label small text-muted mb-1">View</label>
+          <select name="view" class="form-select form-select-sm">
+            <option value="time"   {% if filters.view == 'time' %}selected{% endif %}>Time</option>
+            <option value="object" {% if filters.view == 'object' %}selected{% endif %}>Object</option>
+          </select>
+        </div>
+        <div class="col-md-1 d-grid">
+          <button class="btn btn-sm btn-primary"><i class="bi bi-funnel"></i></button>
+        </div>
+      </div>
+
+      {% if can_push_global and stats.queued > 0 %}
+      <div class="d-flex justify-content-end mt-2 gap-2">
+        <form method="POST" action="{{ url_for('changes.push_all') }}"
+              onsubmit="return confirm('Push every QUEUED change in this Domain in dependency order? Halt-on-failure: if one fails, the rest stay queued.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-sm btn-success">
+            <i class="bi bi-rocket-takeoff"></i> Push all queued ({{ stats.queued }})
+          </button>
+        </form>
+        <form method="POST" action="{{ url_for('changes.abort_all') }}"
+              onsubmit="return confirm('Abort every QUEUED change in this Domain? This is irreversible — they will need to be re-queued from the source feature.');">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <button class="btn btn-sm btn-outline-danger">
+            <i class="bi bi-x-circle"></i> Abort all queued
+          </button>
+        </form>
+      </div>
+      {% endif %}
+    </div>
+  </form>
+
+  {% if not rows %}
+  <div class="alert alert-info">No changes match the current filter.</div>
+  {% else %}
+
+    {% if filters.view == 'object' %}
+      {# Sub-queue view: group by smc_object_id (0 = create-new ops). #}
+      {% for object_id, group in grouped.items() %}
+      <div class="card mb-3">
+        <div class="card-header py-2 d-flex justify-content-between align-items-center">
+          <strong class="small">
+            {% if object_id == 0 %}
+              <i class="bi bi-plus-square text-success"></i> Create-new operations
+            {% else %}
+              {% set first = group[0] %}
+              <i class="bi bi-stack"></i>
+              {% if first.smc_object %}
+                {{ first.smc_object.smc_type }} : {{ first.smc_object.smc_name }}
+                {% if first.smc_object.is_to_be_deleted %}
+                <span class="badge bg-danger ms-2">pending delete</span>
+                {% endif %}
+              {% else %}
+                Object #{{ object_id }}
+              {% endif %}
+            {% endif %}
+            <span class="text-muted ms-2">— {{ group|length }} change(s)</span>
+          </strong>
+        </div>
+        <div class="table-responsive">
+          {% include "changes/_rows_table.html" %}
+        </div>
+      </div>
+      {% endfor %}
+    {% else %}
+      {# Time view: flat chronological list. #}
+      <div class="card">
+        <div class="table-responsive">
+          {% set group = rows %}
+          {% include "changes/_rows_table.html" %}
+        </div>
+      </div>
+    {% endif %}
+
+    {% if rows|length >= 500 %}
+    <div class="alert alert-warning mt-3 small">
+      Showing the most recent 500 changes — narrow the filter (state /
+      source / search) to see older ones.
+    </div>
+    {% endif %}
+  {% endif %}
+
+</div>
+{% endblock %}

@@ -44,25 +44,38 @@ def _get_user_from_db(email: str):
 
 
 def _get_profiles_from_db(email: str) -> list:
-    """Return resolved profile dicts from the database."""
+    """Return resolved profile dicts from the database.
+
+    Phase B.2c: reads from `user.domain_accesses` (UserDomainAccess) —
+    the canonical scope-grant table. Each row resolves to one profile in
+    the operator's `/select-profile` list. Server fields are pulled from
+    `domain.api_key` (Phase A absorbed those onto api_keys); SMC admin
+    domain name from `domain.smc_domain_name`.
+
+    The returned `tenant` key holds `domain.slug` (Phase A preserved each
+    legacy Tenant.slug onto its derived Domain), so `cli/connect.py
+    --tenant prod` keeps resolving the same context as before.
+    """
     user = _get_user_from_db(email)
     if not user:
         return []
 
     profiles = []
-    for access in user.tenant_accesses:
-        t = access.tenant
-        k = access.api_key
-        if not t.is_active or not k.is_active:
+    for access in user.domain_accesses:
+        d = access.domain
+        if d is None or not d.is_active:
+            continue
+        k = d.api_key
+        if k is None or not k.is_active:
             continue
         profiles.append({
-            "name": t.name,
-            "smc_url": t.smc_url,
+            "name": d.display_name,
+            "smc_url": k.smc_url,
             "api_key": k.decrypted_key,
-            "verify_ssl": t.verify_ssl,
-            "timeout": t.timeout,
-            "domain": t.default_domain,
-            "tenant": t.slug,
+            "verify_ssl": k.verify_ssl,
+            "timeout": k.timeout,
+            "domain": d.smc_domain_name,
+            "tenant": d.slug,
         })
     return profiles
 
@@ -159,8 +172,53 @@ def get_user_role(email: str) -> str:
 
 
 def is_admin(email: str) -> bool:
-    """Return True if the user has the 'admin' role."""
-    return get_user_role(email) == "admin"
+    """Return True if the user has admin-level access in the active Domain.
+
+    Phase B (Change Management, refined 2026-05-01) widened the role
+    model. Admin-level resolves True if ANY of:
+
+      1. Legacy `User.role='admin'` — kept for backward compat (the
+         setup wizard still writes this; the Phase A migration also
+         promotes the lowest-id legacy admin to is_super_admin=True).
+      2. `User.is_super_admin=True` — Super Admin, sees every Domain.
+      3. `UserDomainAccess.role` IN ('global_admin', 'admin') for the
+         active Domain — Per-Domain Global Admin or Domain Admin.
+
+    Existing `@admin_required` decorators (admin.py / dhcp_manager.py /
+    tls_manager.py / engines_manager.py) call this and remain correct:
+    today's admins (Super Admin + pre-existing Global Admins) all
+    satisfy at least one branch on every Domain they're assigned to.
+
+    For finer-grained checks (Super vs Global vs Domain vs Operator),
+    use `webapp.auth_roles.is_super_admin()` / `is_global_admin()` /
+    `is_domain_admin()` / `is_domain_operator()` — they expose the full
+    role hierarchy and respect `g.domain`.
+    """
+    role_str = get_user_role(email)
+    if role_str == "admin":
+        return True
+
+    if not _db_available():
+        return False
+    user = _get_user_from_db(email)
+    if user is None:
+        return False
+    if getattr(user, "is_super_admin", False):
+        return True
+
+    # Per-Domain admin (Global Admin or Domain Admin) in the active Domain.
+    try:
+        from flask import g
+        from webapp.models import UserDomainAccess
+        domain = getattr(g, "domain", None)
+        if domain is None:
+            return False
+        access = UserDomainAccess.query.filter_by(
+            user_id=user.id, domain_id=domain.id,
+        ).first()
+        return bool(access and access.role in ("global_admin", "admin"))
+    except Exception:
+        return False
 
 
 def user_exists_in_db(email: str) -> bool:

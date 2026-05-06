@@ -71,21 +71,36 @@
 </div>
 
 {% if leases %}
+<form method="POST" action="{{ url_for('dhcp.scope_leases_reserve', scope_id=scope.id) }}"
+      id="leases-form" onsubmit="return confirmLeaseReserve()">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 <div class="card">
-  <div class="card-header d-flex justify-content-between align-items-center">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span>{{ leases|length }} unique (MAC, IP) entries across all nodes</span>
-    <div>
-      <button class="btn btn-sm btn-outline-secondary" onclick="filterLeases('all')">All</button>
-      <button class="btn btn-sm btn-outline-success" onclick="filterLeases('active')">Active</button>
-      <button class="btn btn-sm btn-outline-warning" onclick="filterLeases('expired')">Expired/free</button>
-      <button class="btn btn-sm btn-outline-info" onclick="filterLeases('reserved')">Reserved</button>
-      <button class="btn btn-sm btn-outline-danger" onclick="filterLeases('mismatch')">IP mismatch</button>
+    <div class="d-flex flex-wrap gap-1 align-items-center">
+      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="filterLeases('all')">All</button>
+      <button type="button" class="btn btn-sm btn-outline-success" onclick="filterLeases('active')">Active</button>
+      <button type="button" class="btn btn-sm btn-outline-warning" onclick="filterLeases('expired')">Expired/free</button>
+      <button type="button" class="btn btn-sm btn-outline-info" onclick="filterLeases('reserved')">Reserved</button>
+      <button type="button" class="btn btn-sm btn-outline-danger" onclick="filterLeases('mismatch')">IP mismatch</button>
+      <span class="vr mx-1"></span>
+      <button type="button" class="btn btn-sm btn-outline-light" onclick="selectAllLeases(true)">
+        <i class="bi bi-check-all"></i> Select visible
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-light" onclick="selectAllLeases(false)">Clear</button>
+      <button type="submit" class="btn btn-sm btn-primary" id="reserve-btn" disabled>
+        <i class="bi bi-pin-angle"></i> Add <span id="reserve-count">0</span> to reservations
+      </button>
     </div>
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0">
       <thead>
         <tr>
+          <th style="width:32px">
+            <input type="checkbox" class="form-check-input" id="select-all-cb"
+                   onchange="selectAllLeases(this.checked)" title="Select all eligible visible">
+          </th>
           <th>IP</th><th>MAC</th><th>Hostname</th>
           <th>State</th><th>Ends</th><th>Seen on</th>
           <th>Reservation</th>
@@ -97,6 +112,18 @@
             data-state="{{ l.binding_state }}"
             data-reserved="{{ '1' if l.reservation_id else '0' }}"
             data-mismatch="{{ '1' if l.reservation_id and not l.reservation_matches else '0' }}">
+          <td>
+            {% if not l.reservation_id %}
+              <input type="checkbox" class="form-check-input lease-cb"
+                     name="lease_idx" value="{{ loop.index0 }}"
+                     onchange="updateReserveCount()">
+              <input type="hidden" name="lease_{{ loop.index0 }}_mac"  value="{{ l.mac }}">
+              <input type="hidden" name="lease_{{ loop.index0 }}_ip"   value="{{ l.ip }}">
+              <input type="hidden" name="lease_{{ loop.index0 }}_host" value="{{ l.client_hostname or '' }}">
+            {% else %}
+              <i class="bi bi-pin-angle text-muted" title="Already reserved"></i>
+            {% endif %}
+          </td>
           <td><code>{{ l.ip }}</code></td>
           <td><code>{{ l.mac }}</code></td>
           <td>{{ l.client_hostname or '—' }}</td>
@@ -143,6 +170,7 @@
     </table>
   </div>
 </div>
+</form>
 {% elif not fetch_errors %}
 <div class="alert alert-info">No leases in file on any node — likely a clean / freshly-booted cluster.</div>
 {% else %}
@@ -164,7 +192,38 @@ function filterLeases(mode) {
     if (mode === "reserved") show = row.dataset.reserved === "1";
     if (mode === "mismatch") show = row.dataset.mismatch === "1";
     row.style.display = show ? "" : "none";
+    // Hidden rows must not contribute to the submit set, even if checked —
+    // disabling the checkbox keeps the user's selection intact when they
+    // toggle filters back on, while ensuring the form never sees it.
+    const cb = row.querySelector(".lease-cb");
+    if (cb) cb.disabled = !show;
   });
+  updateReserveCount();
 }
+
+function _eligibleLeaseCheckboxes() {
+  return Array.from(document.querySelectorAll(".lease-cb")).filter(cb => !cb.disabled);
+}
+
+function selectAllLeases(checked) {
+  _eligibleLeaseCheckboxes().forEach(cb => { cb.checked = checked; });
+  updateReserveCount();
+}
+
+function updateReserveCount() {
+  const n = _eligibleLeaseCheckboxes().filter(cb => cb.checked).length;
+  const btn = document.getElementById("reserve-btn");
+  const cnt = document.getElementById("reserve-count");
+  if (cnt) cnt.textContent = n;
+  if (btn) btn.disabled = n === 0;
+}
+
+function confirmLeaseReserve() {
+  const n = _eligibleLeaseCheckboxes().filter(cb => cb.checked).length;
+  if (n === 0) return false;
+  return confirm(`Add ${n} lease(s) to reservations? This creates an SMC Host element for each one.`);
+}
+
+document.addEventListener("DOMContentLoaded", updateReserveCount);
 </script>
 {% endblock %}

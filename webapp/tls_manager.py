@@ -18,7 +18,7 @@ from pathlib import Path
 
 from flask import (
     Blueprint, render_template, request, redirect,
-    url_for, flash, session, current_app, jsonify,
+    url_for, flash, session, current_app, jsonify, g,
 )
 
 from shared.db import db
@@ -75,11 +75,44 @@ def require_api_token(f):
 
 def _log_activity(category: str, action: str, status: str,
                   target: str = "", detail: str = ""):
-    db.session.add(TLSActivityLog(
-        category=category, action=action, status=status,
-        target=target, detail=detail[:4000],
-    ))
-    db.session.commit()
+    """Funnel a TLS audit-log entry through the platform log writer.
+
+    See dhcp_manager._log_activity for the same routing rule.
+    """
+    from shared.logging import audit
+    feature = "system" if category == "system" else "tls"
+    audit(feature=feature,
+          action=f"{category}.{action}",
+          target=target, detail=detail, status=status)
+
+
+def _read_tls_activity_for_dashboard(domain_id, limit: int = 50):
+    """Return legacy-shaped activity rows for the TLS dashboard.
+
+    Reads from the unified PlatformLog (tls_activity_logs is no longer
+    written; rows backfilled at boot). Re-projects each row into a
+    SimpleNamespace exposing `created_at / category / action / status /
+    target` so the existing dashboard template renders unchanged.
+    """
+    from types import SimpleNamespace
+    from webapp.models import PlatformLog
+    q = PlatformLog.query.filter(PlatformLog.feature.in_(["tls", "system"]))
+    if domain_id is not None:
+        q = q.filter((PlatformLog.domain_id == domain_id) |
+                     (PlatformLog.domain_id.is_(None)))
+    rows = q.order_by(PlatformLog.timestamp.desc()).limit(limit).all()
+    out = []
+    for r in rows:
+        if "." in (r.action or ""):
+            cat, act = r.action.split(".", 1)
+        else:
+            cat, act = (r.feature or "?"), (r.action or "")
+        out.append(SimpleNamespace(
+            id=r.id, created_at=r.timestamp,
+            category=cat, action=act,
+            status=r.status, target=r.target, detail=r.detail,
+        ))
+    return out
 
 
 def _smc_cfg_from_tenant(tenant: Tenant, api_key: ApiKey,
@@ -117,14 +150,27 @@ def init_tls_manager(app):
 @tls_bp.route("/")
 @admin_required
 def dashboard():
+    domain = getattr(g, "domain", None)
+    domain_id = domain.id if domain is not None else None
+
+    # ManagedCertificate is platform-global — it tracks certbot lineages on
+    # disk (`/etc/letsencrypt/live/*`) which exist per host, not per Domain.
     certificates = ManagedCertificate.query.all()
-    deployments = (TLSDeployment.query
-                   .order_by(TLSDeployment.last_deployed_at.desc().nullslast())
-                   .all())
-    deploy_logs = (TLSDeploymentLog.query
-                   .order_by(TLSDeploymentLog.created_at.desc()).limit(20).all())
-    activity_logs = (TLSActivityLog.query
-                     .order_by(TLSActivityLog.created_at.desc()).limit(50).all())
+
+    if domain_id is None:
+        deployments, deploy_logs, activity_logs = [], [], []
+    else:
+        deployments = (TLSDeployment.query
+                       .filter_by(domain_id=domain_id)
+                       .order_by(TLSDeployment.last_deployed_at.desc().nullslast())
+                       .all())
+        deploy_logs = (TLSDeploymentLog.query
+                       .join(TLSDeployment, TLSDeploymentLog.deployment_id == TLSDeployment.id)
+                       .filter(TLSDeployment.domain_id == domain_id)
+                       .order_by(TLSDeploymentLog.created_at.desc()).limit(20).all())
+        # Activity feed sourced from the unified platform log (legacy
+        # tls_activity_logs is read-only post-backfill).
+        activity_logs = _read_tls_activity_for_dashboard(domain_id, limit=50)
     return render_template(
         "tls/dashboard.html",
         certificates=certificates,
@@ -224,15 +270,134 @@ def deploy_execute(deployment_id):
 
     result = None
     if request.method == "POST":
-        result = run_deployment(dep.id, action="deploy")
-        if result.success:
-            _log_activity("deploy", "execute", "ok", dep.service_name,
-                          f"engine={dep.engine_name} steps={len(result.steps)}")
-            flash("Deployment successful!", "success")
+        # Phase E.2 — enqueue + auto-push for admins (Q15/a + Q19/b).
+        # ONE queue row carries the whole 5-step pipeline; the queue UI
+        # surfaces the per-step status in the expanded detail panel.
+        from webapp.models import PendingChange
+        from shared.queue_runner import push_one
+        import json as _json
+
+        if dep.domain_id is None:
+            flash("Deployment has no Domain on file — fix it via Admin Portal.",
+                  "danger")
+            return render_template("tls/deploy_execute.html",
+                                   deployment=dep, result=None)
+
+        change = PendingChange(
+            domain_id=dep.domain_id,
+            user_id=None,  # set lazily by the runner via session
+            scope="main",
+            operation="deploy_tls",
+            payload_json=_json.dumps({
+                "deployment_id": dep.id,
+                "action": "deploy",
+            }),
+            feature_source="tls",
+            source_correlation_id=f"tls_deployment:{dep.id}",
+            state="queued",
+        )
+        db.session.add(change)
+        db.session.flush()
+        # Resolve the queue row's user from session for the audit trail.
+        try:
+            from flask import session as _sess
+            from webapp.models import User
+            email = ((_sess.get("user") or {}).get("email") or "").strip().lower()
+            if email:
+                u = User.query.filter_by(email=email).first()
+                if u is not None:
+                    change.user_id = u.id
+        except Exception:
+            pass
+        db.session.commit()
+
+        # Auto-push for admins (Q15/a) or for users with per-user bypass
+        # on `tls_deploy`. For non-admins-without-bypass this is an
+        # admin-only route normally, but the helper handles both.
+        from webapp.auth_roles import is_domain_admin
+        is_bypass = False
+        try:
+            from shared.queue_settings import should_bypass_queue
+            is_bypass = should_bypass_queue("tls_deploy")
+        except Exception:
+            is_bypass = False
+
+        if is_domain_admin() or is_bypass:
+            push_result = push_one(change.id)
+            db.session.refresh(dep)
+            db.session.refresh(change)
+
+            # Capture identifiers + payload BEFORE the bypass cleanup
+            # may delete the row out from under us.
+            change_id = change.id
+            change_payload_json = change.payload_json or "{}"
+            change_op = change.operation
+            change_corr = change.source_correlation_id
+            change_domain_id = change.domain_id
+
+            if push_result.success:
+                # Bypass cleanup: delete the queue row (transient) and
+                # emit a `tls_deploy.deploy_tls.bypass_queue` audit
+                # marker so log queries can find bypassed runs.
+                if is_bypass:
+                    try:
+                        from shared.logging import audit
+                        audit(
+                            feature="tls_deploy",
+                            action=f"{change_op}.bypass_queue",
+                            target=f"deployment#{dep.id} ({dep.service_name})",
+                            detail=("bypass_queue=True; queue row deleted "
+                                    f"on success (was change_id={change_id})"),
+                            source_correlation_id=change_corr,
+                            domain_id=change_domain_id,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        db.session.delete(change)
+                        db.session.commit()
+                    except Exception:
+                        db.session.rollback()
+                _log_activity("deploy", "execute", "ok", dep.service_name,
+                              f"via_queue=True bypass={is_bypass} "
+                              f"engine={dep.engine_name} change_id={change_id}")
+                flash(f"Deployment successful (queue change #{change_id}).",
+                      "success")
+            else:
+                err = (push_result.error
+                       or (change.push_error_text if change in db.session
+                           else "")
+                       or "Unknown")
+                _log_activity("deploy", "execute", "error", dep.service_name,
+                              f"via_queue=True bypass={is_bypass} "
+                              f"engine={dep.engine_name} — {err}")
+                flash(f"Deployment failed (queue change #{change_id}): {err}. "
+                      f"Retry from the Change Queue.", "danger")
+
+            # Build a render-ready result from the deployment's persisted state.
+            from webapp.smc_tls_client import DeployResult
+            try:
+                payload = _json.loads(change_payload_json)
+                steps = payload.get("steps") or []
+            except Exception:
+                steps = []
+            result = DeployResult(
+                success=(dep.last_status == "deployed"),
+                error=dep.last_error or "",
+                tls_credential_name=dep.tls_credential_name or "",
+                host_public_name=dep.host_public_name or "",
+                host_private_name=dep.host_private_name or "",
+                policy_rule_name=dep.policy_rule_name or "",
+                policy_section_name=dep.policy_section_name or "",
+            )
+            result.steps = steps
         else:
-            _log_activity("deploy", "execute", "error", dep.service_name,
-                          f"engine={dep.engine_name} — {result.error}\n{result.steps}")
-            flash(f"Deployment failed: {result.error}", "danger")
+            _log_activity("deploy", "execute.queued", "ok", dep.service_name,
+                          f"engine={dep.engine_name} change_id={change.id}")
+            flash(f"Deployment queued (change #{change.id}). "
+                  f"Push from the Change Queue.", "info")
+            return redirect(url_for("changes.index",
+                                    source=f"tls_deployment:{dep.id}"))
 
     return render_template("tls/deploy_execute.html", deployment=dep, result=result)
 
@@ -395,6 +560,13 @@ def hook_install():
 @tls_bp.route("/history")
 @admin_required
 def history():
-    logs = (TLSDeploymentLog.query
-            .order_by(TLSDeploymentLog.created_at.desc()).limit(100).all())
+    domain = getattr(g, "domain", None)
+    domain_id = domain.id if domain is not None else None
+    if domain_id is None:
+        logs = []
+    else:
+        logs = (TLSDeploymentLog.query
+                .join(TLSDeployment, TLSDeploymentLog.deployment_id == TLSDeployment.id)
+                .filter(TLSDeployment.domain_id == domain_id)
+                .order_by(TLSDeploymentLog.created_at.desc()).limit(100).all())
     return render_template("tls/history.html", logs=logs)

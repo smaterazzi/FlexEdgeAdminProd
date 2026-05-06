@@ -5,13 +5,54 @@
 <div class="p-4">
 <h2 class="mb-4"><i class="bi bi-router"></i> DHCP Reservation Manager</h2>
 
-<div class="alert alert-info">
-  <strong>Phase 3 (CRUD)</strong>: you can discover scopes, create/edit/delete
-  reservations (as SMC Host objects with MAC in comment). Engine-side push
-  (writing <code>/data/config/base/dhcp-server.conf</code> on each cluster node)
-  lands with Phase 4 — &ldquo;Deploy&rdquo; and &ldquo;Re-sync&rdquo; buttons
-  currently log the intent but do not push.
+{% if not phase0_validated %}
+<div class="alert alert-warning d-flex justify-content-between align-items-start">
+  <div>
+    <strong><i class="bi bi-exclamation-triangle"></i> Phase 0 lab persistence test not yet validated.</strong>
+    <p class="mb-1 small">
+      Phase 4 deploys are <strong>blocked</strong> until an operator confirms that the SMC engine
+      does not overwrite <code>/data/config/base/dhcp-server.conf</code> on policy refresh, upload,
+      or reboot. Run the procedure in <code>docs/DHCP-Phase0-LabTest.md</code> on a lab cluster, then
+      click the button on the right to unlock deploys.
+    </p>
+    <small class="text-muted">
+      Without this gate, a successful "Deploy" can silently lose all reservations on the next SMC
+      policy save — the file gets recreated from the SMC subnet template.
+    </small>
+  </div>
+  <form method="post" action="{{ url_for('dhcp.system_phase0_validate') }}"
+        class="ms-3 d-flex flex-column gap-2"
+        onsubmit="return confirm('Confirm: you have run the Phase 0 lab persistence test on a real cluster and verified that /data/config/base/dhcp-server.conf survives a policy refresh, a policy upload, AND a node reboot. This unlocks Phase 4 deploys for all engines.');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <input type="text" name="notes" class="form-control form-control-sm"
+           placeholder="Notes (engine model / SMC version)" style="min-width:14rem;">
+    <button class="btn btn-warning btn-sm">
+      <i class="bi bi-shield-check"></i> I validated Phase 0
+    </button>
+  </form>
 </div>
+{% else %}
+<div class="alert alert-success d-flex justify-content-between align-items-center">
+  <div>
+    <i class="bi bi-shield-check"></i>
+    <strong>Phase 0 validated</strong>
+    {% if phase0_validation %}
+      by {{ phase0_validation.target or 'system' }}
+      on {{ phase0_validation.created_at.strftime('%Y-%m-%d %H:%M UTC') }}.
+      {% if phase0_validation.detail %}
+        <small class="text-muted d-block">{{ phase0_validation.detail }}</small>
+      {% endif %}
+    {% endif %}
+  </div>
+  <form method="post" action="{{ url_for('dhcp.system_phase0_revoke') }}"
+        onsubmit="return confirm('Revoke Phase 0 validation? Phase 4 deploys will be blocked until re-validated.');">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button class="btn btn-outline-warning btn-sm">
+      <i class="bi bi-arrow-counterclockwise"></i> Revoke
+    </button>
+  </form>
+</div>
+{% endif %}
 
 <div class="row g-3 mb-3">
   <div class="col-md-3">

@@ -65,7 +65,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # Default: run the web app via gunicorn.
 # Threaded workers (-k gthread) are required for flask-sock WebSocket terminals;
 # 2 workers × 8 threads = 16 concurrent sockets, well within an admin-tool budget.
+#
+# --preload imports the app ONCE in the gunicorn master before forking workers.
+# Without it, each worker independently runs init_database() → db.create_all()
+# and they race on freshly-added tables (the loser crashes with "table already
+# exists"). Preload also halves memory via copy-on-write fork semantics.
 # CLI tools available via: docker compose exec flexedge-web python -m cli.connect --tenant prod
-CMD ["gunicorn", "-w", "2", "-k", "gthread", "--threads", "8", \
+CMD ["gunicorn", "--preload", "-w", "2", "-k", "gthread", "--threads", "8", \
      "-b", "0.0.0.0:8088", "--timeout", "120", \
      "--chdir", "/app/webapp", "app:app"]

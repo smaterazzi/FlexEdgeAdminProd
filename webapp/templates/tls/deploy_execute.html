@@ -3,7 +3,15 @@
 
 {% block content %}
 <div class="p-4">
-<h2 class="mb-4">Deployment: {{ deployment.service_name }}</h2>
+<h2 class="mb-4">
+  Deployment: {{ deployment.service_name }}
+  {% if bypass_active('tls_deploy') %}
+  <span class="badge bg-info text-dark align-middle ms-2"
+        title="Execute will commit immediately to SMC (bypass queue mode). Audit log records the deployment; no queue review.">
+    <i class="bi bi-fast-forward"></i> Bypass active
+  </span>
+  {% endif %}
+</h2>
 
 <div class="row">
     <div class="col-md-6">
@@ -54,6 +62,7 @@
                     <li>Upload policy</li>
                 </ol>
                 <form method="post">
+                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                     <button type="submit" class="btn btn-warning">
                         <i class="bi bi-rocket-takeoff"></i> Execute Deployment
                     </button>

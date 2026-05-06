@@ -33,7 +33,14 @@
         </td>
         <td>{{ d.reservations_count }}</td>
         <td class="small">{{ d.duration_ms }} ms</td>
-        <td class="small text-truncate" style="max-width:320px" title="{{ d.error }}">{{ d.error }}</td>
+        <td class="small text-truncate" style="max-width:320px"
+            title="{% if d.error %}ERROR: {{ d.error }}{% endif %}{% if d.error and d.reload_warning %}&#10;{% endif %}{% if d.reload_warning %}RELOAD WARNING: {{ d.reload_warning }}{% endif %}">
+          {% if d.error %}<span class="text-danger">{{ d.error }}</span>{% endif %}
+          {% if d.reload_warning %}
+            {% if d.error %}<br>{% endif %}
+            <span class="text-warning"><i class="bi bi-exclamation-triangle"></i> {{ d.reload_warning }}</span>
+          {% endif %}
+        </td>
       </tr>
       {% endfor %}
     </tbody>

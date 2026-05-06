@@ -17,6 +17,7 @@
         {% endwith %}
 
         <form method="POST">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
             <div class="d-flex flex-column gap-3">
                 {% for profile in profiles %}
                 <button type="submit" name="profile_index" value="{{ loop.index0 }}"

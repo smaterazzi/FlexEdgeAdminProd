@@ -48,6 +48,7 @@
                     </div>
 
                     <form method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
                             <label class="form-label" style="font-size:0.85rem;">Import scope</label>
                             <select name="import_type" class="form-select form-select-sm bg-dark border-secondary text-light">
@@ -58,8 +59,45 @@
                                 <option value="vpn">VPN Infrastructure Only</option>
                             </select>
                         </div>
+
+                        {# Two-step push: imports CREATE rules in the SMC
+                           policy database, but the engine doesn't run them
+                           until the policy is INSTALLED on it. By default
+                           we leave the install for the operator to do via
+                           SMC Management Client (safer review path). Tick
+                           this box to skip that step and install
+                           immediately — equivalent to right-clicking the
+                           policy in SMC and choosing "Install Policy". #}
+                        <div class="form-check mb-3 p-2 rounded"
+                             style="background:#1a1d21; border:1px solid #2d3238;">
+                            <input class="form-check-input" type="checkbox"
+                                   name="auto_install_policy"
+                                   id="auto_install_policy" value="on"
+                                   {% if not project.target.engine_name %}disabled{% endif %}>
+                            <label class="form-check-label" for="auto_install_policy" style="font-size:0.85rem;">
+                                <strong>Auto-install policy on engine after import</strong>
+                            </label>
+                            <div class="form-text mt-1" style="font-size:0.78rem;">
+                                {% if project.target.engine_name %}
+                                Will push policy <code>{{ project.target.policy_name }}</code>
+                                onto engine <code>{{ project.target.engine_name }}</code>
+                                immediately after creating the rules — making them
+                                live on the engine. <strong>Default off</strong>: the
+                                safer flow is to review rules in SMC Management Client
+                                first, then install manually.
+                                {% else %}
+                                <span class="text-warning">
+                                  <i class="bi bi-info-circle"></i>
+                                  No target engine is configured for this migration —
+                                  go back to <em>Configure SMC target</em> to set
+                                  <code>engine_name</code> if you want to use this option.
+                                </span>
+                                {% endif %}
+                            </div>
+                        </div>
+
                         <button type="submit" class="btn btn-success w-100"
-                                onclick="return confirm('Start import to SMC? This will create objects and rules.')">
+                                onclick="return confirm('Start import to SMC? This will create objects and rules. The engine will only run the new rules if you ticked Auto-install (or install the policy manually in SMC Management Client afterwards).')">
                             <i class="bi bi-cloud-upload"></i> Execute Import
                         </button>
                     </form>
@@ -97,7 +135,146 @@
                         <tr><td>Rule errors</td><td class="text-end {% if import_log.rules_errors > 0 %}text-danger{% endif %}">{{ import_log.rules_errors }}</td></tr>
                         <tr><td>NAT rules created</td><td class="text-end fw-bold text-info">{{ import_log.get('nat_created', 0) }}</td></tr>
                         <tr><td>NAT rule errors</td><td class="text-end {% if import_log.get('nat_errors', 0) > 0 %}text-danger{% endif %}">{{ import_log.get('nat_errors', 0) }}</td></tr>
+                        {% if import_log.get('dhcp_changes_enqueued', 0) > 0 %}
+                        <tr>
+                          <td>DHCP reservations queued</td>
+                          <td class="text-end fw-bold text-info">{{ import_log.get('dhcp_changes_enqueued', 0) }}</td>
+                        </tr>
+                        {% endif %}
                     </table>
+
+                    {# Phase E.2 — DHCP migration via queue (Q20). Surface a
+                       prominent CTA to /changes/?source=migration:<id>
+                       so the operator's next action is obvious. #}
+                    {% if import_log.get('dhcp_changes_enqueued', 0) > 0 and import_log.get('dhcp_correlation_id') %}
+                    <div class="mt-3 pt-3 border-top border-secondary">
+                      <div class="alert alert-info mb-0 small">
+                        <strong><i class="bi bi-hourglass-split"></i>
+                          {{ import_log.get('dhcp_changes_enqueued', 0) }} DHCP
+                          reservation change(s) staged in the Change Queue.
+                        </strong>
+                        <div class="mt-1">
+                          They are <strong>queued, not yet pushed to SMC</strong>.
+                          Visit the queue to review and push when ready.
+                        </div>
+                        <a href="{{ url_for('changes.index', source=import_log.get('dhcp_correlation_id')) }}"
+                           class="btn btn-sm btn-info mt-2">
+                          <i class="bi bi-arrow-right-circle"></i>
+                          Open Change Queue (batch <code>{{ import_log.get('dhcp_correlation_id') }}</code>)
+                        </a>
+                      </div>
+                    </div>
+                    {% endif %}
+
+                    {# Phase E.2 — Object / Rule / NAT migration via queue.
+                       All batches share the same `migration:<id>`
+                       correlation, so the operator only sees ONE CTA
+                       summarising the whole import. The collapsed
+                       breakdown below shows what's in it. #}
+                    {% set _obj_n = import_log.get('objects_changes_enqueued', 0) %}
+                    {% set _rule_n = import_log.get('rules_changes_enqueued', 0) %}
+                    {% set _nat_n = import_log.get('nat_changes_enqueued', 0) %}
+                    {% set _vpn_n = import_log.get('vpn_changes_enqueued', 0) %}
+                    {% set _dhcp_n = import_log.get('dhcp_changes_enqueued', 0) %}
+                    {% set _migration_corr =
+                          import_log.get('objects_correlation_id')
+                          or import_log.get('rules_correlation_id')
+                          or import_log.get('nat_correlation_id')
+                          or import_log.get('vpn_correlation_id')
+                          or import_log.get('dhcp_correlation_id') %}
+                    {% if (_obj_n + _rule_n + _nat_n + _vpn_n) > 0 and _migration_corr %}
+                    <div class="mt-3 pt-3 border-top border-secondary">
+                      <div class="alert alert-info mb-0 small">
+                        <strong><i class="bi bi-hourglass-split"></i>
+                          {{ _obj_n + _rule_n + _nat_n + _vpn_n }} migration
+                          change(s) staged in the Change Queue.
+                        </strong>
+                        <div class="mt-1 text-muted">
+                          {% if _obj_n %}
+                          <div>Objects: {{ _obj_n }}
+                            {% if import_log.get('objects_by_type') %}
+                            (
+                            {%- for t, n in import_log.get('objects_by_type', {}).items() -%}
+                            <code>{{ t }}</code>: {{ n }}{% if not loop.last %}, {% endif %}
+                            {%- endfor -%}
+                            )
+                            {% endif %}
+                          </div>
+                          {% endif %}
+                          {% if _rule_n %}
+                          <div>Rules + sections: {{ _rule_n }}
+                            (sections: {{ import_log.get('sections_created', 0) }},
+                            rules: {{ import_log.get('rules_created', 0) }})
+                          </div>
+                          {% endif %}
+                          {% if _nat_n %}
+                          <div>NAT rules: {{ _nat_n }}</div>
+                          {% endif %}
+                          {% if _vpn_n %}
+                          <div>VPN configs: {{ _vpn_n }}
+                            (each row is a 6-step pipeline —
+                            profile / gateway / endpoint / site / PolicyVPN /
+                            topology — see expanded detail in the queue)
+                          </div>
+                          {% endif %}
+                        </div>
+                        <div class="mt-1">
+                          They are <strong>queued, not yet pushed to SMC</strong>.
+                          Push order honors dependencies — objects first,
+                          then sections, then rules, then NAT rules, then VPN.
+                        </div>
+                        <a href="{{ url_for('changes.index', source=_migration_corr) }}"
+                           class="btn btn-sm btn-info mt-2">
+                          <i class="bi bi-arrow-right-circle"></i>
+                          Open Change Queue (batch <code>{{ _migration_corr }}</code>)
+                        </a>
+                      </div>
+                    </div>
+                    {% endif %}
+
+                    {# Engine activation state — call out the two-step
+                       push so the operator doesn't think the import
+                       silently failed when looking at the engine. #}
+                    {% set inst = import_log.get('policy_install_status', 'not_requested') %}
+                    <div class="mt-2 pt-2 border-top border-secondary">
+                      <div class="small mb-1 text-muted">Engine activation:</div>
+                      {% if inst == 'ok' %}
+                        <span class="badge bg-success">
+                          <i class="bi bi-check-circle"></i> Policy installed — rules LIVE on engine
+                        </span>
+                      {% elif inst == 'failed' %}
+                        <span class="badge bg-danger">
+                          <i class="bi bi-x-circle"></i> Install FAILED
+                        </span>
+                        <div class="text-danger small mt-1">
+                          {{ import_log.get('policy_install_message', '') }}
+                        </div>
+                      {% elif inst == 'skipped' %}
+                        <span class="badge bg-warning text-dark">
+                          <i class="bi bi-dash-circle"></i> Skipped
+                        </span>
+                        <div class="text-warning small mt-1">
+                          {{ import_log.get('policy_install_message', '') }}
+                        </div>
+                      {% else %}
+                        {# not_requested — operator didn't tick auto-install #}
+                        {% if import_log.rules_created > 0 or import_log.get('nat_created', 0) > 0 %}
+                          <span class="badge bg-warning text-dark">
+                            <i class="bi bi-exclamation-triangle"></i>
+                            Rules NOT yet live on engine
+                          </span>
+                          <div class="text-warning small mt-1">
+                            Open SMC Management Client and install policy
+                            <code>{{ project.target.policy_name }}</code> on
+                            engine <code>{{ project.target.engine_name or '(not set)' }}</code>
+                            to activate, or re-run the import with
+                            "Auto-install" ticked.
+                          </div>
+                        {% else %}
+                          <span class="badge bg-secondary">N/A — no rule changes</span>
+                        {% endif %}
+                      {% endif %}
+                    </div>
                 </div>
             </div>
             {% endif %}

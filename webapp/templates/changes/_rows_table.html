@@ -1,0 +1,261 @@
+{# Reusable rows-table partial — used by both Time and Object views.
+   Caller must set a `group` variable: a list of PendingChange rows.
+   Pulls action-visibility flags from inject_globals + per-row data. #}
+
+<table class="table table-sm table-hover mb-0 align-middle">
+  <thead>
+    <tr>
+      <th style="width:140px">Time (UTC)</th>
+      <th style="width:90px">Operation</th>
+      <th>Target</th>
+      <th style="width:100px">Source</th>
+      <th style="width:120px">User</th>
+      {% if is_super %}<th style="width:120px">Domain</th>{% endif %}
+      <th style="width:100px">State</th>
+      <th style="width:240px">Actions</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for r in group %}
+    {# Per-row action visibility. The route still re-checks server-side. #}
+    {% set is_mine = r.user_id and r.user_id == current_user_id %}
+    {% set is_queued = r.state == 'queued' %}
+    {% set is_conflict = r.state == 'conflict' %}
+    {% set is_failed = r.state == 'push_failed' %}
+    {% set is_to_be_deleted = (r.operation == 'to_be_deleted' and is_queued) %}
+
+    <tr class="{% if r.smc_object and r.smc_object.is_to_be_deleted %}text-decoration-line-through text-muted{% endif %}">
+      <td class="text-nowrap small">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+      <td>
+        <span class="badge bg-secondary text-uppercase">{{ r.operation }}</span>
+      </td>
+      <td class="small">
+        {% if r.smc_object %}
+          <strong>{{ r.smc_object.smc_type }}</strong>:
+          {{ r.smc_object.smc_name }}
+        {% else %}
+          {# Create-new ops have no smc_object — show payload summary. #}
+          {% set p = r.payload_json|safe %}
+          <span class="text-muted">{{ r.feature_source }} create</span>
+        {% endif %}
+        {% if r.scheduled_after %}
+        <span class="badge bg-info text-dark ms-1" title="Depends on change #{{ r.scheduled_after }}">
+          ↳ #{{ r.scheduled_after }}
+        </span>
+        {% endif %}
+      </td>
+      <td class="small">
+        <span class="text-muted">{{ r.feature_source }}</span>
+        {% if r.source_correlation_id %}
+        <div class="text-muted" style="font-size:0.7rem;">{{ r.source_correlation_id }}</div>
+        {% endif %}
+      </td>
+      <td class="small">
+        {% if r.user %}
+          {{ r.user.email.split('@')[0] }}
+        {% else %}
+          <span class="text-muted">system</span>
+        {% endif %}
+      </td>
+      {% if is_super %}
+      <td class="small">
+        {% if r.domain %}
+        <span class="badge bg-dark border">{{ r.domain.slug }}</span>
+        {% endif %}
+      </td>
+      {% endif %}
+      <td>
+        {% if r.state == 'queued' %}
+          <span class="badge bg-warning text-dark">QUEUED</span>
+        {% elif r.state == 'conflict' %}
+          <span class="badge bg-danger">CONFLICT</span>
+        {% elif r.state == 'push_failed' %}
+          <span class="badge bg-danger">FAILED</span>
+        {% elif r.state == 'pushed' %}
+          <span class="badge bg-info text-dark">PUSHED</span>
+        {% elif r.state == 'applied' %}
+          <span class="badge bg-success">APPLIED</span>
+        {% elif r.state == 'aborted' %}
+          <span class="badge bg-secondary">ABORTED</span>
+        {% else %}
+          <span class="badge bg-secondary">{{ r.state|upper }}</span>
+        {% endif %}
+      </td>
+      <td>
+        <div class="d-flex gap-1 flex-wrap">
+          {# Push button (Admin+, queued main rows that aren't to_be_deleted) #}
+          {% if is_queued and r.scope == 'main' and r.operation != 'to_be_deleted' and can_push_global %}
+          <form method="POST" action="{{ url_for('changes.row_push', change_id=r.id) }}"
+                onsubmit="return confirm('Push change #{{ r.id }} ({{ r.operation }}) to SMC now?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-sm btn-success py-0 px-2" title="Push to SMC">
+              <i class="bi bi-rocket-takeoff"></i>
+            </button>
+          </form>
+          {% endif %}
+
+          {# Confirm/Revoke for to_be_deleted rows (Global Admin+) #}
+          {% if is_to_be_deleted and can_confirm_delete %}
+          <form method="POST" action="{{ url_for('changes.row_confirm_delete', change_id=r.id) }}"
+                onsubmit="return confirm('Confirm deletion of {{ r.smc_object.smc_name if r.smc_object else r.id }}? The object will be removed from SMC immediately.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-sm btn-outline-danger py-0 px-2" title="Confirm deletion">
+              <i class="bi bi-check-lg"></i> Confirm
+            </button>
+          </form>
+          <form method="POST" action="{{ url_for('changes.row_revoke_delete', change_id=r.id) }}"
+                onsubmit="return confirm('Revoke this delete request? The object stays in SMC.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-sm btn-outline-secondary py-0 px-2" title="Revoke deletion request">
+              <i class="bi bi-arrow-counterclockwise"></i> Revoke
+            </button>
+          </form>
+          {% endif %}
+
+          {# Abort (own row OR admin+) #}
+          {% if (is_queued or is_conflict) and (is_mine or can_push_global) %}
+          <form method="POST" action="{{ url_for('changes.row_abort', change_id=r.id) }}"
+                onsubmit="return confirm('Abort change #{{ r.id }}? Cannot be undone.');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-sm btn-outline-warning py-0 px-2" title="Abort">
+              <i class="bi bi-x-circle"></i>
+            </button>
+          </form>
+          {% endif %}
+
+          {# Conflict resolver (Admin+) #}
+          {% if is_conflict and can_push_global %}
+            {% set peer = peer_by_id.get(r.id) %}
+            {% if peer %}
+            <button class="btn btn-sm btn-outline-info py-0 px-2"
+                    type="button" data-bs-toggle="collapse" data-bs-target="#conflict-{{ r.id }}"
+                    title="Resolve conflict">
+              <i class="bi bi-shuffle"></i> Resolve
+            </button>
+            {% endif %}
+          {% endif %}
+
+          {# Detail toggle for the row's payload + error #}
+          <button class="btn btn-sm btn-outline-secondary py-0 px-2"
+                  type="button" data-bs-toggle="collapse" data-bs-target="#detail-{{ r.id }}"
+                  title="Show details">
+            <i class="bi bi-chevron-down"></i>
+          </button>
+        </div>
+      </td>
+    </tr>
+
+    {# Detail expansion row. #}
+    {% set _payload = (r.payload_json or '{}') | from_json %}
+    {% set _steps = _payload.steps if _payload and _payload.steps is defined else [] %}
+    <tr class="collapse" id="detail-{{ r.id }}">
+      <td colspan="{% if is_super %}8{% else %}7{% endif %}">
+        {% if _steps %}
+        {# Q19/b — bundle handlers (deploy_tls, install_ssh_rule etc.)
+           expose a `steps` array in their payload. Render an ordered
+           list so the operator sees what ran in what order with per-
+           step status. #}
+        <div class="mb-3">
+          <strong>Pipeline steps</strong>
+          <span class="text-muted">— in execution order:</span>
+          <ol class="mb-2 mt-1" style="font-size:0.85rem;">
+            {% for s in _steps %}
+            <li>
+              {% if s.status == 'ok' %}
+                <span class="badge bg-success">ok</span>
+              {% elif s.status == 'failed' %}
+                <span class="badge bg-danger">failed</span>
+              {% elif s.status == 'warning' %}
+                <span class="badge bg-warning text-dark">warning</span>
+              {% else %}
+                <span class="badge bg-secondary">{{ s.status }}</span>
+              {% endif %}
+              <code>{{ s.name }}</code>
+              {% if s.detail %}
+              <span class="text-muted">— {{ s.detail }}</span>
+              {% endif %}
+            </li>
+            {% endfor %}
+          </ol>
+        </div>
+        {% endif %}
+        <div class="row small">
+          <div class="col-md-6">
+            <strong>Payload:</strong>
+            <pre class="mb-1" style="white-space:pre-wrap; background:#0d1117; padding:0.5rem; border-radius:0.25rem; font-size:0.75rem;">{{ r.payload_json }}</pre>
+          </div>
+          <div class="col-md-6">
+            {% if r.push_error_text %}
+            <strong class="text-danger">Push error:</strong>
+            <pre class="mb-1 text-danger" style="white-space:pre-wrap; background:#0d1117; padding:0.5rem; border-radius:0.25rem; font-size:0.75rem;">{{ r.push_error_text }}</pre>
+            {% if r.push_error_at %}
+            <div class="text-muted">Failed at {{ r.push_error_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</div>
+            {% endif %}
+            {% endif %}
+            {% if r.transitioned_at %}
+            <div class="text-muted mt-2">Last transition: {{ r.transitioned_at.strftime('%Y-%m-%d %H:%M:%S') }} UTC</div>
+            {% endif %}
+            {% if r.smc_object %}
+            <div class="text-muted">SMC href: <code style="font-size:0.7rem;">{{ r.smc_object.smc_href }}</code></div>
+            {% endif %}
+          </div>
+        </div>
+      </td>
+    </tr>
+
+    {# Conflict resolution panel (only when state='conflict'). #}
+    {% if is_conflict and can_push_global %}
+      {% set peer = peer_by_id.get(r.id) %}
+      {% if peer %}
+      <tr class="collapse" id="conflict-{{ r.id }}">
+        <td colspan="{% if is_super %}8{% else %}7{% endif %}">
+          <div class="alert alert-warning mb-2">
+            <i class="bi bi-exclamation-triangle"></i>
+            <strong>Conflict between change #{{ r.id }} and #{{ peer.id }}</strong>
+            — both target the same object. Pick the winner; the loser is aborted.
+          </div>
+          <form method="POST" action="{{ url_for('changes.row_resolve_conflict', change_id=r.id) }}">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="row g-2 small">
+              <div class="col-md-6">
+                <div class="card border-info h-100">
+                  <div class="card-header py-1 px-2 d-flex justify-content-between">
+                    <strong>This (#{{ r.id }})</strong>
+                    <span class="text-muted">{{ r.created_at.strftime('%Y-%m-%d %H:%M') }} by
+                      {% if r.user %}{{ r.user.email.split('@')[0] }}{% else %}—{% endif %}
+                    </span>
+                  </div>
+                  <div class="card-body py-2 px-2">
+                    <pre style="white-space:pre-wrap; font-size:0.7rem; max-height:240px;">{{ r.payload_json }}</pre>
+                    <button type="submit" name="winner" value="this" class="btn btn-sm btn-success w-100">
+                      <i class="bi bi-check-lg"></i> Use this version
+                    </button>
+                  </div>
+                </div>
+              </div>
+              <div class="col-md-6">
+                <div class="card border-secondary h-100">
+                  <div class="card-header py-1 px-2 d-flex justify-content-between">
+                    <strong>Peer (#{{ peer.id }})</strong>
+                    <span class="text-muted">{{ peer.created_at.strftime('%Y-%m-%d %H:%M') }} by
+                      {% if peer.user %}{{ peer.user.email.split('@')[0] }}{% else %}—{% endif %}
+                    </span>
+                  </div>
+                  <div class="card-body py-2 px-2">
+                    <pre style="white-space:pre-wrap; font-size:0.7rem; max-height:240px;">{{ peer.payload_json }}</pre>
+                    <button type="submit" name="winner" value="peer" class="btn btn-sm btn-outline-success w-100">
+                      <i class="bi bi-check-lg"></i> Use peer version
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </form>
+        </td>
+      </tr>
+      {% endif %}
+    {% endif %}
+
+    {% endfor %}
+  </tbody>
+</table>

@@ -23,6 +23,7 @@
                     <td>
                         <form method="post" action="{{ url_for('tls.certificates_untrack', cert_id=cert.id) }}" class="d-inline"
                               onsubmit="return confirm('Stop tracking {{ cert.domain }}?')">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                             <button class="btn btn-sm btn-outline-warning"><i class="bi bi-eye-slash"></i> Untrack</button>
                         </form>
                     </td>
@@ -77,6 +78,7 @@
                                 <span class="badge bg-success"><i class="bi bi-check"></i> Tracked</span>
                             {% else %}
                                 <form method="post" action="{{ url_for('tls.certificates_track') }}" class="d-inline">
+                                    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                                     <input type="hidden" name="domain" value="{{ cert.domain }}">
                                     <input type="hidden" name="lineage_path" value="{{ cert.lineage_path }}">
                                     <button class="btn btn-sm btn-outline-success"><i class="bi bi-plus"></i> Track</button>

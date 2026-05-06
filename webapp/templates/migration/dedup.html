@@ -345,7 +345,7 @@
 // DHCP reservation checkbox toggle
 document.querySelectorAll('.dhcp-select').forEach(cb => {
     cb.addEventListener('change', function() {
-        fetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
+        fexFetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
@@ -370,7 +370,7 @@ document.querySelectorAll('.dhcp-overwrite').forEach(btn => {
             cb.checked = true;
             cb.dataset.action = 'conflict_overwrite';
         }
-        fetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
+        fexFetch('{{ url_for("migration_dhcp_update", project_id=project.id) }}', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
@@ -390,7 +390,7 @@ document.querySelectorAll('.dhcp-overwrite').forEach(btn => {
 
 document.querySelectorAll('.dedup-action').forEach(sel => {
     sel.addEventListener('change', function() {
-        fetch('{{ url_for("migration_dedup_update", project_id=project.id) }}', {
+        fexFetch('{{ url_for("migration_dedup_update", project_id=project.id) }}', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({

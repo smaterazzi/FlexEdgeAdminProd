@@ -46,6 +46,7 @@
     <div class="alert alert-secondary">No findings in this submission.</div>
     {% else %}
     <form method="post" action="{{ url_for('optimize_submission_decide', sub_id=submission.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
         {% for f in findings %}
         <div class="card mb-3">
             <div class="card-header d-flex justify-content-between align-items-center">

@@ -71,6 +71,7 @@
 
     {# The form ──────────────────────────────────────────────────────────── #}
     <form method="POST">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
 
     {% for srv in fg_servers %}
     {% set saved = saved_mappings.get(srv.id|string, '') %}

@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% block title %}Logs{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-journal-text"></i> Platform Logs</h2>
+    <div class="d-flex gap-2 align-items-center">
+      <span class="text-muted small" title="Log mode controls whether op-level entries are persisted">
+        Mode:
+        {% if log_mode == 'verbose' %}
+          <span class="badge bg-info text-dark">Verbose</span>
+        {% else %}
+          <span class="badge bg-secondary">Normal</span>
+        {% endif %}
+      </span>
+      <a href="{{ url_for('admin.log_settings') }}"
+         class="btn btn-sm btn-outline-secondary">
+        <i class="bi bi-gear"></i> Settings
+      </a>
+    </div>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+  <div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+  {% endfor %}
+  {% endwith %}
+
+  <!-- Filter bar -->
+  <form method="get" class="card mb-3">
+    <div class="card-body py-2 px-3">
+      <div class="row g-2 align-items-end">
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">Feature</label>
+          <select name="feature" class="form-select form-select-sm">
+            <option value="">All</option>
+            {% for f in features %}
+            <option value="{{ f.name }}" {% if filters.feature == f.name %}selected{% endif %}>{{ f.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">Level</label>
+          <select name="level" class="form-select form-select-sm">
+            <option value="">All</option>
+            <option value="audit" {% if filters.level == 'audit' %}selected{% endif %}>Audit</option>
+            <option value="op"    {% if filters.level == 'op' %}selected{% endif %}>Operational</option>
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">Status</label>
+          <select name="status" class="form-select form-select-sm">
+            <option value="">All</option>
+            <option value="ok"      {% if filters.status == 'ok' %}selected{% endif %}>OK</option>
+            <option value="failed"  {% if filters.status == 'failed' %}selected{% endif %}>Failed</option>
+            <option value="warning" {% if filters.status == 'warning' %}selected{% endif %}>Warning</option>
+            <option value="blocked" {% if filters.status == 'blocked' %}selected{% endif %}>Blocked</option>
+          </select>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label small text-muted mb-1">Since (hours)</label>
+          <select name="since_hours" class="form-select form-select-sm">
+            <option value="0"   {% if filters.since_hours == 0 %}selected{% endif %}>All time</option>
+            <option value="1"   {% if filters.since_hours == 1 %}selected{% endif %}>Last 1 h</option>
+            <option value="24"  {% if filters.since_hours == 24 %}selected{% endif %}>Last 24 h</option>
+            <option value="168" {% if filters.since_hours == 168 %}selected{% endif %}>Last 7 d</option>
+            <option value="720" {% if filters.since_hours == 720 %}selected{% endif %}>Last 30 d</option>
+          </select>
+        </div>
+        <div class="col-md-3">
+          <label class="form-label small text-muted mb-1">Search (target + detail)</label>
+          <input type="search" name="q" value="{{ filters.q }}"
+                 class="form-control form-control-sm"
+                 placeholder="hostname, IP, action…">
+        </div>
+        <div class="col-md-1 d-grid">
+          <button class="btn btn-sm btn-primary"><i class="bi bi-funnel"></i></button>
+        </div>
+      </div>
+      <div class="d-flex justify-content-between align-items-center mt-2">
+        <span class="small text-muted">
+          Showing {{ logs|length }} of {{ total_count }} ({{ active_domain or 'no domain' }})
+          {% if active_only %} — current Domain only{% else %} — all visible Domains{% endif %}
+        </span>
+        <div class="d-flex gap-2 align-items-center">
+          <a href="{{ url_for('logs_index', **strip_args(request.args, 'active_only')) }}{% if not active_only %}?active_only=1{% endif %}"
+             class="small text-muted">
+            {% if active_only %}Show all my Domains{% else %}Limit to current Domain{% endif %}
+          </a>
+          <a href="{{ url_for('logs_index') }}" class="small text-muted">Reset</a>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  {% if logs %}
+  <div class="card">
+    <div class="table-responsive">
+      <table class="table table-sm table-hover mb-0">
+        <thead>
+          <tr>
+            <th style="width:160px">Time (UTC)</th>
+            <th style="width:90px">Feature</th>
+            <th style="width:60px">Level</th>
+            <th>Action</th>
+            <th style="width:80px">Status</th>
+            <th>Target</th>
+            <th style="width:160px">User</th>
+            <th style="width:140px">Domain</th>
+            <th style="width:50px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for log in logs %}
+          <tr class="log-row">
+            <td class="text-nowrap small">{{ log.timestamp.strftime('%Y-%m-%d %H:%M:%S') }}</td>
+            <td><span class="badge bg-secondary">{{ log.feature }}</span></td>
+            <td>
+              {% if log.level == 'op' %}
+              <span class="badge bg-info text-dark">op</span>
+              {% else %}
+              <span class="badge bg-light text-dark">audit</span>
+              {% endif %}
+            </td>
+            <td class="text-truncate small" style="max-width:280px;" title="{{ log.action }}">{{ log.action }}</td>
+            <td>
+              {% if log.status == 'ok' %}<span class="badge bg-success">OK</span>
+              {% elif log.status == 'failed' %}<span class="badge bg-danger">FAIL</span>
+              {% elif log.status == 'blocked' %}<span class="badge bg-warning text-dark">BLOCK</span>
+              {% else %}<span class="badge bg-secondary">{{ log.status|upper }}</span>{% endif %}
+            </td>
+            <td class="text-truncate small" style="max-width:300px;" title="{{ log.target }}">{{ log.target }}</td>
+            <td class="text-truncate small" style="max-width:160px;" title="{{ log.user_email or 'system' }}">
+              {{ log.user_email or '—' }}
+            </td>
+            <td class="text-truncate small" style="max-width:140px;"
+                title="{{ log.domain.display_name if log.domain else '—' }}">
+              {{ log.domain.slug if log.domain else '—' }}
+            </td>
+            <td>
+              {% if log.detail %}
+              <button class="btn btn-sm btn-outline-secondary py-0 px-1"
+                      data-bs-toggle="collapse" data-bs-target="#log-{{ log.id }}">
+                <i class="bi bi-chevron-down"></i>
+              </button>
+              {% endif %}
+            </td>
+          </tr>
+          {% if log.detail %}
+          <tr class="collapse" id="log-{{ log.id }}">
+            <td colspan="9">
+              <pre class="mb-0 small" style="white-space:pre-wrap;background:#0d1117;padding:0.75rem;border-radius:0.25rem;">{{ log.detail }}</pre>
+            </td>
+          </tr>
+          {% endif %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    {% if total_count > logs|length %}
+    <div class="card-footer d-flex justify-content-between align-items-center small">
+      <span class="text-muted">
+        Showing newest {{ logs|length }} entries —
+        {{ total_count - logs|length }} more match the filter.
+      </span>
+      <a href="{{ url_for('logs_index', **dict(request.args, limit=request.args.get('limit', 200)|int + 200)) }}"
+         class="btn btn-sm btn-outline-secondary">Load more</a>
+    </div>
+    {% endif %}
+  </div>
+  {% else %}
+  <div class="alert alert-info">
+    No log entries match the current filter.
+  </div>
+  {% endif %}
+
+</div>
+{% endblock %}

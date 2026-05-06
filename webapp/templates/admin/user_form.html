@@ -30,6 +30,7 @@
                 </div>
                 <div class="card-body">
                     <form method="POST">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <div class="mb-3">
                             <label for="email" class="form-label">Email</label>
                             <input type="email" class="form-control bg-dark border-secondary text-light"
@@ -61,44 +62,77 @@
                             <label class="form-check-label" for="is_active">Active</label>
                         </div>
 
-                        {% if tenants %}
+                        {% if domains %}
                         <h6 class="border-bottom border-secondary pb-2 mb-3">
-                            <i class="bi bi-link-45deg"></i> Tenant Access
+                            <i class="bi bi-diagram-3"></i> Domain Access
                         </h6>
                         <p class="text-muted mb-3" style="font-size:0.8rem;">
-                            Assign this user to tenants with a specific API key.
+                            Tick each Domain this user should be able to switch into.
+                            One can be marked <em>default</em> — it's auto-selected on login.
                         </p>
 
-                        {% set current_accesses = {} %}
+                        {# Pre-compute current grants + the existing default. #}
+                        {% set current_domain_ids = [] %}
+                        {% set current_default_id = namespace(value=0) %}
                         {% if user %}
-                            {% for a in user.tenant_accesses %}
-                                {% if current_accesses.update({a.tenant_id: a.api_key_id}) %}{% endif %}
+                            {% for a in user.domain_accesses %}
+                                {% if current_domain_ids.append(a.domain_id) %}{% endif %}
+                                {% if a.is_default %}{% set current_default_id.value = a.domain_id %}{% endif %}
                             {% endfor %}
                         {% endif %}
 
-                        {% for t in tenants %}
-                        <div class="card bg-dark border-secondary mb-2">
-                            <div class="card-body py-2 px-3">
-                                <div class="d-flex align-items-center gap-2">
-                                    <strong style="min-width:150px;">{{ t.name }}</strong>
-                                    <select class="form-select form-select-sm bg-dark border-secondary text-light"
-                                            name="access_{{ t.id }}" style="max-width:300px;">
-                                        <option value="">— No access —</option>
-                                        {% for k in api_keys if k.tenant_id == t.id %}
-                                        <option value="{{ k.id }}"
-                                                {% if current_accesses.get(t.id) == k.id %}selected{% endif %}>
-                                            {{ k.name }}
-                                        </option>
-                                        {% endfor %}
-                                    </select>
-                                </div>
-                            </div>
+                        <div class="table-responsive">
+                            <table class="table table-dark table-sm align-middle mb-2">
+                                <thead>
+                                    <tr>
+                                        <th style="width:60px;">Access</th>
+                                        <th>Domain</th>
+                                        <th>SMC server</th>
+                                        <th style="width:90px;" class="text-center">Default</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    {% for d in domains %}
+                                    {% set has_access = d.id in current_domain_ids %}
+                                    <tr>
+                                        <td class="text-center">
+                                            <input class="form-check-input" type="checkbox"
+                                                   id="domain_{{ d.id }}" name="domain_{{ d.id }}"
+                                                   value="1"
+                                                   {% if has_access %}checked{% endif %}>
+                                        </td>
+                                        <td>
+                                            <label for="domain_{{ d.id }}" style="cursor:pointer;">
+                                                <strong>{{ d.display_name }}</strong>
+                                                <br><small class="text-muted">slug <code>{{ d.slug }}</code> · SMC <code>{{ d.smc_domain_name }}</code></small>
+                                            </label>
+                                        </td>
+                                        <td style="font-size:0.78rem;">
+                                            {% if d.api_key %}{{ d.api_key.smc_url or '—' }}{% else %}—{% endif %}
+                                        </td>
+                                        <td class="text-center">
+                                            <input class="form-check-input" type="radio"
+                                                   name="default_domain_id" value="{{ d.id }}"
+                                                   {% if current_default_id.value == d.id %}checked{% endif %}
+                                                   title="Auto-select on login">
+                                        </td>
+                                    </tr>
+                                    {% endfor %}
+                                </tbody>
+                            </table>
                         </div>
-                        {% endfor %}
+                        <div class="form-text mb-3" style="font-size:0.75rem;">
+                            <i class="bi bi-info-circle"></i>
+                            The default radio only takes effect for ticked Domains. Untick to revoke a
+                            grant. Feature data tied to the Domain stays in the DB on revoke — the
+                            user just loses visibility.
+                        </div>
                         {% else %}
                         <div class="alert alert-info" style="font-size:0.85rem;">
                             <i class="bi bi-info-circle me-1"></i>
-                            Create tenants and API keys first, then assign them to users.
+                            No active Domains exist. <a href="{{ url_for('admin.domain_new') }}">Create one</a>
+                            (or create an API key — Domains are auto-created with new API keys) before
+                            you can grant a user access.
                         </div>
                         {% endif %}
 
@@ -111,6 +145,92 @@
                     </form>
                 </div>
             </div>
+
+            {# Phase E.2 — per-user bypass panel. Only on existing-user
+               edit (no point on create-new since bypass is per-user). #}
+            {% if user and bypass_panel %}
+            <div class="card bg-dark border-info mt-3">
+                <div class="card-header bg-info text-dark">
+                    <i class="bi bi-fast-forward"></i>
+                    Per-feature Bypass — {{ user.email }}
+                </div>
+                <div class="card-body">
+                    <p class="small mb-3">
+                        When ON, this user's actions on the named feature
+                        in the named Domain skip the Change Queue —
+                        they push immediately to SMC (regardless of role
+                        tier) and the audit log records
+                        <code>&lt;feature&gt;.&lt;action&gt;.bypass_queue</code>.
+                        OFF (default) means the user follows the queue
+                        workflow appropriate to their role.
+                        Toggles are <strong>disabled</strong> when the
+                        Domain capability for that feature is OFF and you
+                        aren't a Super or Global Admin —
+                        ask a Global Admin to enable the capability on
+                        Admin → Log Settings, or have a Super / Global
+                        Admin grant it directly.
+                    </p>
+                    <form method="POST" action="{{ url_for('admin.user_bypass', id=user.id) }}">
+                        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                        <table class="table table-sm table-dark">
+                            <thead>
+                                <tr>
+                                    <th style="width:30%;">Domain</th>
+                                    <th>Feature</th>
+                                    <th class="text-center" style="width:140px;">Bypass</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% set ns = namespace(prev_domain=None) %}
+                                {% for row in bypass_panel %}
+                                <tr>
+                                    <td>
+                                        {% if ns.prev_domain != row.domain.id %}
+                                        <code>{{ row.domain.display_name }}</code>
+                                        <div class="small text-muted">{{ row.domain.slug }}</div>
+                                        {% set ns.prev_domain = row.domain.id %}
+                                        {% endif %}
+                                    </td>
+                                    <td>
+                                        <code>{{ row.feature_key }}</code>
+                                        <div class="small text-muted">
+                                            {{ row.feature_label }}
+                                            {% if not row.capability_on %}
+                                            <span class="badge bg-secondary ms-1"
+                                                  title="Domain capability for this feature is OFF; only Super/Global Admin can grant.">
+                                              capability off
+                                            </span>
+                                            {% endif %}
+                                        </div>
+                                    </td>
+                                    <td class="text-center">
+                                        <div class="form-check form-switch d-inline-block">
+                                            <input class="form-check-input" type="checkbox"
+                                                   id="bypass-{{ row.domain.id }}-{{ row.feature_key }}"
+                                                   name="bypass_{{ row.domain.id }}_{{ row.feature_key }}"
+                                                   {% if row.enabled %}checked{% endif %}
+                                                   {% if not row.can_edit %}disabled{% endif %}>
+                                            <label class="form-check-label small"
+                                                   for="bypass-{{ row.domain.id }}-{{ row.feature_key }}">
+                                                {% if row.enabled %}on{% else %}off{% endif %}
+                                            </label>
+                                        </div>
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                        <button type="submit" class="btn btn-info btn-sm">
+                            <i class="bi bi-save"></i> Save bypass settings
+                        </button>
+                        <span class="small text-muted ms-2">
+                            Each toggle change is audit-logged
+                            (<code>queue_bypass.user</code>).
+                        </span>
+                    </form>
+                </div>
+            </div>
+            {% endif %}
         </div>
     </div>
 </div>

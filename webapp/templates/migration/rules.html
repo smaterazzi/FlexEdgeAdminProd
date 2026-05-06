@@ -295,7 +295,7 @@ function saveSelections() {
     document.querySelectorAll('.rule-cb').forEach(cb => {
         selections[cb.dataset.fgtId] = cb.checked;
     });
-    const p1 = fetch('{{ url_for("migration_rules_update", project_id=project.id) }}', {
+    const p1 = fexFetch('{{ url_for("migration_rules_update", project_id=project.id) }}', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({selections: selections})
@@ -306,7 +306,7 @@ function saveSelections() {
     document.querySelectorAll('.nat-cb').forEach(cb => {
         natSelections[cb.dataset.fgtId] = cb.checked;
     });
-    const p2 = fetch('{{ url_for("migration_nat_rules_update", project_id=project.id) }}', {
+    const p2 = fexFetch('{{ url_for("migration_nat_rules_update", project_id=project.id) }}', {
         method: 'POST',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({selections: natSelections})
