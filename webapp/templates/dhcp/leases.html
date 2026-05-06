@@ -325,7 +325,7 @@
   {% if _parts|length == 2 %}
     {% set _prefix = _parts[1]|int %}
     {% if _prefix >= 0 and _prefix <= 32 %}
-      {% set _subnet_size = (1 << (32 - _prefix)) - 2 %}
+      {% set _subnet_size = (2 ** (32 - _prefix)) - 2 %}
     {% endif %}
   {% endif %}
 {% endif %}
