@@ -142,8 +142,18 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                         zone=str(pi_data.get("zone_ref", "") or ""),
                         addresses=top_addrs,
                     ))
-                # VLAN sub-interfaces
-                for vlan in (pi_data.get("vlanInterfaces") or []):
+                # VLAN sub-interfaces. SMC payloads come in two shapes:
+                #   - flat:    [{"vlan_id": "10", "interfaces": [...]}]
+                #   - wrapped: [{"physical_interface": {"vlan_id": "10", ...}}]
+                # Some versions also key the list as snake_case
+                # (vlan_interfaces) instead of camelCase (vlanInterfaces).
+                vlan_list = (pi_data.get("vlanInterfaces")
+                             or pi_data.get("vlan_interfaces")
+                             or [])
+                for vlan_wrap in vlan_list:
+                    if not isinstance(vlan_wrap, dict):
+                        continue
+                    vlan = vlan_wrap.get("physical_interface") or vlan_wrap
                     out.append(InterfaceInfo(
                         interface_id=str(pi_data.get("interface_id", "") or ""),
                         vlan_id=str(vlan.get("vlan_id", "") or ""),
