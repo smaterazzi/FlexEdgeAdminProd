@@ -4,16 +4,30 @@
 {% block content %}
 <div class="filter-bar p-3 d-flex align-items-center gap-3 flex-wrap">
     <h5 class="mb-0"><i class="bi bi-shield-check"></i> {{ policy_name }}</h5>
-    <span class="badge bg-primary">{{ total_rules }} rules</span>
-    <span class="badge bg-info">{{ total_sections }} sections</span>
+    <span class="badge bg-primary"><span id="rule-counter">{{ total_rules }}</span> rules</span>
+    <span class="badge bg-info"><span id="section-counter">{{ total_sections }}</span> sections</span>
     {% if disabled_count %}
     <span class="badge bg-secondary">{{ disabled_count }} disabled</span>
     {% endif %}
+    <div class="ms-auto position-relative" style="min-width:280px;">
+        <i class="bi bi-search position-absolute"
+           style="top:50%; left:0.75rem; transform:translateY(-50%); color:#6c757d;"></i>
+        <input type="search" id="rules-search"
+               class="form-control form-control-sm"
+               style="padding-left:2rem;"
+               placeholder="Search rules — supports AND / OR (e.g. ssh AND lan)">
+        <button type="button" id="rules-search-clear"
+                class="btn btn-sm btn-link position-absolute"
+                style="top:50%; right:0.25rem; transform:translateY(-50%); display:none;"
+                title="Clear search (Esc)">
+            <i class="bi bi-x-circle"></i>
+        </button>
+    </div>
 </div>
 
 <div class="p-3">
     <div class="table-responsive">
-        <table class="table table-sm table-hover align-middle">
+        <table class="table table-sm table-hover align-middle" id="rules-table">
             <thead>
                 <tr>
                     <th style="width:40px;">#</th>
@@ -83,4 +97,219 @@
         </table>
     </div>
 </div>
+
+<style>
+mark.search-hit {
+  background-color: #ffeb3b;
+  color: #000;
+  padding: 0 2px;
+  border-radius: 2px;
+}
+.filter-bar #rule-counter.filtered,
+.filter-bar #section-counter.filtered {
+  color: #ffc107;
+  font-weight: 600;
+}
+</style>
+
+<script>
+(function() {
+  // ── Policy rules viewer full-text filter ────────────────────────────
+  // - Tokens parsed on whitespace; AND / OR (case insensitive) are
+  //   operators between tokens (mixed → AND wins).
+  // - Each rule row is matched against its full visible text. Sections
+  //   stay visible when ANY rule under them matches (so the operator
+  //   keeps context) OR when the section name itself matches.
+  // - Highlights matching substrings via <mark.search-hit>.
+  // - Counters in the filter bar update to the filtered total when a
+  //   query is active; restored when cleared.
+
+  const input    = document.getElementById("rules-search");
+  const clearBtn = document.getElementById("rules-search-clear");
+  const table    = document.getElementById("rules-table");
+  if (!input || !table) return;
+
+  const tbody = table.querySelector("tbody");
+  if (!tbody) return;
+
+  const ruleCounter    = document.getElementById("rule-counter");
+  const sectionCounter = document.getElementById("section-counter");
+  const totalRules     = ruleCounter ? parseInt(ruleCounter.textContent, 10) || 0 : 0;
+  const totalSections  = sectionCounter ? parseInt(sectionCounter.textContent, 10) || 0 : 0;
+
+  function escapeRegex(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  function parseQuery(q) {
+    const parts = q.trim().split(/\s+/).filter(Boolean);
+    if (!parts.length) return { tokens: [], op: "AND" };
+    let op = "AND";
+    let sawAnd = false, sawOr = false;
+    const tokens = [];
+    for (const p of parts) {
+      const u = p.toUpperCase();
+      if (u === "AND") { sawAnd = true; op = "AND"; continue; }
+      if (u === "OR")  { sawOr  = true; op = "OR";  continue; }
+      tokens.push(p.toLowerCase());
+    }
+    if (sawAnd && sawOr) op = "AND";
+    return { tokens, op };
+  }
+
+  function clearHighlights(rowEl) {
+    rowEl.querySelectorAll("mark.search-hit").forEach(m => {
+      m.replaceWith(document.createTextNode(m.textContent));
+    });
+    rowEl.normalize();
+  }
+
+  function highlightTokens(rowEl, tokens) {
+    if (!tokens.length) return;
+    const re = new RegExp(tokens.map(escapeRegex).join("|"), "gi");
+    const walker = document.createTreeWalker(rowEl, NodeFilter.SHOW_TEXT, {
+      acceptNode(n) {
+        if (!n.textContent.trim()) return NodeFilter.FILTER_REJECT;
+        const p = n.parentNode;
+        if (p && p.tagName === "MARK" && p.classList.contains("search-hit")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        if (p && (p.tagName === "SCRIPT" || p.tagName === "STYLE")) {
+          return NodeFilter.FILTER_REJECT;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    });
+    const nodes = [];
+    let n;
+    while ((n = walker.nextNode())) nodes.push(n);
+    for (const tn of nodes) {
+      const text = tn.textContent;
+      re.lastIndex = 0;
+      if (!re.test(text)) continue;
+      re.lastIndex = 0;
+      const frag = document.createDocumentFragment();
+      let lastIdx = 0;
+      let m;
+      while ((m = re.exec(text)) !== null) {
+        if (m.index > lastIdx) {
+          frag.appendChild(document.createTextNode(text.slice(lastIdx, m.index)));
+        }
+        const mk = document.createElement("mark");
+        mk.className = "search-hit";
+        mk.textContent = m[0];
+        frag.appendChild(mk);
+        lastIdx = m.index + m[0].length;
+      }
+      if (lastIdx < text.length) {
+        frag.appendChild(document.createTextNode(text.slice(lastIdx)));
+      }
+      tn.parentNode.replaceChild(frag, tn);
+    }
+  }
+
+  // Build groups: each group = a section header (or null for pre-section
+  // rules) + the rule rows that follow until the next section.
+  function buildGroups() {
+    const rows = Array.from(tbody.querySelectorAll("tr"));
+    const groups = [];
+    let current = { section: null, rules: [] };
+    for (const row of rows) {
+      if (row.classList.contains("rule-section-row")) {
+        if (current.section || current.rules.length) groups.push(current);
+        current = { section: row, rules: [] };
+      } else {
+        current.rules.push(row);
+      }
+    }
+    if (current.section || current.rules.length) groups.push(current);
+    return groups;
+  }
+  const groups = buildGroups();
+
+  function applyFilter() {
+    const q = input.value;
+    const { tokens, op } = parseQuery(q);
+    clearBtn.style.display = q ? "" : "none";
+
+    const matchTokens = (text) => !tokens.length
+      || (op === "AND" ? tokens.every(t => text.includes(t))
+                       : tokens.some(t => text.includes(t)));
+
+    let visibleRules = 0;
+    let visibleSections = 0;
+
+    for (const g of groups) {
+      let sectionMatch = false;
+      if (g.section) {
+        clearHighlights(g.section);
+        sectionMatch = matchTokens(g.section.textContent.toLowerCase());
+      }
+
+      let groupHasRuleMatch = false;
+      for (const row of g.rules) {
+        clearHighlights(row);
+        const match = matchTokens(row.textContent.toLowerCase());
+        if (match) {
+          row.style.display = "";
+          visibleRules++;
+          groupHasRuleMatch = true;
+          if (tokens.length) highlightTokens(row, tokens);
+        } else {
+          row.style.display = "none";
+        }
+      }
+
+      if (g.section) {
+        // Section header is visible when:
+        //   * no filter is active, OR
+        //   * the section name itself matches, OR
+        //   * any rule under it matches (operator wants the context).
+        const sectionVisible = !tokens.length || sectionMatch || groupHasRuleMatch;
+        g.section.style.display = sectionVisible ? "" : "none";
+        if (sectionVisible) {
+          visibleSections++;
+          if (tokens.length && sectionMatch) highlightTokens(g.section, tokens);
+        }
+      }
+    }
+
+    if (ruleCounter) {
+      if (tokens.length && visibleRules !== totalRules) {
+        ruleCounter.textContent = `${visibleRules} of ${totalRules}`;
+        ruleCounter.classList.add("filtered");
+      } else {
+        ruleCounter.textContent = totalRules;
+        ruleCounter.classList.remove("filtered");
+      }
+    }
+    if (sectionCounter) {
+      if (tokens.length && visibleSections !== totalSections) {
+        sectionCounter.textContent = `${visibleSections} of ${totalSections}`;
+        sectionCounter.classList.add("filtered");
+      } else {
+        sectionCounter.textContent = totalSections;
+        sectionCounter.classList.remove("filtered");
+      }
+    }
+  }
+
+  let debounceTimer = null;
+  input.addEventListener("input", () => {
+    clearTimeout(debounceTimer);
+    debounceTimer = setTimeout(applyFilter, 80);
+  });
+  input.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") {
+      input.value = "";
+      applyFilter();
+    }
+  });
+  clearBtn.addEventListener("click", () => {
+    input.value = "";
+    applyFilter();
+    input.focus();
+  });
+})();
+</script>
 {% endblock %}
