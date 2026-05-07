@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-07
 
+### Policy rules viewer: section detection fix + full-text search (2026-05-07)
+
+- **Sections were silently rendered as rules.** The detection in
+  `get_policy_rules` / `get_policy_nat_rules` checked
+  `"section" in rule.typeof.lower()`, but in `fp-NGFW-SMC-python`
+  v1.x both rules AND sections share the same `typeof`
+  (`fw_ipv4_access_rule` / `fw_ipv4_nat_rule`). Sections are
+  distinguished by data shape: they lack `sources` / `destinations`
+  / `services` and carry their label in `comment` (where
+  `create_rule_section(name=...)` writes it). The check now uses
+  `Rule.is_rule_section` (the SDK's documented property) with a
+  data-dict shape fallback for older SDK builds. Section headers
+  render correctly again on `/policy/<name>`.
+- **Full-text search bar** added to the policy rules viewer with
+  the same UX as the Engines cluster-detail search: AND / OR token
+  grammar (case-insensitive, mixed → AND), matched substrings
+  highlighted in-place via `<mark.search-hit>`, rule + section
+  counters update to "M of N" while a query is active. Section
+  headers stay visible when any rule under them matches OR when
+  the section name matches — preserves operator context. Esc
+  clears, × button on the input, debounced 80 ms.
+
 ### DHCP Manager: subnet active-discovery scan (2026-05-07)
 
 Active-discovery sweep that turns the **Active leases** page into a
