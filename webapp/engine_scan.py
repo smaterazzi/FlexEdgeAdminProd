@@ -1,0 +1,430 @@
+"""Engines → Tools → Scan — generic node-side network scanner.
+
+Extends the DHCP subnet scan's 2-phase pattern (ICMP + arping) with
+two additional phases that produce per-host port and hostname data:
+
+  Phase 1 — ICMP        parallel ping + ip neighbor show for MAC
+  Phase 2 — arping      fallback for ICMP-failed IPs (L2 visibility)
+  Phase 3 — port scan   nc -z -w1 per (IP, port) for L2-visible hosts
+  Phase 4 — RDNS        nslookup per L2-visible host
+
+Output is one event per line (same shape as the DHCP scanner) so the
+job runtime can stream progress live:
+
+  <ip> ICMP_OK [<mac>]
+  <ip> ICMP_FAIL
+  <ip> ARP_OK <mac>
+  <ip> SILENT
+  <ip> NO_ROUTE
+  <ip> PORT <port> open|closed
+  <ip> HOST <hostname>
+
+`nmap` is intentionally NOT used — Forcepoint NGFW BusyBox doesn't
+ship it. `nc -z` (TCP zero-I/O scan) and `nslookup` are universal in
+BusyBox builds, confirmed on the lab cluster on 2026-05-07.
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import shlex
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, Optional
+
+from webapp.dhcp_ssh import SSHTarget, SSHCredential, ssh_connect
+
+log = logging.getLogger(__name__)
+
+
+MAX_HOSTS = 4096          # = /20
+MAX_PORTS = 256
+WARN_OPS_THRESHOLD = 8000   # default /24 × 25 ports = 6,375 fits
+HARD_OPS_CAP = 16384
+
+# Curated TCP-ports default — locked in 2026-05-07 (see
+# docs/Engines-ScanTool.md "Default port list").
+DEFAULT_PORTS: tuple[int, ...] = (
+    20, 21,                   # FTP
+    22,                       # SSH
+    23,                       # Telnet
+    25,                       # SMTP
+    53,                       # DNS (TCP)
+    80,                       # HTTP
+    110,                      # POP3
+    135,                      # RPC
+    137, 138, 139,            # NetBIOS
+    143,                      # IMAP
+    389,                      # LDAP
+    443,                      # HTTPS
+    445,                      # SMB
+    993,                      # IMAPS
+    995,                      # POP3S
+    1433,                     # MS SQL
+    1521,                     # Oracle
+    3306,                     # MySQL
+    3389,                     # RDP
+    5432,                     # PostgreSQL
+    5900,                     # VNC
+    8080,                     # HTTP-alt / proxy
+)
+
+
+@dataclass
+class HostResult:
+    ip: str
+    icmp_reply: bool = False
+    arp_reply: bool = False
+    mac: str = ""
+    hostname: str = ""
+    ports: dict[int, str] = field(default_factory=dict)  # port -> 'open'|'closed'
+
+    @property
+    def reachable(self) -> bool:
+        return self.icmp_reply or self.arp_reply
+
+    @property
+    def open_ports(self) -> list[int]:
+        return sorted(p for p, s in self.ports.items() if s == "open")
+
+
+@dataclass
+class EngineScanReport:
+    started_at: datetime
+    finished_at: Optional[datetime] = None
+    duration_ms: int = 0
+    source_node_index: int = 0
+    source_node_hostname: str = ""
+    source_iface_id: str = ""
+    source_iface_name: str = ""
+    target_label: str = ""           # human-readable target description
+    targets: int = 0
+    ports_scanned: list[int] = field(default_factory=list)
+    icmp_replies: int = 0
+    arp_replies: int = 0
+    hosts_with_open_ports: int = 0
+    error: str = ""
+    results: dict[str, HostResult] = field(default_factory=dict)
+
+
+# ── Port-list parsing ───────────────────────────────────────────────────
+
+
+_PORT_TOKEN_RE = re.compile(r"^\s*(\d+)\s*(?:-\s*(\d+)\s*)?$")
+
+
+def parse_port_list(raw: str) -> list[int]:
+    """Parse a comma- or whitespace-separated list of TCP ports.
+
+    Accepts ranges via ``a-b``. Returns a deduped sorted list. Raises
+    ValueError on bad tokens or out-of-range values.
+    """
+    if not raw or not raw.strip():
+        return []
+    out: set[int] = set()
+    for tok in re.split(r"[,\s]+", raw.strip()):
+        if not tok:
+            continue
+        m = _PORT_TOKEN_RE.match(tok)
+        if not m:
+            raise ValueError(f"invalid port token: {tok!r}")
+        a = int(m.group(1))
+        b = int(m.group(2)) if m.group(2) else a
+        if a < 1 or b > 65535 or a > b:
+            raise ValueError(f"port out of range or reversed: {tok!r}")
+        out.update(range(a, b + 1))
+    return sorted(out)
+
+
+# ── Remote shell script ─────────────────────────────────────────────────
+#
+# Args (after `_`):
+#   $1 BATCH                parallel job ceiling
+#   $2 PING_TIMEOUT_S
+#   $3 ARPING_TIMEOUT_S
+#   $4 PORT_TIMEOUT_S       nc -z -w
+#   $5 DNS_TIMEOUT_S        unused today (nslookup has no per-call timeout
+#                            in BusyBox, but we keep the slot for future use)
+#   $6 PORTS_CSV            comma-separated TCP ports, "" = skip Phase 3
+#   $@ (after shift 6)      target IPs
+#
+# Phases stream to stdout AND a TMP file (Phase 1 results so Phase 2 has
+# its work list). Each phase emits one line per (IP) or (IP, port). The
+# Python parser drives the progress bar from these.
+#
+# Phase 3 only probes IPs that were reachable in Phase 1 OR 2 — no point
+# port-scanning a host that didn't answer either.
+_SCAN_SCRIPT = r"""
+BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; shift 6
+TMP=$(mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
+REACHABLE=$(mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
+: > "$TMP"
+: > "$REACHABLE"
+
+# Phase 1 — ICMP
+n=0
+for ip in "$@"; do
+    (
+        if ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
+            NEIGH=$(ip neighbor show "$ip" 2>/dev/null | head -1)
+            MAC=$(printf '%s\n' "$NEIGH" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+            if [ -n "$MAC" ]; then
+                printf '%s ICMP_OK %s\n' "$ip" "$MAC"
+            else
+                printf '%s ICMP_OK\n' "$ip"
+            fi
+            printf '%s ICMP_OK\n' "$ip" >> "$TMP"
+            printf '%s\n' "$ip" >> "$REACHABLE"
+        else
+            printf '%s ICMP_FAIL\n' "$ip"
+            printf '%s ICMP_FAIL\n' "$ip" >> "$TMP"
+        fi
+    ) &
+    n=$((n+1))
+    if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
+done
+wait
+
+# Phase 2 — arping fallback for ICMP_FAIL
+while IFS= read -r line; do
+    set -- $line
+    ip=$1; state=$2
+    if [ "$state" = "ICMP_FAIL" ]; then
+        DEV=$(ip route get "$ip" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
+        if [ -z "$DEV" ]; then
+            printf '%s NO_ROUTE\n' "$ip"
+            continue
+        fi
+        OUT=$(arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
+        MAC=$(printf '%s\n' "$OUT" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+        if [ -n "$MAC" ]; then
+            printf '%s ARP_OK %s\n' "$ip" "$MAC"
+            printf '%s\n' "$ip" >> "$REACHABLE"
+        else
+            printf '%s SILENT\n' "$ip"
+        fi
+    fi
+done < "$TMP"
+
+# Phase 3 — port scan + Phase 4 RDNS, only for reachable hosts
+if [ -n "$PORTS" ] && [ -s "$REACHABLE" ]; then
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        for port in $(printf '%s' "$PORTS" | tr ',' ' '); do
+            (
+                if nc -z -w "$CT" "$ip" "$port" >/dev/null 2>&1; then
+                    printf '%s PORT %s open\n' "$ip" "$port"
+                else
+                    printf '%s PORT %s closed\n' "$ip" "$port"
+                fi
+            ) &
+            n=$((n+1))
+            if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
+        done
+    done < "$REACHABLE"
+    wait
+fi
+
+if [ -s "$REACHABLE" ]; then
+    while IFS= read -r ip; do
+        [ -z "$ip" ] && continue
+        (
+            HN=$(nslookup "$ip" 2>/dev/null | awk -F'= ' '/name = / {print $2; exit}' | sed 's/\.$//')
+            if [ -n "$HN" ]; then
+                printf '%s HOST %s\n' "$ip" "$HN"
+            fi
+        ) &
+        n=$((n+1))
+        if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
+    done < "$REACHABLE"
+    wait
+fi
+
+rm -f "$TMP" "$REACHABLE"
+"""
+
+
+# ── Scan execution ─────────────────────────────────────────────────────
+
+
+EventCallback = Callable[[dict], None]
+
+
+def _run_scan(target: SSHTarget, cred: SSHCredential, *,
+              ip_list: list[str], ports: list[int],
+              batch_size: int = 32,
+              ping_timeout_s: int = 1,
+              arping_timeout_s: int = 1,
+              port_timeout_s: int = 1,
+              dns_timeout_s: int = 2,
+              exec_timeout_s: int = 900,
+              on_event: Optional[EventCallback] = None,
+              ) -> tuple[dict[str, HostResult], dict, str]:
+    """Open SSH, run the scan script, parse stdout line-by-line.
+
+    Returns (results, summary_counters, error_text). On error `results`
+    may be partial. Caller wraps in EngineScanReport.
+    """
+    cmd_parts = ["sh", "-c", _SCAN_SCRIPT, "_",
+                 str(batch_size),
+                 str(ping_timeout_s), str(arping_timeout_s),
+                 str(port_timeout_s), str(dns_timeout_s),
+                 ",".join(str(p) for p in ports)]
+    cmd_parts.extend(ip_list)
+    cmd = " ".join(shlex.quote(p) for p in cmd_parts)
+
+    try:
+        client = ssh_connect(target, cred)
+    except Exception as exc:
+        return {}, {}, f"SSH connect failed: {exc}"
+
+    results: dict[str, HostResult] = {}
+    counters = {"icmp_replies": 0, "arp_replies": 0,
+                "ports_open": 0, "ports_closed": 0,
+                "hostnames_resolved": 0}
+    error_text = ""
+
+    try:
+        _, stdout, stderr = client.exec_command(cmd, timeout=exec_timeout_s)
+        for raw in iter(stdout.readline, ''):
+            parts = raw.strip().split()
+            if not parts:
+                continue
+            ip = parts[0]
+            tag = parts[1] if len(parts) > 1 else "SILENT"
+            r = results.get(ip) or HostResult(ip=ip)
+            ev: dict = {"ip": ip, "tag": tag}
+
+            if tag == "ICMP_OK":
+                if not r.icmp_reply:
+                    counters["icmp_replies"] += 1
+                r.icmp_reply = True
+                r.arp_reply = True
+                if len(parts) > 2 and not r.mac:
+                    r.mac = parts[2].lower()
+                ev["mac"] = r.mac
+            elif tag == "ICMP_FAIL":
+                pass  # progress only; Phase 2 will resolve
+            elif tag == "ARP_OK":
+                if not r.arp_reply:
+                    counters["arp_replies"] += 1
+                r.arp_reply = True
+                if len(parts) > 2:
+                    r.mac = parts[2].lower()
+                ev["mac"] = r.mac
+            elif tag == "PORT" and len(parts) >= 4:
+                port = int(parts[2])
+                state = parts[3].lower()
+                r.ports[port] = state
+                if state == "open":
+                    counters["ports_open"] += 1
+                else:
+                    counters["ports_closed"] += 1
+                ev["port"] = port
+                ev["port_state"] = state
+            elif tag == "HOST" and len(parts) >= 3:
+                r.hostname = parts[2]
+                counters["hostnames_resolved"] += 1
+                ev["hostname"] = r.hostname
+            # SILENT / NO_ROUTE: no fields to update
+
+            results[ip] = r
+            if on_event is not None:
+                try:
+                    on_event(ev)
+                except Exception:
+                    log.exception("on_event callback raised — ignored")
+
+        rc = stdout.channel.recv_exit_status()
+        err = stderr.read().decode(errors="replace")
+        if rc != 0 and not results:
+            error_text = (f"scan script exit={rc} "
+                          f"stderr={err.strip()[:300] or '(empty)'}")
+    except Exception as exc:
+        error_text = f"scan exec failed: {exc}"
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    return results, counters, error_text
+
+
+def scan(target: SSHTarget, cred: SSHCredential, *,
+         ip_list: list[str], ports: list[int],
+         source_node_index: int = 0,
+         source_node_hostname: str = "",
+         source_iface_id: str = "",
+         source_iface_name: str = "",
+         target_label: str = "",
+         batch_size: int = 32,
+         ping_timeout_s: int = 1,
+         arping_timeout_s: int = 1,
+         port_timeout_s: int = 1,
+         dns_timeout_s: int = 2,
+         exec_timeout_s: int = 900,
+         on_event: Optional[EventCallback] = None,
+         ) -> EngineScanReport:
+    """Synchronous engine-side scan. Returns an EngineScanReport.
+
+    The credential we hold is root on the Forcepoint engine, so
+    ping / arping / nc raw-socket ops work without privilege escalation.
+    """
+    started = datetime.now(timezone.utc)
+    report = EngineScanReport(
+        started_at=started,
+        source_node_index=source_node_index,
+        source_node_hostname=source_node_hostname,
+        source_iface_id=source_iface_id,
+        source_iface_name=source_iface_name,
+        target_label=target_label,
+        ports_scanned=list(ports),
+    )
+
+    if not ip_list:
+        report.error = "empty target list"
+        report.finished_at = datetime.now(timezone.utc)
+        return report
+    if len(ip_list) > MAX_HOSTS:
+        report.error = (f"target list too large ({len(ip_list)} > "
+                        f"{MAX_HOSTS} cap)")
+        report.finished_at = datetime.now(timezone.utc)
+        return report
+    if len(ports) > MAX_PORTS:
+        report.error = (f"port list too large ({len(ports)} > "
+                        f"{MAX_PORTS} cap)")
+        report.finished_at = datetime.now(timezone.utc)
+        return report
+
+    report.targets = len(ip_list)
+
+    log.info("engine_scan: targets=%d ports=%d via %s/node%s (%s)",
+             len(ip_list), len(ports), target.hostname,
+             source_node_index, source_iface_id)
+
+    results, counters, err = _run_scan(
+        target, cred, ip_list=ip_list, ports=ports,
+        batch_size=batch_size,
+        ping_timeout_s=ping_timeout_s,
+        arping_timeout_s=arping_timeout_s,
+        port_timeout_s=port_timeout_s,
+        dns_timeout_s=dns_timeout_s,
+        exec_timeout_s=exec_timeout_s,
+        on_event=on_event,
+    )
+    report.results = results
+    report.icmp_replies = counters.get("icmp_replies", 0)
+    report.arp_replies = counters.get("arp_replies", 0)
+    report.hosts_with_open_ports = sum(
+        1 for r in results.values() if r.open_ports)
+    report.error = err
+
+    report.finished_at = datetime.now(timezone.utc)
+    report.duration_ms = int(
+        (report.finished_at - report.started_at).total_seconds() * 1000)
+    log.info("engine_scan: done in %dms — icmp=%d arp=%d open_hosts=%d err=%r",
+             report.duration_ms, report.icmp_replies, report.arp_replies,
+             report.hosts_with_open_ports, err)
+    return report

@@ -24,7 +24,7 @@ from functools import wraps
 
 from flask import (
     Blueprint, render_template, redirect, url_for,
-    flash, session, request,
+    flash, session, request, jsonify,
 )
 
 from shared.db import db
@@ -389,10 +389,403 @@ def tools():
     return render_template("engines/tools.html")
 
 
-@engines_bp.route("/tools/scan")
-@admin_required
+@engines_bp.route("/tools/scan", methods=["GET"])
+@profile_required_admin
 def tools_scan():
-    return render_template("engines/scan_placeholder.html")
+    """Engines → Tools → Scan landing / watcher / results page.
+
+    With no `?scan_id`, renders the picker form (cascading
+    tenant/cluster/node/interface, target-mode radio, ports textarea
+    pre-filled from the curated default).
+
+    With `?scan_id=X`, queries the job runtime:
+      * state=running → render the watcher (progress bar + 10-line log,
+                        polled by JS via /tools/scan/status)
+      * state=done    → consume the report and render the result table
+                        + filter buttons + CSV-export link
+      * state=failed  → flash error and fall back to the picker
+    """
+    scan_id = (request.args.get("scan_id") or "").strip()
+
+    from webapp import engine_scan_jobs
+    from webapp.engine_scan import DEFAULT_PORTS
+    user_email = (session.get("user") or {}).get("email", "")
+
+    scan_running = None
+    scan_report = None
+
+    if scan_id:
+        status = engine_scan_jobs.get_status(scan_id, user_email=user_email)
+        if status is None:
+            flash("Scan job not found or expired — start a new one.", "info")
+        elif status["state"] == "running":
+            scan_running = status
+        elif status["state"] == "failed":
+            flash(f"Scan failed: {status.get('error') or 'unknown error'}",
+                  "danger")
+            engine_scan_jobs.discard(scan_id, user_email=user_email)
+        else:  # done
+            scan_report = engine_scan_jobs.consume_report(
+                scan_id, user_email=user_email)
+            if scan_report is None:
+                flash("Scan results expired before they could be loaded.",
+                      "warning")
+            else:
+                _log_activity_engines(
+                    "scan", "scan_complete", "ok",
+                    f"{scan_report.target_label}",
+                    f"icmp={scan_report.icmp_replies} "
+                    f"arp={scan_report.arp_replies} "
+                    f"open_hosts={scan_report.hosts_with_open_ports} "
+                    f"duration={scan_report.duration_ms}ms "
+                    f"node={scan_report.source_node_index}",
+                )
+
+    # Build the source picker payload — current cluster inventory so
+    # the cascading dropdowns can render without a second round-trip.
+    # Failures here are non-fatal: the page still loads, the operator
+    # picks differently, the form POST validates again server-side.
+    inventory = []
+    inventory_error = None
+    if not scan_running and not scan_report:
+        try:
+            cfg = _user_cfg()
+            with __import__("smc_client").smc_session(cfg):
+                clusters_summary = engine_inquiry.list_clusters(cfg)
+            inventory = [{"name": c.name, "node_count": c.node_count,
+                          "typeof": c.typeof} for c in clusters_summary]
+        except Exception as exc:
+            inventory_error = str(exc)
+            log.warning("tools_scan: cluster list failed: %s", exc)
+
+    return render_template(
+        "engines/tools_scan.html",
+        scan_running=scan_running,
+        scan_report=scan_report,
+        inventory=inventory,
+        inventory_error=inventory_error,
+        default_ports=",".join(str(p) for p in DEFAULT_PORTS),
+    )
+
+
+@engines_bp.route("/tools/scan", methods=["POST"])
+@profile_required_admin
+def tools_scan_start():
+    """Validate the picker form, build the IP list, kick off the
+    background job, and redirect to the watcher.
+
+    Form fields:
+      engine_name      cluster name (string)
+      node_index       1-based cluster nodeid (int)
+      iface_id         interface id ("1.10" for VLAN 10 on iface 1)
+      target_mode      'subnet' | 'single_ip' | 'custom_range'
+      single_ip        when target_mode=single_ip
+      custom_start     \\
+      custom_end        \\ when target_mode=custom_range
+      ports            comma/whitespace list (or "1-1024" range)
+      skip_port_scan   '1' = ICMP/ARP only (Phase 3 skipped)
+      accept_warning   '1' = operator confirmed >warn-threshold ops
+    """
+    from webapp.engine_scan import (
+        parse_port_list, DEFAULT_PORTS,
+        MAX_HOSTS, MAX_PORTS, WARN_OPS_THRESHOLD, HARD_OPS_CAP,
+    )
+    from webapp import engine_scan_jobs
+    from webapp.dhcp_subnet_scan import (
+        enumerate_subnet_targets, enumerate_range_targets,
+    )
+
+    engine_name = (request.form.get("engine_name") or "").strip()
+    node_index_raw = (request.form.get("node_index") or "").strip()
+    iface_id = (request.form.get("iface_id") or "").strip()
+    target_mode = (request.form.get("target_mode") or "subnet").strip().lower()
+    single_ip = (request.form.get("single_ip") or "").strip()
+    custom_start = (request.form.get("custom_start") or "").strip()
+    custom_end = (request.form.get("custom_end") or "").strip()
+    ports_raw = (request.form.get("ports") or "").strip()
+    skip_port_scan = request.form.get("skip_port_scan") == "1"
+    accept_warning = request.form.get("accept_warning") == "1"
+
+    if not engine_name or not node_index_raw or not iface_id:
+        flash("Pick a cluster, node, and interface first.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    try:
+        node_index = int(node_index_raw)
+    except ValueError:
+        flash("Invalid node index.", "danger")
+        return redirect(url_for("engines.tools_scan"))
+
+    domain = _current_domain()
+    if domain is None:
+        flash("No active Domain — pick one first.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    creds_by_node = _credentials_for_engine(domain.id, engine_name)
+    cred_row = creds_by_node.get(node_index)
+    if cred_row is None or (cred_row.last_verify_status or "").lower() != "ok":
+        flash(f"No verified credential for node {node_index} of "
+              f"{engine_name}. Visit the credentials page to fix.",
+              "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    # Resolve interface metadata (subnet + OS-level interface name) by
+    # asking the SMC inventory for the cluster's interface walk.
+    iface_subnet_cidr = ""
+    iface_label = iface_id
+    try:
+        cfg = _user_cfg()
+        with __import__("smc_client").smc_session(cfg):
+            detail = engine_inquiry.cluster_detail(cfg, engine_name)
+        for iface in detail.interfaces:
+            if iface.interface_id == iface_id:
+                iface_label = (
+                    f"{iface.interface_id}"
+                    + (f".{iface.vlan_id}" if iface.vlan_id else "")
+                )
+                # Pick this node's address (NDI) on this interface.
+                # Sub-interfaces all share the same network; the
+                # network_value field carries the CIDR.
+                for addr in iface.addresses:
+                    if addr.network_value:
+                        iface_subnet_cidr = addr.network_value
+                        break
+                break
+    except Exception as exc:
+        log.warning("tools_scan_start: interface walk failed: %s", exc)
+
+    # Build target IP list.
+    try:
+        if target_mode == "single_ip":
+            if not single_ip:
+                flash("Single-IP mode needs an IP.", "warning")
+                return redirect(url_for("engines.tools_scan"))
+            ip_list = [single_ip]
+            target_label = f"{engine_name}/{iface_label} → {single_ip}"
+        elif target_mode == "custom_range":
+            if not (custom_start and custom_end):
+                flash("Custom range needs both start and end IPs.", "warning")
+                return redirect(url_for("engines.tools_scan"))
+            ip_list = enumerate_range_targets(
+                custom_start, custom_end,
+                subnet_cidr=iface_subnet_cidr,
+            )
+            target_label = (
+                f"{engine_name}/{iface_label} → {custom_start}-{custom_end}"
+            )
+        else:  # subnet
+            if not iface_subnet_cidr:
+                flash("Could not resolve the interface's subnet — "
+                      "use Custom range instead.", "warning")
+                return redirect(url_for("engines.tools_scan"))
+            ip_list = enumerate_subnet_targets(iface_subnet_cidr)
+            target_label = f"{engine_name}/{iface_label} → {iface_subnet_cidr}"
+    except ValueError as exc:
+        flash(f"Invalid scan range: {exc}", "danger")
+        return redirect(url_for("engines.tools_scan"))
+
+    if not ip_list:
+        flash("Resolved range is empty — nothing to scan.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+    if len(ip_list) > MAX_HOSTS:
+        flash(f"Range too large ({len(ip_list)} > {MAX_HOSTS} cap).",
+              "danger")
+        return redirect(url_for("engines.tools_scan"))
+
+    # Parse ports.
+    if skip_port_scan:
+        ports: list[int] = []
+    else:
+        if not ports_raw:
+            ports = list(DEFAULT_PORTS)
+        else:
+            try:
+                ports = parse_port_list(ports_raw)
+            except ValueError as exc:
+                flash(f"Invalid port list: {exc}", "danger")
+                return redirect(url_for("engines.tools_scan"))
+        if len(ports) > MAX_PORTS:
+            flash(f"Port list too large ({len(ports)} > {MAX_PORTS} cap).",
+                  "danger")
+            return redirect(url_for("engines.tools_scan"))
+
+    total_ops = len(ip_list) + (len(ip_list) * len(ports) if ports else 0)
+    if total_ops > HARD_OPS_CAP:
+        flash(f"Scan would total {total_ops} operations (> {HARD_OPS_CAP} "
+              f"hard cap). Narrow the range or shrink the port list.",
+              "danger")
+        return redirect(url_for("engines.tools_scan"))
+    if total_ops > WARN_OPS_THRESHOLD and not accept_warning:
+        flash(f"Scan would total {total_ops} operations "
+              f"(> {WARN_OPS_THRESHOLD} threshold). Tick the confirm box "
+              f"and re-submit.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    # Spawn the background job.
+    user_email = (session.get("user") or {}).get("email", "")
+    target = _cred_to_target_engines(cred_row)
+    payload = _cred_to_payload_engines(cred_row)
+    scan_id = engine_scan_jobs.start_scan(
+        target=target, cred=payload,
+        ip_list=ip_list, ports=ports,
+        user_email=user_email,
+        source_node_index=node_index,
+        source_node_hostname=cred_row.hostname,
+        source_iface_id=iface_id,
+        source_iface_name=iface_label,
+        target_label=target_label,
+    )
+    _log_activity_engines(
+        "scan", "scan_started", "ok", target_label,
+        f"mode={target_mode} ip_list_size={len(ip_list)} "
+        f"ports={len(ports)} scan_id={scan_id[:8]}",
+    )
+    return redirect(url_for("engines.tools_scan", scan_id=scan_id))
+
+
+@engines_bp.route("/tools/scan/status")
+@profile_required_admin
+def tools_scan_status():
+    """JSON poll target for the watcher's polling loop. 404 on unknown."""
+    scan_id = (request.args.get("id") or "").strip()
+    if not scan_id:
+        return jsonify({"error": "missing id"}), 400
+    from webapp import engine_scan_jobs
+    user_email = (session.get("user") or {}).get("email", "")
+    status = engine_scan_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(status)
+
+
+@engines_bp.route("/api/clusters/<path:engine_name>/interfaces")
+@profile_required_admin
+def api_cluster_interfaces(engine_name):
+    """Cascading-picker JSON: nodes + interfaces for a cluster.
+
+    Returns:
+      {"nodes": [{"node_index": int, "hostname": str, "verified": bool}, ...],
+       "interfaces": [{"id": str, "vlan_id": str, "subnet_cidr": str}, ...]}
+
+    The OS-level interface name is auto-derived inside the engine-side
+    script via `ip route get`, so we don't need to plumb it through the
+    UI today; the picker just needs the SMC `interface_id` (stable
+    identifier).
+    """
+    domain = _current_domain()
+    if domain is None:
+        return jsonify({"error": "no active domain"}), 400
+
+    creds_by_node = _credentials_for_engine(domain.id, engine_name)
+
+    try:
+        cfg = _user_cfg()
+        with __import__("smc_client").smc_session(cfg):
+            detail = engine_inquiry.cluster_detail(cfg, engine_name)
+    except Exception as exc:
+        log.warning("api_cluster_interfaces(%s): %s", engine_name, exc)
+        return jsonify({"error": str(exc)}), 502
+
+    nodes = []
+    for n in detail.nodes:
+        cred = creds_by_node.get(n.nodeid)
+        verified = bool(cred and (cred.last_verify_status or "").lower() == "ok")
+        nodes.append({
+            "node_index": n.nodeid, "hostname": cred.hostname if cred else "",
+            "verified": verified, "version": n.engine_version,
+            "status_state": n.status_state,
+        })
+
+    seen_iface_ids = set()
+    interfaces = []
+    for iface in detail.interfaces:
+        if iface.interface_id in seen_iface_ids:
+            continue
+        seen_iface_ids.add(iface.interface_id)
+        subnet_cidr = ""
+        for addr in iface.addresses:
+            if addr.network_value:
+                subnet_cidr = addr.network_value
+                break
+        label = iface.interface_id
+        if iface.vlan_id:
+            label = f"{iface.interface_id}.{iface.vlan_id}"
+        interfaces.append({
+            "id": iface.interface_id,
+            "vlan_id": iface.vlan_id or "",
+            "label": label,
+            "zone": iface.zone or "",
+            "subnet_cidr": subnet_cidr,
+        })
+
+    return jsonify({"nodes": nodes, "interfaces": interfaces})
+
+
+@engines_bp.route("/tools/scan/<scan_id>/csv")
+@profile_required_admin
+def tools_scan_csv(scan_id):
+    """Export the consumed scan report as CSV. Operator-only stash —
+    the report is removed from memory after export, mirroring
+    consume_report semantics.
+    """
+    import csv
+    from io import StringIO
+    from flask import Response
+    from webapp import engine_scan_jobs
+
+    user_email = (session.get("user") or {}).get("email", "")
+    report = engine_scan_jobs.consume_report(scan_id, user_email=user_email)
+    if report is None:
+        flash("Scan results expired or already consumed.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    buf = StringIO()
+    w = csv.writer(buf)
+    w.writerow([
+        "ip", "icmp_reply", "arp_reply", "mac", "hostname",
+        "open_ports", "closed_ports",
+    ])
+    rows = sorted(report.results.values(),
+                  key=lambda r: tuple(int(p) for p in r.ip.split(".")
+                                      if p.isdigit()))
+    for r in rows:
+        opens = ",".join(str(p) for p in r.open_ports)
+        closes = ",".join(str(p) for p, s in sorted(r.ports.items())
+                          if s == "closed")
+        w.writerow([r.ip, int(r.icmp_reply), int(r.arp_reply),
+                    r.mac, r.hostname, opens, closes])
+    return Response(
+        buf.getvalue(),
+        mimetype="text/csv",
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="engine-scan-{scan_id[:8]}.csv"',
+        },
+    )
+
+
+def _cred_to_target_engines(cred):
+    """Build SSHTarget from a DhcpEngineCredential row. Mirrors
+    `dhcp_manager._cred_to_target` to avoid the cross-blueprint import.
+    """
+    from webapp.dhcp_ssh import SSHTarget
+    return SSHTarget(
+        hostname=cred.hostname, port=cred.ssh_port,
+        username=cred.ssh_username,
+    )
+
+
+def _cred_to_payload_engines(cred):
+    """Build SSHCredential from a DhcpEngineCredential row.
+
+    `encrypted_password` is an `EncryptedString` column — reading it
+    returns plaintext (the type decorator handles Fernet round-trip).
+    """
+    from webapp.dhcp_ssh import SSHCredential
+    return SSHCredential(
+        password=cred.encrypted_password,
+        host_fingerprint=cred.host_fingerprint or "",
+    )
 
 
 @engines_bp.route("/nodes/<int:cred_id>/terminal")

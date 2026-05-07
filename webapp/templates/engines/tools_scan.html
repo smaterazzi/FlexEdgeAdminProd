@@ -1,0 +1,651 @@
+{% extends "base.html" %}
+{% block title %}Engines — Network Scan{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.index') }}">Engines</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.tools') }}">Tools</a></li>
+    <li class="breadcrumb-item active">Scan</li>
+  </ol>
+</nav>
+
+<h2 class="mb-3"><i class="bi bi-radar"></i> Network scan</h2>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, msg in messages %}
+<div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+{% endfor %}
+{% endwith %}
+
+{% if scan_running %}
+{# ── Watcher mode — scan is in progress ─────────────────────────────── #}
+<div id="scan-watcher" class="card mb-3"
+     data-scan-id="{{ scan_running.scan_id }}"
+     data-status-url="{{ url_for('engines.tools_scan_status') }}"
+     data-leases-url="{{ url_for('engines.tools_scan') }}">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+    <span>
+      <i class="bi bi-radar"></i>
+      Scanning <code>{{ scan_running.target_label or scan_running.subnet_cidr }}</code>
+      <span class="ms-2 small text-muted">
+        from node {{ scan_running.source_node_index }}
+        (<code>{{ scan_running.source_node_hostname }}</code>),
+        iface <code>{{ scan_running.source_iface_name or scan_running.source_iface_id }}</code>
+      </span>
+    </span>
+    <span class="small text-muted" id="scan-counters">
+      ICMP <span class="badge bg-success" id="scan-icmp">{{ scan_running.counters.icmp_replies or 0 }}</span>
+      · ARP <span class="badge bg-warning text-dark" id="scan-arp">{{ scan_running.counters.arp_replies or 0 }}</span>
+      · open ports <span class="badge bg-info text-dark" id="scan-open">{{ scan_running.counters.ports_open or 0 }}</span>
+      · <span id="scan-progress-text">{{ scan_running.progress }} / {{ scan_running.total }}</span>
+    </span>
+  </div>
+  <div class="card-body py-2">
+    <div class="progress" style="height: 14px;">
+      <div id="scan-progress-bar"
+           class="progress-bar progress-bar-striped progress-bar-animated bg-info"
+           role="progressbar"
+           style="width: {{ ((scan_running.progress / scan_running.total) * 100)|round(1) if scan_running.total else 0 }}%"
+           aria-valuenow="{{ scan_running.progress }}"
+           aria-valuemin="0" aria-valuemax="{{ scan_running.total }}"></div>
+    </div>
+    <pre id="scan-log" class="mt-2 mb-0 small bg-dark text-light p-2 rounded"
+         style="height: 12em; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;"
+>{% for line in scan_running.log_tail %}{{ line }}
+{% endfor %}</pre>
+  </div>
+</div>
+
+{% elif scan_report %}
+{# ── Results mode — scan completed, render the table ──────────────────── #}
+{% set silent = scan_report.targets - scan_report.icmp_replies - scan_report.arp_replies %}
+<div class="alert alert-info py-2 px-3 mb-3 small d-flex flex-wrap align-items-center justify-content-between gap-2">
+  <div>
+    <i class="bi bi-check2-circle"></i>
+    <strong>Scan complete</strong> on <code>{{ scan_report.target_label }}</code>
+    <span class="badge bg-success">{{ scan_report.icmp_replies }} ICMP</span>
+    <span class="badge bg-warning text-dark">{{ scan_report.arp_replies }} ARP only</span>
+    <span class="badge bg-info text-dark">{{ scan_report.hosts_with_open_ports }} hosts w/ open ports</span>
+    {% if silent > 0 %}<span class="badge bg-secondary">{{ silent }} silent</span>{% endif %}
+    <span class="text-muted ms-2">
+      {{ scan_report.targets }} targets · {{ scan_report.duration_ms }} ms ·
+      {{ scan_report.ports_scanned|length }} port(s) ·
+      via node {{ scan_report.source_node_index }}
+      (<code>{{ scan_report.source_node_hostname }}</code>),
+      iface <code>{{ scan_report.source_iface_name }}</code>
+    </span>
+  </div>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('engines.tools_scan_csv', scan_id=request.args.get('scan_id')) }}"
+       class="btn btn-sm btn-outline-secondary"
+       title="Download CSV (consumes the report)">
+      <i class="bi bi-filetype-csv"></i> Export CSV
+    </a>
+    <a href="{{ url_for('engines.tools_scan') }}"
+       class="btn btn-sm btn-primary">
+      <i class="bi bi-plus-circle"></i> New scan
+    </a>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <span>{{ scan_report.results|length }} hosts seen</span>
+    <div class="d-flex flex-wrap gap-1 align-items-center">
+      <button type="button" class="btn btn-sm btn-outline-secondary" data-filter="all">
+        All <span class="rcounter badge bg-secondary ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-success" data-filter="reachable">
+        Reachable <span class="rcounter badge bg-success ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-info" data-filter="open-ports">
+        Has open ports <span class="rcounter badge bg-info text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-success" data-filter="icmp-only">
+        ICMP only <span class="rcounter badge bg-success ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-warning" data-filter="arp-only">
+        ARP only <span class="rcounter badge bg-warning text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-dark" data-filter="silent">
+        Silent <span class="rcounter badge bg-dark ms-1">0</span>
+      </button>
+    </div>
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0" id="scan-results-table">
+      <thead>
+        <tr>
+          <th class="sortable" data-sort-key="ip"   data-sort-type="ip">IP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="icmp" data-sort-type="text">ICMP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="mac"  data-sort-type="text">ARP / MAC <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="host" data-sort-type="text">Hostname <span class="sort-indicator"></span></th>
+          <th>Open ports</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% set sorted_ips = scan_report.results.keys() | sort %}
+        {% for ip in sorted_ips %}
+        {% set r = scan_report.results[ip] %}
+        {% set has_open = r.open_ports|length > 0 %}
+        {% set reachable = r.icmp_reply or r.arp_reply %}
+        <tr class="result-row"
+            data-ip="{{ r.ip }}"
+            data-icmp="{{ '1' if r.icmp_reply else '0' }}"
+            data-arp="{{ '1' if r.arp_reply else '0' }}"
+            data-reachable="{{ '1' if reachable else '0' }}"
+            data-openports="{{ '1' if has_open else '0' }}"
+            data-mac="{{ r.mac or '' }}"
+            data-host="{{ (r.hostname or '')|lower }}">
+          <td><code>{{ r.ip }}</code></td>
+          <td>
+            {% if r.icmp_reply %}
+              <span class="badge bg-success" title="Replied to ping"><i class="bi bi-broadcast"></i> yes</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if r.mac %}<code class="small">{{ r.mac }}</code>{% else %}<span class="text-muted">—</span>{% endif %}
+            {% if r.arp_reply and not r.icmp_reply %}
+              <span class="badge bg-warning text-dark ms-1" title="L2 visible only — ICMP filtered">firewalled</span>
+            {% endif %}
+          </td>
+          <td class="small">{{ r.hostname or '—' }}</td>
+          <td class="small">
+            {% for p in r.open_ports %}
+              <span class="badge bg-success me-1">{{ p }}</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endfor %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+{% else %}
+{# ── Picker mode — start a new scan ─────────────────────────────────── #}
+{% if inventory_error %}
+<div class="alert alert-danger small">
+  <i class="bi bi-exclamation-triangle"></i> Could not load cluster
+  inventory: <code>{{ inventory_error }}</code>. Pick from the dropdown
+  manually, or check the active SMC profile.
+</div>
+{% endif %}
+
+<form method="POST" action="{{ url_for('engines.tools_scan') }}" class="card mb-3">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="card-body">
+    <p class="small text-muted mb-3">
+      Active-discovery scan from a firewall node against an attached
+      subnet (or any IP reachable from that interface). Uses
+      <code>ping</code> + <code>arping</code> + <code>nc -z</code>.
+    </p>
+
+    <div class="row g-3">
+      <div class="col-md-4">
+        <label class="form-label small mb-1">Cluster</label>
+        <select name="engine_name" id="pick-cluster" class="form-select form-select-sm" required>
+          <option value="">— pick a cluster —</option>
+          {% for c in inventory %}
+          <option value="{{ c.name }}">{{ c.name }} ({{ c.node_count }} node{{ '' if c.node_count == 1 else 's' }})</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-4">
+        <label class="form-label small mb-1">Source node</label>
+        <select name="node_index" id="pick-node" class="form-select form-select-sm" required disabled>
+          <option value="">— pick a cluster first —</option>
+        </select>
+        <div class="form-text small">Verified credential required. Greyed nodes can't run a scan.</div>
+      </div>
+      <div class="col-md-4">
+        <label class="form-label small mb-1">Source interface</label>
+        <select name="iface_id" id="pick-iface" class="form-select form-select-sm" required disabled>
+          <option value="">— pick a cluster first —</option>
+        </select>
+        <div class="form-text small" id="iface-hint">arping uses this leg.</div>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="row g-3">
+      <div class="col-md-12">
+        <label class="form-label small mb-1">Target</label>
+        <div class="form-check mb-2">
+          <input type="radio" name="target_mode" value="subnet" id="tmSubnet"
+                 class="form-check-input" checked>
+          <label class="form-check-label" for="tmSubnet">
+            <strong>Whole subnet attached to the interface</strong>
+            <span id="tm-subnet-hint" class="text-muted small ms-1"></span>
+          </label>
+        </div>
+        <div class="form-check mb-2">
+          <input type="radio" name="target_mode" value="single_ip" id="tmSingle"
+                 class="form-check-input">
+          <label class="form-check-label" for="tmSingle">
+            <strong>Single IP</strong>
+          </label>
+          <input type="text" name="single_ip" class="form-control form-control-sm mt-1 ms-3"
+                 placeholder="e.g. 10.0.0.5" style="max-width: 240px;">
+        </div>
+        <div class="form-check mb-2">
+          <input type="radio" name="target_mode" value="custom_range" id="tmRange"
+                 class="form-check-input">
+          <label class="form-check-label" for="tmRange">
+            <strong>Custom range</strong>
+          </label>
+          <div class="row g-2 mt-1 ms-3" style="max-width: 480px;">
+            <div class="col"><input type="text" name="custom_start" class="form-control form-control-sm" placeholder="start"></div>
+            <div class="col"><input type="text" name="custom_end"   class="form-control form-control-sm" placeholder="end"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="row g-3">
+      <div class="col-md-12">
+        <label class="form-label small mb-1">TCP ports</label>
+        <input type="text" name="ports" class="form-control form-control-sm font-monospace"
+               value="{{ default_ports }}" id="ports-input">
+        <div class="form-text small">
+          Comma- or space-separated. Ranges allowed (<code>1-1024</code>).
+          Default = curated common-services set (25 ports).
+          <a href="#" id="reset-ports" class="ms-1">Reset to default</a> ·
+          <a href="#" id="clear-ports" class="ms-1">Clear (skip port scan)</a>
+        </div>
+        <div class="form-check mt-2">
+          <input class="form-check-input" type="checkbox" name="skip_port_scan"
+                 value="1" id="skipPortScan">
+          <label class="form-check-label small text-muted" for="skipPortScan">
+            Skip port scan (ICMP / ARP only — much faster)
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <hr>
+
+    <div class="form-check" id="warning-block" style="display:none;">
+      <input class="form-check-input" type="checkbox" name="accept_warning"
+             value="1" id="acceptWarning">
+      <label class="form-check-label small text-warning" for="acceptWarning">
+        <i class="bi bi-exclamation-triangle"></i>
+        I understand this scan will probe more than 8000 operations
+        and may take several minutes.
+      </label>
+    </div>
+
+    <button type="submit" class="btn btn-primary mt-2" id="start-scan-btn">
+      <i class="bi bi-radar"></i> Start scan
+    </button>
+  </div>
+</form>
+{% endif %}
+
+</div>
+
+<style>
+#scan-results-table th.sortable {
+  cursor: pointer;
+  user-select: none;
+  position: relative;
+}
+#scan-results-table th.sortable:hover {
+  background-color: rgba(13, 110, 253, 0.08);
+}
+#scan-results-table th .sort-indicator {
+  display: inline-block; width: 0.9em;
+  color: #6c757d; font-size: 0.75em; margin-left: 0.25em;
+}
+#scan-results-table th.sort-asc  .sort-indicator::before { content: "▲"; color: #0d6efd; }
+#scan-results-table th.sort-desc .sort-indicator::before { content: "▼"; color: #0d6efd; }
+[data-filter].active {
+  outline: 2px solid currentColor;
+  outline-offset: -2px;
+}
+</style>
+
+{% endblock %}
+
+{% block extra_js %}
+<script>
+// ─────────────────────────────────────────────────────────────────────
+//  Picker — cascading clusters → nodes → interfaces
+// ─────────────────────────────────────────────────────────────────────
+(function pickerWiring() {
+  const cluster = document.getElementById("pick-cluster");
+  if (!cluster) return;
+  const nodeSel  = document.getElementById("pick-node");
+  const ifaceSel = document.getElementById("pick-iface");
+  const subnetHint = document.getElementById("tm-subnet-hint");
+  const ifaceHint  = document.getElementById("iface-hint");
+
+  function setOptions(sel, items, placeholder) {
+    sel.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = ""; ph.textContent = placeholder;
+    sel.appendChild(ph);
+    for (const it of items) sel.appendChild(it);
+    sel.disabled = items.length === 0;
+  }
+
+  cluster.addEventListener("change", async () => {
+    const name = cluster.value;
+    setOptions(nodeSel,  [], "loading…");
+    setOptions(ifaceSel, [], "loading…");
+    if (!name) {
+      setOptions(nodeSel,  [], "— pick a cluster first —");
+      setOptions(ifaceSel, [], "— pick a cluster first —");
+      return;
+    }
+    try {
+      const res = await fetch(`/engines/api/clusters/${encodeURIComponent(name)}/interfaces`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const nodeOpts = (data.nodes || []).map(n => {
+        const o = document.createElement("option");
+        o.value = String(n.node_index);
+        o.textContent = `Node ${n.node_index}`
+                      + (n.hostname ? ` · ${n.hostname}` : "")
+                      + (n.verified ? " ✓" : "  (no verified credential)");
+        if (!n.verified) o.disabled = true;
+        return o;
+      });
+      setOptions(nodeSel, nodeOpts, "— pick a node —");
+      const ifaceOpts = (data.interfaces || []).map(i => {
+        const o = document.createElement("option");
+        o.value = i.id;
+        o.dataset.subnet = i.subnet_cidr || "";
+        o.dataset.label  = i.label || i.id;
+        o.textContent = `${i.label}`
+                      + (i.zone ? ` [${i.zone}]` : "")
+                      + (i.subnet_cidr ? ` — ${i.subnet_cidr}` : "  (no IPv4 attached)");
+        return o;
+      });
+      setOptions(ifaceSel, ifaceOpts, "— pick an interface —");
+    } catch (err) {
+      console.error("interfaces fetch failed", err);
+      setOptions(nodeSel,  [], "fetch failed");
+      setOptions(ifaceSel, [], "fetch failed");
+    }
+  });
+
+  ifaceSel.addEventListener("change", () => {
+    const opt = ifaceSel.selectedOptions[0];
+    const subnet = opt ? opt.dataset.subnet : "";
+    if (subnetHint) {
+      subnetHint.textContent = subnet ? `(${subnet})` : "";
+    }
+    if (ifaceHint) {
+      ifaceHint.textContent = subnet
+        ? `arping uses this leg. Subnet: ${subnet}`
+        : "arping uses this leg. (No IPv4 attached — pick Custom range or Single IP.)";
+    }
+  });
+})();
+
+// ─────────────────────────────────────────────────────────────────────
+//  Picker — port-list helpers + warning gate
+// ─────────────────────────────────────────────────────────────────────
+(function portsAndWarning() {
+  const portsInput = document.getElementById("ports-input");
+  const skipBox    = document.getElementById("skipPortScan");
+  const warnBlock  = document.getElementById("warning-block");
+  const startBtn   = document.getElementById("start-scan-btn");
+  if (!portsInput) return;
+
+  const DEFAULT_PORTS_RAW = portsInput.value;
+  const resetLink = document.getElementById("reset-ports");
+  const clearLink = document.getElementById("clear-ports");
+  if (resetLink) resetLink.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    portsInput.value = DEFAULT_PORTS_RAW;
+    skipBox.checked = false;
+    portsInput.disabled = false;
+    updateWarn();
+  });
+  if (clearLink) clearLink.addEventListener("click", (ev) => {
+    ev.preventDefault();
+    portsInput.value = "";
+    skipBox.checked = true;
+    portsInput.disabled = true;
+    updateWarn();
+  });
+  skipBox.addEventListener("change", () => {
+    portsInput.disabled = skipBox.checked;
+    if (skipBox.checked) portsInput.value = "";
+    updateWarn();
+  });
+
+  function approxPortCount() {
+    if (skipBox.checked) return 0;
+    const raw = portsInput.value.trim();
+    if (!raw) return 0;
+    let count = 0;
+    for (const tok of raw.split(/[,\s]+/)) {
+      if (!tok) continue;
+      const m = tok.match(/^(\d+)(?:-(\d+))?$/);
+      if (!m) continue;
+      const a = parseInt(m[1], 10);
+      const b = m[2] ? parseInt(m[2], 10) : a;
+      if (b >= a) count += (b - a + 1);
+    }
+    return count;
+  }
+
+  // Approximate the IP count from the selected target mode. When the
+  // operator hasn't picked an interface yet we conservatively assume 0.
+  function approxIpCount() {
+    const mode = (document.querySelector('input[name="target_mode"]:checked') || {}).value;
+    if (mode === "single_ip") return 1;
+    if (mode === "subnet") {
+      const opt = document.getElementById("pick-iface")?.selectedOptions?.[0];
+      const subnet = opt ? opt.dataset.subnet : "";
+      const m = subnet && subnet.match(/\/(\d+)$/);
+      if (!m) return 0;
+      const prefix = parseInt(m[1], 10);
+      return Math.max(0, Math.pow(2, 32 - prefix) - 2);
+    }
+    if (mode === "custom_range") {
+      const start = document.querySelector('input[name="custom_start"]')?.value;
+      const end   = document.querySelector('input[name="custom_end"]')?.value;
+      const v = (s) => {
+        const p = (s || "").split(".").map(x => parseInt(x, 10));
+        if (p.length !== 4 || p.some(isNaN)) return null;
+        return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+      };
+      const a = v(start), b = v(end);
+      if (a === null || b === null || b < a) return 0;
+      return b - a + 1;
+    }
+    return 0;
+  }
+
+  function updateWarn() {
+    const ops = approxIpCount() + approxIpCount() * approxPortCount();
+    if (warnBlock) warnBlock.style.display = ops > 8000 ? "" : "none";
+  }
+
+  document.querySelectorAll('input[name="target_mode"], #pick-iface, input[name="custom_start"], input[name="custom_end"], #ports-input')
+    .forEach(el => {
+      el.addEventListener("change", updateWarn);
+      el.addEventListener("input", updateWarn);
+    });
+  updateWarn();
+
+  if (startBtn) {
+    startBtn.closest("form").addEventListener("submit", () => {
+      startBtn.disabled = true;
+      startBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Starting…';
+    });
+  }
+})();
+
+// ─────────────────────────────────────────────────────────────────────
+//  Watcher — poll /tools/scan/status, update bar + log + counters
+// ─────────────────────────────────────────────────────────────────────
+(function pollScanWatcher() {
+  const w = document.getElementById("scan-watcher");
+  if (!w) return;
+  const scanId    = w.dataset.scanId;
+  const statusUrl = w.dataset.statusUrl;
+  const leasesUrl = w.dataset.leasesUrl;
+  const bar  = document.getElementById("scan-progress-bar");
+  const text = document.getElementById("scan-progress-text");
+  const icmp = document.getElementById("scan-icmp");
+  const arp  = document.getElementById("scan-arp");
+  const open = document.getElementById("scan-open");
+  const log  = document.getElementById("scan-log");
+
+  let stopped = false;
+  let lastLogLen = log ? log.textContent.split("\n").filter(l => l.length).length : 0;
+
+  async function tick() {
+    if (stopped) return;
+    try {
+      const res = await fetch(statusUrl + "?id=" + encodeURIComponent(scanId), {
+        headers: {"Accept": "application/json"},
+      });
+      if (res.status === 404) {
+        stopped = true;
+        window.location = leasesUrl;
+        return;
+      }
+      const s = await res.json();
+      const total = s.total || 1;
+      const pct = Math.min(100, Math.round((s.progress / total) * 1000) / 10);
+      if (bar) {
+        bar.style.width = pct + "%";
+        bar.setAttribute("aria-valuenow", String(s.progress));
+      }
+      if (text) text.textContent = s.progress + " / " + s.total;
+      if (icmp) icmp.textContent = s.counters?.icmp_replies || 0;
+      if (arp)  arp.textContent  = s.counters?.arp_replies  || 0;
+      if (open) open.textContent = s.counters?.ports_open   || 0;
+      if (log) {
+        const lines = s.log_tail || [];
+        if (lines.length !== lastLogLen) {
+          log.textContent = lines.join("\n") + (lines.length ? "\n" : "");
+          log.scrollTop = log.scrollHeight;
+          lastLogLen = lines.length;
+        }
+      }
+      if (s.state === "done" || s.state === "failed") {
+        stopped = true;
+        window.location = leasesUrl + "?scan_id=" + encodeURIComponent(scanId);
+        return;
+      }
+    } catch (err) {
+      console.warn("scan poll error", err);
+    }
+    setTimeout(tick, 800);
+  }
+  tick();
+})();
+
+// ─────────────────────────────────────────────────────────────────────
+//  Results — filter buttons + counters + click-to-sort
+// ─────────────────────────────────────────────────────────────────────
+(function resultsTable() {
+  const table = document.getElementById("scan-results-table");
+  if (!table) return;
+  const tbody = table.querySelector("tbody");
+
+  function matches(row, mode) {
+    switch (mode) {
+      case "all": return true;
+      case "reachable": return row.dataset.reachable === "1";
+      case "open-ports": return row.dataset.openports === "1";
+      case "icmp-only": return row.dataset.icmp === "1";
+      case "arp-only":  return row.dataset.arp === "1" && row.dataset.icmp === "0";
+      case "silent":    return row.dataset.reachable === "0";
+      default: return true;
+    }
+  }
+
+  function applyFilter(mode) {
+    document.querySelectorAll("[data-filter]").forEach(b =>
+      b.classList.toggle("active", b.dataset.filter === mode));
+    tbody.querySelectorAll("tr.result-row").forEach(r => {
+      r.style.display = matches(r, mode) ? "" : "none";
+    });
+  }
+
+  function recomputeCounts() {
+    const rows = Array.from(tbody.querySelectorAll("tr.result-row"));
+    document.querySelectorAll("[data-filter]").forEach(btn => {
+      const mode = btn.dataset.filter;
+      const n = rows.filter(r => matches(r, mode)).length;
+      const span = btn.querySelector(".rcounter");
+      if (span) span.textContent = n;
+    });
+  }
+
+  document.querySelectorAll("[data-filter]").forEach(btn => {
+    btn.addEventListener("click", () => applyFilter(btn.dataset.filter));
+  });
+  recomputeCounts();
+
+  // Click-to-sort
+  const headers = table.querySelectorAll("th.sortable");
+  let activeKey = "ip";
+  let activeDir = "asc";
+  function ipKey(s) {
+    if (!s) return [0, 0, 0, 0];
+    const p = s.split(".");
+    if (p.length !== 4) return [0, 0, 0, 0];
+    return p.map(x => parseInt(x, 10) || 0);
+  }
+  function cmp(a, b) {
+    if (Array.isArray(a) && Array.isArray(b)) {
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const da = a[i] ?? 0, db = b[i] ?? 0;
+        if (da !== db) return da - db;
+      }
+      return 0;
+    }
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  }
+  function rowKey(row, key, type) {
+    let v;
+    if (key === "icmp") v = row.dataset.icmp;
+    else if (key === "mac") v = row.dataset.mac;
+    else if (key === "host") v = row.dataset.host;
+    else v = row.dataset[key] || "";
+    return type === "ip" ? ipKey(v) : v;
+  }
+  function sort(key, type, dir) {
+    const rows = Array.from(tbody.querySelectorAll("tr.result-row"));
+    rows.sort((a, b) => {
+      const r = cmp(rowKey(a, key, type), rowKey(b, key, type));
+      return dir === "desc" ? -r : r;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+  }
+  headers.forEach(th => {
+    th.addEventListener("click", () => {
+      const key  = th.dataset.sortKey;
+      const type = th.dataset.sortType || "text";
+      if (activeKey === key) activeDir = (activeDir === "asc") ? "desc" : "asc";
+      else { activeKey = key; activeDir = "asc"; }
+      headers.forEach(h => h.classList.remove("sort-asc", "sort-desc"));
+      th.classList.add(activeDir === "asc" ? "sort-asc" : "sort-desc");
+      sort(key, type, activeDir);
+    });
+  });
+  const ipHeader = table.querySelector('th[data-sort-key="ip"]');
+  if (ipHeader) ipHeader.classList.add("sort-asc");
+})();
+</script>
+{% endblock %}
