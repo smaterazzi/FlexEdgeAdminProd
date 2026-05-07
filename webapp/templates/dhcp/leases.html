@@ -166,11 +166,56 @@
   <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span>{{ leases|length }} unique (MAC, IP) entries across all nodes</span>
     <div class="d-flex flex-wrap gap-1 align-items-center">
-      <button type="button" class="btn btn-sm btn-outline-secondary" onclick="filterLeases('all')">All</button>
-      <button type="button" class="btn btn-sm btn-outline-success" onclick="filterLeases('active')">Active</button>
-      <button type="button" class="btn btn-sm btn-outline-warning" onclick="filterLeases('expired')">Expired/free</button>
-      <button type="button" class="btn btn-sm btn-outline-info" onclick="filterLeases('reserved')">Reserved</button>
-      <button type="button" class="btn btn-sm btn-outline-danger" onclick="filterLeases('mismatch')">IP mismatch</button>
+      {# Lease-state filters (always visible). Each button has a
+         data-filter attribute so JS can bind click + paint counters.
+         The .lease-counter span gets filled in by recomputeFilterCounts()
+         on DOMContentLoaded; default text "0" until then. #}
+      <button type="button" class="btn btn-sm btn-outline-secondary" data-filter="all">
+        All <span class="lease-counter badge bg-secondary ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-success" data-filter="active">
+        Active <span class="lease-counter badge bg-success ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-warning" data-filter="expired">
+        Expired/free <span class="lease-counter badge bg-warning text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-info" data-filter="reserved">
+        Reserved <span class="lease-counter badge bg-info text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-danger" data-filter="mismatch">
+        IP mismatch <span class="lease-counter badge bg-danger ms-1">0</span>
+      </button>
+
+      {% if scan_report %}
+      <span class="vr mx-1"></span>
+      {# Discovery-state filters — only when a scan has been consumed.
+         These match against `data-discovery` set on each row from the
+         scan classifier (active / leased-silent / firewalled /
+         active-untracked / firewalled-untracked). Pure-`free` rows
+         don't appear in the upper table so no button for that state. #}
+      <button type="button" class="btn btn-sm btn-outline-success" data-filter="d-active"
+              title="Discovery: lease + ICMP/ARP reply">
+        <i class="bi bi-broadcast"></i> active <span class="lease-counter badge bg-success ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-dark" data-filter="d-leased-silent"
+              title="Discovery: lease but no reply (powered off?)">
+        <i class="bi bi-volume-mute"></i> silent <span class="lease-counter badge bg-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-warning" data-filter="d-firewalled"
+              title="Discovery: L2-visible (ARP) but drops ICMP">
+        <i class="bi bi-shield-lock"></i> firewalled <span class="lease-counter badge bg-warning text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm btn-outline-info" data-filter="d-active-untracked"
+              title="Discovery: replies to ICMP but has no DHCP lease (static IP)">
+        <i class="bi bi-question-square"></i> untracked <span class="lease-counter badge bg-info text-dark ms-1">0</span>
+      </button>
+      <button type="button" class="btn btn-sm" data-filter="d-firewalled-untracked"
+              style="border:1px solid #6f42c1; color:#6f42c1;"
+              title="Discovery: L2-visible, drops ICMP, no DHCP lease">
+        untracked + firewalled <span class="lease-counter badge ms-1" style="background:#6f42c1;color:#fff;">0</span>
+      </button>
+      {% endif %}
+
       <span class="vr mx-1"></span>
       <button type="button" class="btn btn-sm btn-outline-light" onclick="selectAllLeases(true)">
         <i class="bi bi-check-all"></i> Select visible
@@ -468,13 +513,30 @@
   #leases-table th.sort-desc .sort-indicator::before { content: "▼"; color: #0d6efd; }
 </style>
 <script>
+// Predicate per filter mode — single source of truth for both
+// `filterLeases()` (showing/hiding rows) and `recomputeFilterCounts()`
+// (painting the badge counts).  Modes prefixed `d-` filter on the
+// discovery state set by the scan classifier; the rest filter on lease
+// data attributes.
+function _matchesFilter(row, mode) {
+  switch (mode) {
+    case "all":      return true;
+    case "active":   return row.dataset.state === "active";
+    case "expired":  return row.dataset.state === "free" || row.dataset.state === "expired";
+    case "reserved": return row.dataset.reserved === "1";
+    case "mismatch": return row.dataset.mismatch === "1";
+    case "d-active":               return row.dataset.discovery === "active";
+    case "d-leased-silent":        return row.dataset.discovery === "leased-silent";
+    case "d-firewalled":           return row.dataset.discovery === "firewalled";
+    case "d-active-untracked":     return row.dataset.discovery === "active-untracked";
+    case "d-firewalled-untracked": return row.dataset.discovery === "firewalled-untracked";
+    default: return true;
+  }
+}
+
 function filterLeases(mode) {
   document.querySelectorAll(".lease-row").forEach(row => {
-    let show = true;
-    if (mode === "active")   show = row.dataset.state === "active";
-    if (mode === "expired")  show = (row.dataset.state === "free" || row.dataset.state === "expired");
-    if (mode === "reserved") show = row.dataset.reserved === "1";
-    if (mode === "mismatch") show = row.dataset.mismatch === "1";
+    const show = _matchesFilter(row, mode);
     row.style.display = show ? "" : "none";
     // Hidden rows must not contribute to the submit set, even if checked —
     // disabling the checkbox keeps the user's selection intact when they
@@ -482,7 +544,27 @@ function filterLeases(mode) {
     const cb = row.querySelector(".lease-cb");
     if (cb) cb.disabled = !show;
   });
+  // Visually mark the active filter button.
+  document.querySelectorAll("[data-filter]").forEach(b => {
+    b.classList.toggle("active", b.dataset.filter === mode);
+  });
   updateReserveCount();
+}
+
+// Walk every row once, count how many match each filter mode, and
+// paint the .lease-counter badge inside each filter button. Called on
+// DOMContentLoaded so the badges are accurate before any user click.
+function recomputeFilterCounts() {
+  const buttons = document.querySelectorAll("[data-filter]");
+  if (!buttons.length) return;
+  const rows = document.querySelectorAll(".lease-row");
+  buttons.forEach(btn => {
+    const mode = btn.dataset.filter;
+    let n = 0;
+    rows.forEach(r => { if (_matchesFilter(r, mode)) n++; });
+    const span = btn.querySelector(".lease-counter");
+    if (span) span.textContent = n;
+  });
 }
 
 function _eligibleLeaseCheckboxes() {
@@ -508,7 +590,16 @@ function confirmLeaseReserve() {
   return confirm(`Add ${n} lease(s) to reservations? This creates an SMC Host element for each one.`);
 }
 
-document.addEventListener("DOMContentLoaded", updateReserveCount);
+document.addEventListener("DOMContentLoaded", () => {
+  updateReserveCount();
+  recomputeFilterCounts();
+  // Bind every [data-filter] button to filterLeases — replaces the
+  // ad-hoc onclick="filterLeases('mode')" attribute pattern so the
+  // discovery filter buttons share the same path as the legacy ones.
+  document.querySelectorAll("[data-filter]").forEach(btn => {
+    btn.addEventListener("click", () => filterLeases(btn.dataset.filter));
+  });
+});
 
 // ── Scan-range modal — toggle custom-range fields + warning checkbox ──
 function _scanRangeUpdateUI() {
