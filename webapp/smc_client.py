@@ -352,6 +352,39 @@ def _extract_action(rule):
         return ""
 
 
+def _is_rule_section(rule) -> bool:
+    """Detect whether a Rule SDK object is actually a section header.
+
+    Sections share the same `typeof` (`fw_ipv4_access_rule`) as regular
+    rules — SMC stores them as rule entries that lack the source /
+    destination / service fields. The SDK exposes this via the
+    `is_rule_section` property; we fall back to a manual data-dict
+    check when the property is missing on older SDK builds.
+    """
+    flag = getattr(rule, "is_rule_section", None)
+    if isinstance(flag, bool):
+        return flag
+    try:
+        data = getattr(rule, "data", {}) or {}
+        return not any(field in data
+                       for field in ("sources", "destinations"))
+    except Exception:
+        return False
+
+
+def _section_label(rule) -> str:
+    """Best-effort display label for a section header.
+
+    `create_rule_section(name=...)` stores the section name in the
+    rule's `comment` field, so that's the primary label. Falls back to
+    the SMC-side `name` if no comment was set.
+    """
+    label = (getattr(rule, "comment", "") or "").strip()
+    if label:
+        return label
+    return getattr(rule, "name", "") or ""
+
+
 def get_policy_rules(policy_name):
     """
     Return all IPv4 access rules for the given policy.
@@ -365,12 +398,10 @@ def get_policy_rules(policy_name):
     try:
         policy = FirewallPolicy(policy_name)
         for rule in policy.fw_ipv4_access_rules.all():
-            # Detect rule sections
-            rule_type = getattr(rule, "typeof", "")
-            if "section" in rule_type.lower():
+            if _is_rule_section(rule):
                 rules.append({
                     "is_section": True,
-                    "name": getattr(rule, "name", ""),
+                    "name": _section_label(rule),
                     "tag": getattr(rule, "tag", ""),
                 })
                 continue
@@ -484,11 +515,10 @@ def get_policy_nat_rules(policy_name):
     try:
         policy = FirewallPolicy(policy_name)
         for rule in policy.fw_ipv4_nat_rules.all():
-            rule_type = getattr(rule, "typeof", "")
-            if "section" in rule_type.lower():
+            if _is_rule_section(rule):
                 rules.append({
                     "is_section": True,
-                    "name": getattr(rule, "name", ""),
+                    "name": _section_label(rule),
                     "tag": getattr(rule, "tag", ""),
                 })
                 continue

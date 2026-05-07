@@ -4,7 +4,104 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-05-01
+## [2.2.0-dev] - 2026-04-29 → 2026-05-07
+
+### DHCP Manager: subnet active-discovery scan (2026-05-07)
+
+Active-discovery sweep that turns the **Active leases** page into a
+richer view showing every device on the subnet, not just the ones
+holding a DHCP lease. Operator guide:
+[docs/DHCP-SubnetScan.md](docs/DHCP-SubnetScan.md).
+
+- **New "Scan subnet" button** on `/dhcp/scopes/<id>/leases`. Opens a
+  range-picker modal with three radio options:
+  - **Scope (pool only)** — `dhcp_pool_start … dhcp_pool_end`. Default
+    when subnet > /24.
+  - **Full subnet** — every host in the CIDR minus
+    gateway/network/broadcast. Default when subnet ≤ /24.
+  - **Custom range** — operator-typed start/end IPs, server-validated
+    to fit inside the subnet.
+
+  Anything resolving to >256 hosts requires a confirmation checkbox.
+  Hard cap at 4096 hosts (= /20) refuses /16 sweeps.
+- **Async + live progress.** POST `/scan` starts a background daemon
+  thread, redirects to `/leases?scan_id=X` which renders a watcher
+  card (progress bar + 10-line rolling log). JS polls
+  `/scan/status` every 800 ms; on `state=done` the page reloads with
+  `?scan_id=X` so the leases route consumes the report and renders
+  the enriched view.
+- **6-state classifier.** Joining the scan results with
+  `dhcpd.leases`, every IP is classified into:
+  - `active` — lease + ICMP/ARP reply (healthy)
+  - `leased-silent` — lease but no reply (powered off?)
+  - `firewalled` — L2-visible (ARP) but drops ICMP
+  - `free` — pool slot, no occupant
+  - `active-untracked` — replies, no DHCP lease (static IP)
+  - `firewalled-untracked` — L2-visible, drops ICMP, no lease
+- **Promotion: in-pool scan responders join the upper table.**
+  Discovered hosts whose IP falls inside the pool are merged into the
+  upper lease table with `binding_state="no-lease"` so the operator
+  can tick them and add to reservations like an ordinary lease.
+  Out-of-pool responders stay in a separate "Discovered hosts (no
+  DHCP lease)" card below.
+- **Click-to-sort columns + numeric IP sort.** Every header in the
+  upper table is clickable. **IP** uses a numeric octet-tuple
+  comparator so `192.168.1.6` sorts before `192.168.1.69`. Other
+  columns sort as text. Click toggles asc/desc; ▲/▼ indicator.
+  Default = IP ascending, also enforced server-side.
+- **Live counters on every filter button.** Lease-state filters
+  (All / Active / Expired-free / Reserved / IP mismatch) plus five
+  new discovery-state filters that appear after a scan
+  (`active` / `silent` / `firewalled` / `untracked` /
+  `untracked + firewalled`). Each button shows a badge with the
+  count of matching rows, painted on `DOMContentLoaded` so the
+  operator gets an at-a-glance overview without clicking. Discovery
+  counters include rows from both tables (upper + lower card);
+  clicking a discovery filter scopes both tables to that state.
+- **MAC capture for ICMP_OK hosts.** Shell script reads the kernel
+  ARP cache via `ip neighbor show <ip>` immediately after each
+  successful ping, so ICMP-only responders also carry their MAC into
+  the result and can be reserved without a follow-up arping.
+- **New modules:**
+  [webapp/dhcp_subnet_scan.py](webapp/dhcp_subnet_scan.py) —
+  `enumerate_subnet_targets`, `enumerate_range_targets`,
+  `_run_scan_streaming` (with `on_event` callback for live progress),
+  `scan_subnet`, `classify`. Pure / no Flask deps.
+  [webapp/dhcp_scan_jobs.py](webapp/dhcp_scan_jobs.py) — background
+  job runtime: `start_scan` / `get_status` / `consume_report` /
+  `discard`. Module-local `_JOBS` dict + `threading.Lock` + 15-min
+  TTL eviction. Per-user ownership check on every access (no
+  cross-user leaks).
+- **Routes added** in [webapp/dhcp_manager.py](webapp/dhcp_manager.py):
+  `POST /dhcp/scopes/<id>/scan`,
+  `GET /dhcp/scopes/<id>/scan/status?id=X`. The existing
+  `GET /dhcp/scopes/<id>/leases` route now also handles
+  `?scan_id=X`: renders the watcher when running, consumes the
+  report and renders the enriched view when done.
+
+### Bug fixes (2026-05-06 → 2026-05-07)
+
+- **Super Admin couldn't log in after Multi-Domain Revamp on
+  existing data.** `_get_profiles_from_db` only iterated explicit
+  `user_domain_access` grants, but the spec says Super Admin sees
+  every Domain "including ones added later". Fixed: when
+  `User.is_super_admin=True`, the profile list is built from every
+  active Domain (with an active ApiKey). Self-heals deployments where
+  the bootstrap admin had no UDA rows.
+- **Container crash on import:** `shared/queue_runner._CREATE_DISPATCH`
+  was defined at line 972 but referenced `_create_rule` /
+  `_create_nat_rule` declared further down. Module-level dict literals
+  evaluate at import time, so workers boot-looped with `NameError`.
+  Moved the dispatch table to after the function definitions.
+- **Jinja can't parse `<<` bitshift** in
+  `templates/dhcp/leases.html` subnet-size calc — replaced with `**`.
+- **`{% set %}` doesn't cross block scopes.** A var set in
+  `{% block content %}` was read in `{% block extra_js %}`,
+  producing `Undefined` and breaking `tojson`. Moved the value to
+  the render context (passed from Python).
+- **DHCP lease list rendered in lexicographic IP order** — server
+  now sorts by numeric octet tuple before render, fixing cases where
+  `192.168.1.6` sorted after `192.168.1.69`.
 
 ### Change Management Phase G — drift detector landed (2026-05-01)
 

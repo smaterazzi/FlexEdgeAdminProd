@@ -488,6 +488,14 @@ The DHCP Manager (`/dhcp/*`, admin-only) lets operators define MAC-to-IP reserva
 7. **Inspect leases** — scope detail → **View leases**. Reads `/spool/dhcp-server/dhcpd.leases` from every enrolled cluster node, merges them, and cross-checks each lease against tracked reservations: green badge = matches, red = IP mismatch with reservation, grey = pool client.
 8. **Deploy reservations to the engine** — pending Phase 4. Today the **Deploy** button on the scope page logs the intent only.
 
+### Subnet active-discovery scan
+
+The lease viewer (`/dhcp/scopes/<id>/leases`) carries a **Scan subnet** button next to Refresh. Clicking it runs a parallel ICMP sweep + arping fallback from the cluster's primary verified node, then joins the results with `dhcpd.leases` to classify every IP into one of six discovery states. In-pool responders without a lease (typically static IPs or new clients) are promoted into the upper table where they can be ticked and added to reservations directly. Out-of-pool responders appear in a separate "Discovered hosts" card below.
+
+The button opens a small modal with three range options (Scope / Full subnet / Custom range). Anything bigger than /24 requires an explicit confirmation; hard cap at 4096 hosts (= /20). The scan runs in a background thread with a live progress bar + 10-line rolling log so big subnets don't block the page.
+
+Full guide with the legend, filter buttons, and troubleshooting: [DHCP-SubnetScan.md](DHCP-SubnetScan.md).
+
 ### Summary view
 
 The DHCP Manager dashboard (`/dhcp/`) gives at-a-glance health of the whole feature:
@@ -553,7 +561,7 @@ It dumps the raw SMC interface JSON plus the walker's per-level decisions. If `d
 
 **Rule shown as "found in our records but missing from policy"** — admin removed it from Management Client. The credentials page surfaces a banner with **Recreate rule** button.
 
-For the per-phase test procedures, see [DHCP-Phase0-LabTest.md](DHCP-Phase0-LabTest.md), [DHCP-Phase1-Testing.md](DHCP-Phase1-Testing.md), and [DHCP-Phase3-Testing.md](DHCP-Phase3-Testing.md).
+For the per-phase test procedures, see [DHCP-Phase0-LabTest.md](DHCP-Phase0-LabTest.md), [DHCP-Phase1-Testing.md](DHCP-Phase1-Testing.md), and [DHCP-Phase3-Testing.md](DHCP-Phase3-Testing.md). For the subnet active-discovery scan, see [DHCP-SubnetScan.md](DHCP-SubnetScan.md).
 
 ---
 
