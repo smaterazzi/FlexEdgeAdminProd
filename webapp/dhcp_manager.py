@@ -3132,13 +3132,36 @@ def scope_leases(scope_id):
             row["reservation_host"] = ""
             row["reservation_ip"] = ""
             row["reservation_matches"] = None
+        row["from_scan"] = False  # came from dhcpd.leases
 
     # If we just consumed a scan report, fold the L3/L2 results into
-    # every lease row + build the "untracked" list for the secondary
-    # card below the lease table.
+    # every lease row, AND promote in-pool scan responders without a
+    # lease into the main table (so the operator can pick them for
+    # reservation alongside leases). Out-of-pool responders stay in the
+    # secondary "Discovered hosts" card below.
     untracked_rows = []
     if scan_report is not None:
         from webapp.dhcp_subnet_scan import classify
+
+        # Pool bounds for "in-scope" decision — defaults to the full
+        # subnet when no pool is configured.
+        pool_lo = pool_hi = None
+        try:
+            if scope.dhcp_pool_start and scope.dhcp_pool_end:
+                pool_lo = int(ipaddress.ip_address(scope.dhcp_pool_start))
+                pool_hi = int(ipaddress.ip_address(scope.dhcp_pool_end))
+        except (ValueError, TypeError):
+            pool_lo = pool_hi = None
+
+        def _in_pool(ip_str: str) -> bool:
+            if pool_lo is None or pool_hi is None:
+                return network is not None and ipaddress.ip_address(ip_str) in network
+            try:
+                v = int(ipaddress.ip_address(ip_str))
+                return pool_lo <= v <= pool_hi
+            except (ValueError, TypeError):
+                return False
+
         leased_ips: set[str] = set()
         for row in merged:
             ip = row.get("ip", "")
@@ -3159,23 +3182,61 @@ def scope_leases(scope_id):
             if not (hit.icmp_reply or hit.arp_reply):
                 continue
             res = res_by_ip.get(ip)
-            untracked_rows.append({
-                "ip": ip,
-                "mac": hit.mac,
-                "scan_icmp": hit.icmp_reply,
-                "scan_arp": hit.arp_reply,
-                "scan_state": classify(
-                    has_lease=False, lease_active=False,
-                    icmp_reply=hit.icmp_reply, arp_reply=hit.arp_reply,
-                ),
-                "reservation_id": res.id if res else None,
-                "reservation_host": res.smc_host_name if res else "",
-            })
+            scan_state = classify(
+                has_lease=False, lease_active=False,
+                icmp_reply=hit.icmp_reply, arp_reply=hit.arp_reply,
+            )
+
+            if _in_pool(ip):
+                # Promote into the main lease table — the operator can
+                # tick the row and add it to reservations like any
+                # ordinary lease. Shaped like a lease dict so the same
+                # template loop renders it; from_scan=True flips a few
+                # column hints.
+                merged.append({
+                    "ip": ip,
+                    "mac": hit.mac,
+                    "client_hostname": "",
+                    "binding_state": "no-lease",
+                    "next_binding_state": "",
+                    "starts": None, "ends": None,
+                    "seen_on_nodes": [],
+                    "reservation_id": res.id if res else None,
+                    "reservation_host": res.smc_host_name if res else "",
+                    "reservation_ip": res.ip_address if res else "",
+                    "reservation_matches": (
+                        res is not None and res.ip_address == ip),
+                    "scan_icmp": hit.icmp_reply,
+                    "scan_arp": hit.arp_reply,
+                    "scan_state": scan_state,
+                    "from_scan": True,
+                })
+            else:
+                untracked_rows.append({
+                    "ip": ip,
+                    "mac": hit.mac,
+                    "scan_icmp": hit.icmp_reply,
+                    "scan_arp": hit.arp_reply,
+                    "scan_state": scan_state,
+                    "reservation_id": res.id if res else None,
+                    "reservation_host": res.smc_host_name if res else "",
+                })
+
         try:
             untracked_rows.sort(
                 key=lambda r: tuple(int(p) for p in r["ip"].split(".")))
         except Exception:
             pass
+
+    # Final stable sort by IP (numeric octet tuple) — fixes the
+    # lexicographic ordering bug where 192.168.1.6 sorted after
+    # 192.168.1.69, and ensures promoted from-scan rows interleave
+    # naturally with lease rows.
+    try:
+        merged.sort(key=lambda r: tuple(
+            int(p) for p in (r.get("ip") or "0.0.0.0").split(".")))
+    except Exception:
+        pass
 
     # Subnet size — passed to the template so both the modal AND the
     # extra_js polling block can read it without each block re-deriving

@@ -182,39 +182,67 @@
     </div>
   </div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
+    <table class="table table-sm table-hover mb-0" id="leases-table">
       <thead>
         <tr>
           <th style="width:32px">
             <input type="checkbox" class="form-check-input" id="select-all-cb"
                    onchange="selectAllLeases(this.checked)" title="Select all eligible visible">
           </th>
-          <th>IP</th><th>MAC</th><th>Hostname</th>
-          <th>State</th><th>Ends</th><th>Seen on</th>
-          <th>Reservation</th>
-          {% if scan_report %}<th>Discovery</th>{% endif %}
+          <th class="sortable" data-sort-key="ip"        data-sort-type="ip">IP            <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="mac"       data-sort-type="text">MAC         <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="host"      data-sort-type="text">Hostname    <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="state"     data-sort-type="text">State       <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="ends"      data-sort-type="text">Ends        <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="seen"      data-sort-type="text">Seen on     <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="reservation" data-sort-type="text">Reservation <span class="sort-indicator"></span></th>
+          {% if scan_report %}
+          <th class="sortable" data-sort-key="discovery" data-sort-type="text">Discovery   <span class="sort-indicator"></span></th>
+          {% endif %}
         </tr>
       </thead>
       <tbody>
+        {# Two row variants share this loop:
+             - lease rows (l.from_scan == False): from dhcpd.leases
+             - from-scan rows (l.from_scan == True): in-pool scan responders
+               with no DHCP lease, promoted into the upper table so the
+               operator can pick them for reservation. They have empty
+               hostname / no Ends / no Seen-on nodes; their `binding_state`
+               sentinel is "no-lease". MAC is set when the kernel ARP
+               cache had it; without MAC the row stays informational
+               (checkbox disabled with a tooltip). #}
         {% for l in leases %}
         <tr class="lease-row"
             data-state="{{ l.binding_state }}"
             data-reserved="{{ '1' if l.reservation_id else '0' }}"
-            data-mismatch="{{ '1' if l.reservation_id and not l.reservation_matches else '0' }}">
+            data-mismatch="{{ '1' if l.reservation_id and not l.reservation_matches else '0' }}"
+            data-fromscan="{{ '1' if l.from_scan else '0' }}"
+            data-ip="{{ l.ip }}"
+            data-mac="{{ l.mac or '' }}"
+            data-host="{{ (l.client_hostname or '')|lower }}"
+            data-ends="{{ l.ends.isoformat() if l.ends else '' }}"
+            data-seen="{{ (l.seen_on_nodes|join(',')) if l.seen_on_nodes else '' }}"
+            data-reservation="{{ (l.reservation_host or '')|lower }}"
+            data-discovery="{{ l.scan_state or '' }}">
           <td>
-            {% if not l.reservation_id %}
+            {% if l.reservation_id %}
+              <i class="bi bi-pin-angle text-muted" title="Already reserved"></i>
+            {% elif l.from_scan and not l.mac %}
+              <i class="bi bi-question-circle text-muted"
+                 title="No MAC observed — cannot create a reservation. Try the scan again with this host online."></i>
+            {% else %}
               <input type="checkbox" class="form-check-input lease-cb"
                      name="lease_idx" value="{{ loop.index0 }}"
                      onchange="updateReserveCount()">
               <input type="hidden" name="lease_{{ loop.index0 }}_mac"  value="{{ l.mac }}">
               <input type="hidden" name="lease_{{ loop.index0 }}_ip"   value="{{ l.ip }}">
               <input type="hidden" name="lease_{{ loop.index0 }}_host" value="{{ l.client_hostname or '' }}">
-            {% else %}
-              <i class="bi bi-pin-angle text-muted" title="Already reserved"></i>
             {% endif %}
           </td>
           <td><code>{{ l.ip }}</code></td>
-          <td><code>{{ l.mac }}</code></td>
+          <td>
+            {% if l.mac %}<code>{{ l.mac }}</code>{% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
           <td>{{ l.client_hostname or '—' }}</td>
           <td>
             {% if l.binding_state == 'active' %}
@@ -225,15 +253,19 @@
               <span class="badge bg-warning text-dark">expired</span>
             {% elif l.binding_state == 'abandoned' %}
               <span class="badge bg-danger">abandoned</span>
+            {% elif l.binding_state == 'no-lease' %}
+              <span class="badge bg-info text-dark"
+                    title="No DHCP lease on file — discovered by subnet scan">no lease</span>
             {% else %}
               <span class="badge bg-secondary">{{ l.binding_state or '—' }}</span>
             {% endif %}
           </td>
           <td class="small text-nowrap">
-            {% if l.ends %}{{ l.ends.strftime('%Y-%m-%d %H:%M') }}{% else %}never{% endif %}
+            {% if l.ends %}{{ l.ends.strftime('%Y-%m-%d %H:%M') }}{% else %}{% if l.from_scan %}—{% else %}never{% endif %}{% endif %}
           </td>
           <td class="small">
             {% for n in l.seen_on_nodes %}<span class="badge bg-dark me-1">node {{ n }}</span>{% endfor %}
+            {% if l.from_scan %}<span class="text-muted small">scan</span>{% endif %}
           </td>
           <td class="small">
             {% if l.reservation_id %}
@@ -416,6 +448,25 @@
 {% endblock %}
 
 {% block extra_js %}
+<style>
+  #leases-table th.sortable {
+    cursor: pointer;
+    user-select: none;
+    position: relative;
+  }
+  #leases-table th.sortable:hover {
+    background-color: rgba(13, 110, 253, 0.08);
+  }
+  #leases-table th .sort-indicator {
+    display: inline-block;
+    width: 0.9em;
+    color: #6c757d;
+    font-size: 0.75em;
+    margin-left: 0.25em;
+  }
+  #leases-table th.sort-asc  .sort-indicator::before { content: "▲"; color: #0d6efd; }
+  #leases-table th.sort-desc .sort-indicator::before { content: "▼"; color: #0d6efd; }
+</style>
 <script>
 function filterLeases(mode) {
   document.querySelectorAll(".lease-row").forEach(row => {
@@ -490,6 +541,78 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 });
+
+// ── Click-to-sort headers on the leases table ──
+(function attachLeaseSort() {
+  const table = document.getElementById("leases-table");
+  if (!table) return;
+  const tbody = table.querySelector("tbody");
+  if (!tbody) return;
+  const headers = table.querySelectorAll("th.sortable");
+  let activeKey = null;
+  let activeDir = "asc";
+
+  function ipKey(s) {
+    if (!s) return [0, 0, 0, 0];
+    const parts = s.split(".");
+    if (parts.length !== 4) return [0, 0, 0, 0];
+    return parts.map(p => parseInt(p, 10) || 0);
+  }
+  function cmp(a, b) {
+    if (Array.isArray(a) && Array.isArray(b)) {
+      for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        const da = a[i] ?? 0, db = b[i] ?? 0;
+        if (da !== db) return da - db;
+      }
+      return 0;
+    }
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+  }
+  function rowKey(row, sortKey, sortType) {
+    // All data attrs use the same lowercase keys we set as sortKey.
+    const v = row.dataset[sortKey] || "";
+    if (sortType === "ip") return ipKey(v);
+    return v;
+  }
+
+  function sort(sortKey, sortType, direction) {
+    const rows = Array.from(tbody.querySelectorAll("tr.lease-row"));
+    rows.sort((a, b) => {
+      const ka = rowKey(a, sortKey, sortType);
+      const kb = rowKey(b, sortKey, sortType);
+      const r = cmp(ka, kb);
+      return direction === "desc" ? -r : r;
+    });
+    rows.forEach(r => tbody.appendChild(r));
+  }
+
+  headers.forEach(th => {
+    th.addEventListener("click", () => {
+      const key = th.dataset.sortKey;
+      const type = th.dataset.sortType || "text";
+      // Toggle direction if clicking the same column; otherwise default to asc.
+      if (activeKey === key) {
+        activeDir = (activeDir === "asc") ? "desc" : "asc";
+      } else {
+        activeKey = key;
+        activeDir = "asc";
+      }
+      headers.forEach(h => h.classList.remove("sort-asc", "sort-desc"));
+      th.classList.add(activeDir === "asc" ? "sort-asc" : "sort-desc");
+      sort(key, type, activeDir);
+    });
+  });
+
+  // Default — IP ascending. Server already pre-sorts numerically, but we
+  // also paint the indicator so the user sees what's active.
+  const ipHeader = table.querySelector('th[data-sort-key="ip"]');
+  if (ipHeader) {
+    activeKey = "ip"; activeDir = "asc";
+    ipHeader.classList.add("sort-asc");
+  }
+})();
 
 // ── Scan watcher — poll /scan/status, update progress bar + log ──
 (function pollScanWatcher() {

@@ -102,12 +102,24 @@ n=0
 for ip in "$@"; do
     (
         if ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
-            line="$ip ICMP_OK"
+            # Kernel populated the ARP cache during ping resolution —
+            # read the MAC from `ip neighbor show` so the upper UI can
+            # promote the host into the reservable list. May be empty if
+            # the cache evicted the entry by the time we look (rare).
+            NEIGH=$(ip neighbor show "$ip" 2>/dev/null | head -1)
+            MAC=$(printf '%s\n' "$NEIGH" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+            if [ -n "$MAC" ]; then
+                line="$ip ICMP_OK $MAC"
+            else
+                line="$ip ICMP_OK"
+            fi
+            printf '%s\n' "$line"
+            printf '%s ICMP_OK\n' "$ip" >> "$TMP"
         else
             line="$ip ICMP_FAIL"
+            printf '%s\n' "$line"
+            printf '%s\n' "$line" >> "$TMP"
         fi
-        printf '%s\n' "$line"
-        printf '%s\n' "$line" >> "$TMP"
     ) &
     n=$((n+1))
     if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
@@ -251,6 +263,8 @@ def _run_scan_streaming(target: SSHTarget, cred: SSHCredential, *,
                 # both flags so classify() doesn't mistake it for "firewalled".
                 r.icmp_reply = True
                 r.arp_reply = True
+                if mac and not r.mac:
+                    r.mac = mac
                 icmp_replies += 1
             elif state == "ICMP_FAIL":
                 # First-pass result; values stay False until Phase 2 updates
