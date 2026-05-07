@@ -209,6 +209,7 @@
         <select name="iface_id" id="pick-iface" class="form-select form-select-sm" required disabled>
           <option value="">— pick a cluster first —</option>
         </select>
+        <input type="hidden" name="vlan_id" id="pick-vlan-id" value="">
         <div class="form-text small" id="iface-hint">arping uses this leg.</div>
       </div>
     </div>
@@ -366,12 +367,15 @@
         o.value = i.id;
         o.dataset.subnet = i.subnet_cidr || "";
         o.dataset.label  = i.label || i.id;
+        o.dataset.vlanId = i.vlan_id || "";
         o.textContent = `${i.label}`
                       + (i.zone ? ` [${i.zone}]` : "")
                       + (i.subnet_cidr ? ` — ${i.subnet_cidr}` : "  (no IPv4 attached)");
         return o;
       });
       setOptions(ifaceSel, ifaceOpts, "— pick an interface —");
+      const vlanField = document.getElementById("pick-vlan-id");
+      if (vlanField) vlanField.value = "";
     } catch (err) {
       console.error("interfaces fetch failed", err);
       setOptions(nodeSel,  [], "fetch failed");
@@ -382,6 +386,8 @@
   ifaceSel.addEventListener("change", () => {
     const opt = ifaceSel.selectedOptions[0];
     const subnet = opt ? opt.dataset.subnet : "";
+    const vlanField = document.getElementById("pick-vlan-id");
+    if (vlanField) vlanField.value = (opt && opt.dataset.vlanId) ? opt.dataset.vlanId : "";
     if (subnetHint) {
       subnetHint.textContent = subnet ? `(${subnet})` : "";
     }

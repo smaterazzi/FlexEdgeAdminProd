@@ -498,6 +498,7 @@ def tools_scan_start():
     engine_name = (request.form.get("engine_name") or "").strip()
     node_index_raw = (request.form.get("node_index") or "").strip()
     iface_id = (request.form.get("iface_id") or "").strip()
+    vlan_id = (request.form.get("vlan_id") or "").strip()
     target_mode = (request.form.get("target_mode") or "subnet").strip().lower()
     single_ip = (request.form.get("single_ip") or "").strip()
     custom_start = (request.form.get("custom_start") or "").strip()
@@ -532,13 +533,13 @@ def tools_scan_start():
     # Resolve interface metadata (subnet + OS-level interface name) by
     # asking the SMC inventory for the cluster's interface walk.
     iface_subnet_cidr = ""
-    iface_label = iface_id
+    iface_label = iface_id + (f".{vlan_id}" if vlan_id else "")
     try:
         cfg = _user_cfg()
         with __import__("smc_client").smc_session(cfg):
             detail = engine_inquiry.cluster_detail(cfg, engine_name)
         for iface in detail.interfaces:
-            if iface.interface_id == iface_id:
+            if iface.interface_id == iface_id and (iface.vlan_id or "") == vlan_id:
                 iface_label = (
                     f"{iface.interface_id}"
                     + (f".{iface.vlan_id}" if iface.vlan_id else "")
@@ -696,12 +697,13 @@ def api_cluster_interfaces(engine_name):
             "status_state": n.status_state,
         })
 
-    seen_iface_ids = set()
+    seen_iface_keys: set[tuple[str, str]] = set()
     interfaces = []
     for iface in detail.interfaces:
-        if iface.interface_id in seen_iface_ids:
+        key = (iface.interface_id or "", iface.vlan_id or "")
+        if key in seen_iface_keys:
             continue
-        seen_iface_ids.add(iface.interface_id)
+        seen_iface_keys.add(key)
         subnet_cidr = ""
         for addr in iface.addresses:
             if addr.network_value:
@@ -717,6 +719,19 @@ def api_cluster_interfaces(engine_name):
             "zone": iface.zone or "",
             "subnet_cidr": subnet_cidr,
         })
+
+    # Stable order: physical iface first, then VLANs by numeric vlan_id.
+    def _iface_sort_key(it):
+        try:
+            iid = int(it["id"])
+        except (TypeError, ValueError):
+            iid = 99999
+        try:
+            vid = int(it["vlan_id"]) if it["vlan_id"] else -1
+        except (TypeError, ValueError):
+            vid = 99999
+        return (iid, vid)
+    interfaces.sort(key=_iface_sort_key)
 
     return jsonify({"nodes": nodes, "interfaces": interfaces})
 

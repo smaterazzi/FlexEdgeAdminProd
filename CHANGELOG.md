@@ -6,6 +6,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-07
 
+### Engines → Tools → Scan landed (2026-05-07)
+
+Engine-level network scan tool — pick a node + interface from the
+cascading picker, run an active-discovery sweep against any target
+range from that interface's vantage point. Operator guide:
+[docs/Engines-ScanTool.md](docs/Engines-ScanTool.md). Plan-to-live
+delta: ~5 h, no new external dependencies.
+
+- **Decision blocker resolved.** Forcepoint NGFW BusyBox does NOT
+  ship `nmap`, but `nc -z` (TCP zero-I/O scan), `nslookup`, `arping`,
+  `ip neighbor show`, and `ip route get` are all there. The full
+  feature builds on the existing tools — no static binary to bundle.
+- **Generic background-job runtime** in
+  [webapp/scan_jobs.py](webapp/scan_jobs.py): module-local `_JOBS`
+  dict + `threading.Lock` + 15-min TTL eviction + per-user ownership
+  check. Public API: `register_job` / `update_progress` /
+  `increment` / `append_log` / `mark_done` / `mark_failed` /
+  `spawn_runner` / `get_status` / `consume_report` / `discard`.
+- **DHCP scan refactored.** [webapp/dhcp_scan_jobs.py](webapp/dhcp_scan_jobs.py)
+  is now a thin wrapper around the shared runtime. Public API
+  unchanged — DHCP routes import unchanged. Runtime is now
+  feature-agnostic.
+- **Engine scanner** [webapp/engine_scan.py](webapp/engine_scan.py):
+  4-phase shell script — Phase 1 ICMP (parallel ping +
+  `ip neighbor show` for MAC), Phase 2 arping fallback for
+  ICMP-failed (L2 visibility), Phase 3 port scan (`nc -z -w1` per
+  reachable IP × port), Phase 4 reverse DNS (`nslookup`). Output
+  streams line-by-line for live progress. `parse_port_list()`
+  handles comma / whitespace / range syntax (`1-1024`).
+- **Routes** in [webapp/engines_manager.py](webapp/engines_manager.py):
+  - `GET /engines/tools/scan` — picker / watcher / results dispatch
+  - `POST /engines/tools/scan` — validate, build IP list, enforce
+    caps + warn threshold, kick off background job
+  - `GET /engines/tools/scan/status?id=X` — JSON poll target
+  - `GET /engines/api/clusters/<engine>/interfaces` — cascading
+    picker JSON: nodes (with `verified` flag) + interfaces (with
+    attached subnet)
+  - `GET /engines/tools/scan/<id>/csv` — export results as CSV
+- **Template** [webapp/templates/engines/tools_scan.html](webapp/templates/engines/tools_scan.html):
+  cluster→node→interface cascading picker (backed by the JSON
+  endpoint), target-mode radio (subnet / single IP / custom range),
+  ports input pre-filled with the curated default + reset/clear
+  shortcuts + skip-port-scan checkbox, JS op-count estimator with
+  warning gate, watcher card identical to DHCP scan, result table
+  with ICMP / MAC / hostname / open-port columns + 5 filter buttons
+  with live counters + click-to-sort + CSV export.
+- **Default port set (TCP-only, locked):** 25 ports —
+  `20, 21, 22, 23, 25, 53, 80, 110, 135, 137, 138, 139, 143, 389,
+  443, 445, 993, 995, 1433, 1521, 3306, 3389, 5432, 5900, 8080`.
+  /24 × default = 6,375 ops, fits under the 8000 warn threshold.
+  UDP probing intentionally NOT supported in v1.
+- **Limits:** 4096 hosts cap (= /20), 256 ports cap, 8000 ops soft
+  warn, 16384 ops hard cap.
+- **Audit** via `audit("engines", "scan_started" / "scan_complete",
+  ...)` with the scan_id as `source_correlation_id`.
+
 ### Policy rules viewer: section detection fix + full-text search (2026-05-07)
 
 - **Sections were silently rendered as rules.** The detection in
