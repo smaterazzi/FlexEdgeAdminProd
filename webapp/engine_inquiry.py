@@ -147,11 +147,15 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                         zone=str(pi_data.get("zone_ref", "") or ""),
                         addresses=top_addrs,
                     ))
-                # VLAN sub-interfaces. SMC payloads come in two shapes:
-                #   - flat:    [{"vlan_id": "10", "interfaces": [...]}]
-                #   - wrapped: [{"physical_interface": {"vlan_id": "10", ...}}]
-                # Some versions also key the list as snake_case
-                # (vlan_interfaces) instead of camelCase (vlanInterfaces).
+                # VLAN sub-interfaces. The SDK encodes the VLAN id INSIDE
+                # the entry's interface_id (e.g. "1.42") — there is no
+                # separate "vlan_id" key in the wrapper. We split it back
+                # out into (parent_id, vlan_id) for the picker UI.
+                # Payload shapes seen in the wild:
+                #   - flat:    [{"interface_id": "1.42", "interfaces": [...]}]
+                #   - wrapped: [{"physical_interface": {"interface_id": "1.42", ...}}]
+                # Snake_case key (vlan_interfaces) also seen on some builds.
+                parent_iid = str(pi_data.get("interface_id", "") or "")
                 vlan_list = (pi_data.get("vlanInterfaces")
                              or pi_data.get("vlan_interfaces")
                              or [])
@@ -159,9 +163,17 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                     if not isinstance(vlan_wrap, dict):
                         continue
                     vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+                    raw_iid = str(vlan.get("interface_id", "") or "")
+                    explicit_vlan = str(vlan.get("vlan_id", "") or "")
+                    # Prefer the parent.vlan composite encoded by the SDK;
+                    # fall back to an explicit "vlan_id" key if present.
+                    if "." in raw_iid:
+                        iid_part, vlan_part = raw_iid.rsplit(".", 1)
+                    else:
+                        iid_part, vlan_part = raw_iid or parent_iid, explicit_vlan
                     out.append(InterfaceInfo(
-                        interface_id=str(pi_data.get("interface_id", "") or ""),
-                        vlan_id=str(vlan.get("vlan_id", "") or ""),
+                        interface_id=iid_part or parent_iid,
+                        vlan_id=vlan_part,
                         zone=str(vlan.get("zone_ref", "") or ""),
                         addresses=_addresses_from_iface_payload(vlan),
                     ))

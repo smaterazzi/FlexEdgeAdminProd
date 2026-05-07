@@ -736,6 +736,64 @@ def api_cluster_interfaces(engine_name):
     return jsonify({"nodes": nodes, "interfaces": interfaces})
 
 
+@engines_bp.route("/api/clusters/<path:engine_name>/interfaces/debug")
+@profile_required_admin
+def api_cluster_interfaces_debug(engine_name):
+    """Diagnostic dump of every physical_interface payload as raw JSON.
+    Use to verify what SMC actually returns when VLAN sub-interfaces
+    don't show up on the picker. Hit:
+      /engines/api/clusters/<engine>/interfaces/debug?pretty=1
+    """
+    from smc.core.engine import Engine
+    from flask import Response
+    import json
+
+    cfg = _user_cfg()
+    out: list[dict] = []
+    try:
+        with __import__("smc_client").smc_session(cfg):
+            engine = Engine(engine_name)
+            for pi in engine.physical_interface:
+                # Try every shape we've seen for pi.data
+                raw = getattr(pi, "data", None)
+                snapshot: dict = {}
+                if raw is None:
+                    snapshot["_pi_data"] = None
+                else:
+                    snapshot["_repr_type"] = type(raw).__name__
+                    try:
+                        if hasattr(raw, "data") and isinstance(raw.data, dict):
+                            snapshot["_via"] = ".data.data"
+                            snapshot.update(dict(raw.data))
+                        elif isinstance(raw, dict):
+                            snapshot["_via"] = "isinstance(dict)"
+                            snapshot.update(dict(raw))
+                        else:
+                            snapshot["_via"] = "dict(raw)"
+                            snapshot.update(dict(raw))
+                    except Exception as exc:
+                        snapshot["_extract_error"] = str(exc)
+                # Also try the SDK's vlan_interface iterator if present
+                try:
+                    vi_list = []
+                    for vi in getattr(pi, "vlan_interface", []) or []:
+                        vi_list.append({
+                            "type": type(vi).__name__,
+                            "data": getattr(vi, "data", None) if not hasattr(getattr(vi, "data", None), "data")
+                                    else dict(vi.data.data),
+                        })
+                    snapshot["_pi_vlan_interface_iter"] = vi_list
+                except Exception as exc:
+                    snapshot["_pi_vlan_interface_iter_error"] = str(exc)
+                out.append(snapshot)
+    except Exception as exc:
+        return jsonify({"error": str(exc), "engine": engine_name}), 502
+
+    pretty = request.args.get("pretty") == "1"
+    body = json.dumps(out, indent=2 if pretty else None, default=str)
+    return Response(body, mimetype="application/json")
+
+
 @engines_bp.route("/tools/scan/<scan_id>/csv")
 @profile_required_admin
 def tools_scan_csv(scan_id):
