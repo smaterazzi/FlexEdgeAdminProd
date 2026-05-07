@@ -132,7 +132,12 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
     try:
         for pi in engine.physical_interface:
             try:
-                pi_data = getattr(pi, "data", {}) or {}
+                # SDK wraps `pi.data` in an SmcDict-like object; the raw dict
+                # lives at `.data.data`. Without this unwrap, .get() returns
+                # the wrapper's attributes, not the SMC payload — so VLAN
+                # sub-interfaces silently disappear.
+                raw = getattr(pi, "data", {}) or {}
+                pi_data = raw.data if hasattr(raw, "data") else dict(raw)
                 # Top-level (untagged) addresses
                 top_addrs = _addresses_from_iface_payload(pi_data)
                 if top_addrs:
