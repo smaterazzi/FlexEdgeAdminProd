@@ -366,7 +366,8 @@
       </thead>
       <tbody>
         {% for r in untracked_rows %}
-        <tr>
+        <tr class="discovery-row"
+            data-discovery="{{ r.scan_state or '' }}">
           <td><code>{{ r.ip }}</code></td>
           <td><code>{{ r.mac or '—' }}</code></td>
           <td class="small">{{ scan_badge(r.scan_state, r.scan_icmp, r.scan_arp) }}</td>
@@ -544,6 +545,18 @@ function filterLeases(mode) {
     const cb = row.querySelector(".lease-cb");
     if (cb) cb.disabled = !show;
   });
+  // Lower-card "Discovered hosts" rows also get filtered when the user
+  // picks a discovery-state filter, so a click on `untracked` shows
+  // exactly the matching rows in BOTH tables. For lease-state filters
+  // (Active/Expired/Reserved/Mismatch) the lower card stays visible —
+  // those concepts don't apply to no-lease hosts.
+  document.querySelectorAll(".discovery-row").forEach(row => {
+    let show = true;
+    if (mode.startsWith("d-")) {
+      show = _matchesFilter(row, mode);
+    }
+    row.style.display = show ? "" : "none";
+  });
   // Visually mark the active filter button.
   document.querySelectorAll("[data-filter]").forEach(b => {
     b.classList.toggle("active", b.dataset.filter === mode);
@@ -554,14 +567,25 @@ function filterLeases(mode) {
 // Walk every row once, count how many match each filter mode, and
 // paint the .lease-counter badge inside each filter button. Called on
 // DOMContentLoaded so the badges are accurate before any user click.
+//
+// Discovery-state filters (d-*) include rows from BOTH the upper lease
+// table and the lower "Discovered hosts" card — the count is an
+// overview of how many of that state exist on the page. Lease-state
+// filters (active / expired / reserved / mismatch) only walk the upper
+// table since those concepts don't apply to lower-card rows.
 function recomputeFilterCounts() {
   const buttons = document.querySelectorAll("[data-filter]");
   if (!buttons.length) return;
-  const rows = document.querySelectorAll(".lease-row");
+  const upperRows = document.querySelectorAll(".lease-row");
+  const lowerRows = document.querySelectorAll(".discovery-row");
   buttons.forEach(btn => {
     const mode = btn.dataset.filter;
     let n = 0;
-    rows.forEach(r => { if (_matchesFilter(r, mode)) n++; });
+    upperRows.forEach(r => { if (_matchesFilter(r, mode)) n++; });
+    if (mode.startsWith("d-")) {
+      // Discovery filters also count lower-card rows.
+      lowerRows.forEach(r => { if (_matchesFilter(r, mode)) n++; });
+    }
     const span = btn.querySelector(".lease-counter");
     if (span) span.textContent = n;
   });
