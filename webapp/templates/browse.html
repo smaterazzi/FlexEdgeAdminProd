@@ -6,6 +6,32 @@
     <h5 class="mb-0"><i class="bi bi-list-ul"></i> {{ label }}</h5>
     <span class="badge bg-primary">{{ count }} items</span>
 
+    {% if cache_meta %}
+    {# Cache-freshness badge + Refresh button.
+       Refresh is family-wide: also drops smc.element.<type_key>. #}
+    <div class="d-flex align-items-center gap-2 small">
+      {% if cache_meta.served_from_cache %}
+        {% set mins = (cache_meta.age_minutes)|round(0)|int %}
+        <span class="text-muted"
+              title="Served from process cache. Click Refresh to force a live SMC fetch.">
+          <i class="bi bi-database-check"></i>
+          cached · {{ mins if mins else '<1' }} min ago
+        </span>
+      {% else %}
+        <span class="text-success"
+              title="Just fetched from SMC; cached for the next 1 hour.">
+          <i class="bi bi-cloud-download"></i>
+          fresh from SMC
+        </span>
+      {% endif %}
+      <a href="/browse/{{ type_key }}?refresh=1{% if filter_text %}&q={{ filter_text }}{% endif %}{% if fgt_only %}&fgt=1{% endif %}"
+         class="btn btn-sm btn-outline-secondary"
+         title="Force a live SMC fetch and repopulate the cache. Also drops every cached element-detail page of this type.">
+        <i class="bi bi-arrow-clockwise"></i> Refresh from SMC
+      </a>
+    </div>
+    {% endif %}
+
     <form class="d-flex gap-2 ms-auto" method="get" action="/browse/{{ type_key }}">
         <input type="text" name="q" class="form-control form-control-sm"
                placeholder="Filter by name..." value="{{ filter_text }}" style="width:200px;">

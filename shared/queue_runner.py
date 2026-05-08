@@ -256,25 +256,33 @@ def _invalidate_cache_for_change(change):
     op = change.operation
     if op == "upload_policy":
         # Engine state changed — drop engine + policy caches.
+        # Phase 1 (engines.detail) cache shape: one section, multi-key
+        # `(domain_id, engine_name)`. Drop the SPECIFIC entry when we
+        # know the engine name; fall back to the whole section to stay
+        # on the over-invalidate side. Same shape for smc.policy.
         sections.append(("engines.list", None))
-        # Best-effort: invalidate any cached engine detail keyed by the
-        # engine name from payload.
         try:
             payload = _json.loads(change.payload_json or "{}")
             engine = payload.get("engine_name")
             if engine:
-                sections.append((f"engines.detail.{engine}", None))
+                sections.append(
+                    ("engines.detail", (change.domain_id, engine)))
             policy = payload.get("policy_name")
             if policy:
-                sections.append((f"smc.policy.{policy}", None))
+                sections.append(
+                    ("smc.policy", (change.domain_id, policy)))
         except Exception:
             pass
     elif smc_type in ("rule", "nat_rule", "section"):
-        # Rule lives in a policy — drop the policy cache section.
+        # Rule lives in a policy — drop the whole smc.policy section
+        # since we don't always know which policy from the change row.
         sections.append(("smc.policy", None))
     elif smc_type:
-        # Plain element types: drop the explorer section that lists them.
+        # Plain element types: drop the explorer section AND the
+        # per-element detail section so a freshly created/updated host
+        # shows up everywhere on next read.
         sections.append((f"smc.explorer.{smc_type}", None))
+        sections.append((f"smc.element.{smc_type}", None))
 
     for section, key_parts in sections:
         try:

@@ -6,6 +6,50 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Caching rollout phase 2: SMC Explorer + policies list (2026-05-08)
+
+TODO-item-2 phase 2 — biggest user-visible cache win across the SMC
+Explorer pages. Standing rules from phase 1 carry over (TTL rule B,
+per-page Refresh button, family-wide refresh).
+
+- **`smc.explorer.<type_key>` section** — `/browse/<type>` for hosts,
+  networks, address ranges, FQDNs, services, groups, etc. ([webapp/app.py:browse](webapp/app.py)).
+  Cache key `(domain_id, filter_text, fgt_only)` so different filter
+  states cache independently. TTL 1 h (FlexEdge writes via the queue,
+  per Q1.B). Refresh button + freshness footer on
+  [webapp/templates/browse.html](webapp/templates/browse.html).
+- **`smc.element.<type_key>` section** — `/detail/<type>/<name>`
+  per-element view ([webapp/app.py:detail](webapp/app.py)). Cache key
+  `(domain_id, element_name)`. TTL 1 h. Refresh button on
+  [webapp/templates/detail.html](webapp/templates/detail.html).
+- **`smc.policy.list` section** — `/policies` index ([webapp/app.py:policies](webapp/app.py)).
+  Cache key `(domain_id,)`. TTL 24 h (FlexEdge doesn't create or
+  delete policies — the rule list within a policy IS writeable, but
+  that's a different cache section that lands in phase 3). Refresh
+  button on [webapp/templates/policies.html](webapp/templates/policies.html).
+- **Family-wide refresh** — `?refresh=1` on `/browse/<type>` also
+  invalidates the entire `smc.element.<type>` section so deeper
+  visits land on fresh data without a second click.
+
+Aligned the queue runner's invalidation map ([shared/queue_runner.py](shared/queue_runner.py))
+to match phase 1 + phase 2 cache shapes:
+
+- `upload_policy` push: drops `engines.list` (whole section), the
+  specific `engines.detail` entry by `(domain_id, engine_name)`, and
+  the specific `smc.policy` entry by `(domain_id, policy_name)`.
+  Previously it targeted bogus per-engine / per-policy section names
+  that never existed in the cache, so phase 1's `engines.detail` cache
+  wouldn't have been auto-invalidated after deploys.
+- Plain element create/update/delete (`host`, `network`, `service`,
+  `group`, etc.): drops both `smc.explorer.<type>` AND
+  `smc.element.<type>`, so a freshly-created host shows up in both
+  the list view and any cached element-detail page.
+
+Phase 2 nets ~4 SMC round-trips saved per typical operator session
+across the Explorer + Policies pages, plus eliminates the
+"phase 1 cache survives 24 h despite a recent deploy" symptom that
+the old (mis-targeted) invalidation map would have produced.
+
 ### Caching rollout phase 1: engines.detail + tools_scan inventory share (2026-05-08)
 
 TODO-item-2 phase 1 — first slice of the engine-objects caching plan.

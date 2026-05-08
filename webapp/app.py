@@ -810,7 +810,20 @@ def index():
 @app.route("/browse/<type_key>")
 @profile_required
 def browse(type_key):
-    """List all elements of a given type."""
+    """List all elements of a given type.
+
+    Cached read-through ([shared/smc_cache.py](shared/smc_cache.py),
+    section ``smc.explorer.<type_key>``, TTL 1 h per the operator's
+    TTL rule — operators DO write hosts/networks/services through the
+    queue, so the shorter TTL plus the queue runner's auto-invalidation
+    keeps the list fresh after each push). Cache key is
+    ``(domain_id, filter_text, fgt_only)`` so a filtered view doesn't
+    pollute the unfiltered cache (and vice versa).
+
+    ``?refresh=1`` is family-wide: it also drops every cached
+    per-element detail (``smc.element.<type_key>``) so a deeper page
+    visit after Refresh sees fresh data without a second click.
+    """
     if type_key not in smc_client.ELEMENT_TYPES:
         return redirect(url_for("index"))
     # Engines have a dedicated, richer view at /engines/clusters that
@@ -824,9 +837,30 @@ def browse(type_key):
     fgt_only = request.args.get("fgt", "0") == "1"
     label = smc_client.ELEMENT_TYPES[type_key]["label"]
     try:
+        from shared.smc_cache import cache_get_or_fetch, invalidate
         cfg = get_user_cfg()
-        with smc_client.smc_session(cfg):
-            elements = smc_client.list_elements(type_key, filter_text, fgt_only)
+        domain_obj = getattr(g, "domain", None)
+        domain_id = domain_obj.id if domain_obj else 0
+        refresh_requested = (request.args.get("refresh") == "1")
+
+        if refresh_requested:
+            # Q5 family-wide: refreshing the explorer also drops every
+            # cached per-element detail entry of THIS type so deeper
+            # pages don't surprise the operator with stale data.
+            invalidate(f"smc.element.{type_key}")
+
+        def _fetch():
+            with smc_client.smc_session(cfg):
+                return smc_client.list_elements(type_key, filter_text, fgt_only)
+
+        cv = cache_get_or_fetch(
+            section=f"smc.explorer.{type_key}",
+            key_parts=(domain_id, filter_text, "fgt" if fgt_only else ""),
+            fetcher=_fetch,
+            ttl=3600,            # 1 h — FlexEdge writes to these via queue (Q1.B)
+            refresh=refresh_requested,
+        )
+        elements = cv.data
     except Exception as e:
         log.error("SMC connection error: %s", e)
         return render_template("error.html", message=str(e))
@@ -834,34 +868,78 @@ def browse(type_key):
         "browse.html", type_key=type_key, label=label,
         elements=elements, filter_text=filter_text,
         fgt_only=fgt_only, count=len(elements),
+        cache_meta=cv,
     )
 
 
 @app.route("/detail/<type_key>/<path:element_name>")
 @profile_required
 def detail(type_key, element_name):
-    """Show full detail for a single element."""
+    """Show full detail for a single element.
+
+    Cached read-through (section ``smc.element.<type_key>``, key
+    ``(domain_id, element_name)``, TTL 1 h). Auto-invalidated by the
+    queue runner after any create/update of the same element type, and
+    by the parent ``/browse/<type_key>?refresh=1`` (family-wide).
+    """
     try:
+        from shared.smc_cache import cache_get_or_fetch
         cfg = get_user_cfg()
-        with smc_client.smc_session(cfg):
-            data = smc_client.get_element_detail(type_key, element_name)
+        domain_obj = getattr(g, "domain", None)
+        domain_id = domain_obj.id if domain_obj else 0
+
+        def _fetch():
+            with smc_client.smc_session(cfg):
+                return smc_client.get_element_detail(type_key, element_name)
+
+        cv = cache_get_or_fetch(
+            section=f"smc.element.{type_key}",
+            key_parts=(domain_id, element_name),
+            fetcher=_fetch,
+            ttl=3600,                     # 1 h — writeable via queue
+            refresh=(request.args.get("refresh") == "1"),
+        )
+        data = cv.data
     except Exception as e:
         return render_template("error.html", message=str(e))
     label = smc_client.ELEMENT_TYPES.get(type_key, {}).get("label", type_key)
-    return render_template("detail.html", type_key=type_key, label=label, element=data)
+    return render_template("detail.html", type_key=type_key, label=label,
+                           element=data, cache_meta=cv)
 
 
 @app.route("/policies")
 @profile_required
 def policies():
-    """List all firewall policies."""
+    """List all firewall policies.
+
+    Cached read-through (section ``smc.policy.list``, key
+    ``(domain_id,)``, TTL 24 h — FlexEdge doesn't create / delete
+    policies; the queue runner can mutate rules within them but the
+    list itself is stable, so 24 h is the read-only side of the rule).
+    Refresh button on the page.
+    """
     try:
+        from shared.smc_cache import cache_get_or_fetch
         cfg = get_user_cfg()
-        with smc_client.smc_session(cfg):
-            policy_list = smc_client.list_policies()
+        domain_obj = getattr(g, "domain", None)
+        domain_id = domain_obj.id if domain_obj else 0
+
+        def _fetch():
+            with smc_client.smc_session(cfg):
+                return smc_client.list_policies()
+
+        cv = cache_get_or_fetch(
+            section="smc.policy.list",
+            key_parts=(domain_id,),
+            fetcher=_fetch,
+            ttl=86400,                # 24 h — read-only inventory
+            refresh=(request.args.get("refresh") == "1"),
+        )
+        policy_list = cv.data
     except Exception as e:
         return render_template("error.html", message=str(e))
-    return render_template("policies.html", policies=policy_list)
+    return render_template("policies.html", policies=policy_list,
+                           cache_meta=cv)
 
 
 @app.route("/policy/<path:policy_name>")
