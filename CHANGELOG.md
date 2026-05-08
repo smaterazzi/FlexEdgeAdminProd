@@ -6,6 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: port → service-name labels in result table (2026-05-08)
+
+Open-port badges in the scan-result table now show the SMC service
+name next to the port number — `443 (HTTPS)`, `3389 (RDP)`,
+`8080 (Custom-HTTP-Alt)` — pulled from the operator's own SMC
+`tcp_services` / `udp_services` element lists. Names matter to
+operators because they reflect what they've defined in SMC, not a
+generic IANA list. Custom services (e.g. an internal app on a
+non-standard port) flow through automatically.
+
+The lookup goes through the existing `smc.explorer.tcp_services` /
+`smc.explorer.udp_services` cache sections (Quick refresh, key
+`(domain_id, "", "")`) — same cache the SMC Explorer already
+populates, so the lookup is free if the operator has visited
+`/browse/tcp_services` in the last hour. Auto-invalidated by the
+queue runner after any service-element write.
+
+Two-pass merge so specific names beat catch-alls: range services
+applied first, single-port services overwrite second. Ranges wider
+than 256 ports are skipped entirely (those are usually "TCP All" /
+all-ports categories that would clobber every well-known port name
+and reduce signal). On any cache or SMC failure the lookup returns
+an empty dict — the table falls back to bare port numbers, scan
+results still render.
+
+The hosts filter on the scan detail page now matches against the
+service name too — typing `rdp` filters to rows with port 3389
+open, `https` to rows with 443 open, etc. Placeholder updated:
+`filter by IP / hostname / MAC / port / service…`.
+
+Helper: `webapp.engines_manager.resolve_port_services(domain_id,
+cfg)` — public so [scan_history.routes.detail](webapp/scan_history/routes.py)
+(the primary results view operators land on) and the in-memory
+fallback render in `tools_scan` both use it.
+
 ### Engines → Tools → Scan: Phase 3 port scan now covers ALL targets (2026-05-08)
 
 Operator reported only seeing ICMP traffic from the firewall, no

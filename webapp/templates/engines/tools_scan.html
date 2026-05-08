@@ -193,7 +193,11 @@
           <td class="small">{{ r.hostname or '—' }}</td>
           <td class="small">
             {% for p in r.open_ports %}
-              <span class="badge bg-success me-1">{{ p }}</span>
+              {% set _svc = port_services_map.get(p) %}
+              <span class="badge bg-success me-1"
+                    {% if _svc %}title="{{ _svc }}"{% endif %}>
+                {{ p }}{% if _svc %} <span class="opacity-75">({{ _svc }})</span>{% endif %}
+              </span>
             {% else %}
               <span class="text-muted">—</span>
             {% endfor %}

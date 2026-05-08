@@ -107,6 +107,76 @@ def _current_domain():
     return getattr(g, "domain", None)
 
 
+def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
+    """Build a ``{port: service_name}`` map from cached SMC tcp/udp_services.
+
+    Reuses the SMC Explorer cache sections (``smc.explorer.tcp_services``
+    / ``smc.explorer.udp_services``, key ``(domain_id, "", "")``) so the
+    lookup is free if the operator has already visited
+    ``/browse/tcp_services`` in the last hour, and lives off the queue
+    runner's auto-invalidation otherwise. Empty dict on failure — caller
+    falls back to bare port numbers in the result table.
+
+    Two passes: range services first, single-port services second so a
+    specific name (``HTTPS`` = 443) overrides a range catch-all (``Web``
+    = 80-89). Ranges wider than 256 ports are skipped entirely — those
+    are usually "TCP All" / "all-ports" categories that would clobber
+    every well-known port name and reduce signal.
+
+    ``cfg`` is the dict-shaped SMC config the caller already builds for
+    its own routes. Passing it in keeps this helper module-agnostic so
+    callers in different blueprints (engines, scan_history) don't pull
+    each other in.
+    """
+    from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
+    from webapp import smc_client
+
+    if not cfg:
+        return {}
+
+    def _make_fetcher(tk: str):
+        def _f():
+            with smc_client.smc_session(cfg):
+                return smc_client.list_elements(tk)
+        return _f
+
+    elements: list[dict] = []
+    for type_key in ("tcp_services", "udp_services"):
+        try:
+            cv = cache_get_or_fetch(
+                section=f"smc.explorer.{type_key}",
+                key_parts=(domain_id, "", ""),
+                fetcher=_make_fetcher(type_key),
+                ttl=get_quick_ttl(),
+            )
+            elements.extend(cv.data or [])
+        except Exception as exc:
+            log.warning("port_services lookup (%s) failed: %s",
+                        type_key, exc)
+
+    out: dict[int, str] = {}
+    for want_single in (False, True):
+        for elem in elements:
+            name = (elem.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                lo = int(elem.get("min_dst_port") or 0)
+                hi = int(elem.get("max_dst_port") or lo)
+            except (TypeError, ValueError):
+                continue
+            if lo < 1 or hi < lo or hi > 65535:
+                continue
+            is_single = (hi == lo)
+            if is_single != want_single:
+                continue
+            if not is_single and (hi - lo) > 256:
+                continue
+            for port in range(lo, hi + 1):
+                out[port] = name
+    return out
+
+
 def _credentials_for_engine(domain_id: int, engine_name: str) -> dict[int, DhcpEngineCredential]:
     """Map SMC's 1-based ``nodeid`` -> DhcpEngineCredential.
 
@@ -554,6 +624,7 @@ def tools_scan():
     # `|sort` is lexicographic, which puts 192.168.1.69 before
     # 192.168.1.6.
     sorted_ips: list[str] = []
+    port_services_map: dict[int, str] = {}
     if scan_report is not None:
         try:
             sorted_ips = sorted(
@@ -562,12 +633,19 @@ def tools_scan():
             )
         except Exception:
             sorted_ips = sorted(scan_report.results.keys())
+        try:
+            domain_obj = _current_domain()
+            domain_id = domain_obj.id if domain_obj else 0
+            port_services_map = resolve_port_services(domain_id, _user_cfg())
+        except Exception as exc:
+            log.warning("port_services_map build failed: %s", exc)
 
     return render_template(
         "engines/tools_scan.html",
         scan_running=scan_running,
         scan_report=scan_report,
         sorted_ips=sorted_ips,
+        port_services_map=port_services_map,
         inventory=inventory,
         inventory_error=inventory_error,
         inventory_total=inventory_total,

@@ -151,8 +151,21 @@ def detail(scan_id: int):
         flash("Scan not found (or not in your active Domain).", "warning")
         return redirect(url_for("scan_history.history"))
     hosts = service.get_hosts(rec)
+
+    # TODO #2: render port → service-name labels on each open-port badge.
+    # Pulls from the cached SMC tcp/udp_services lists; empty dict on
+    # any failure so the table still renders with bare port numbers.
+    port_services_map: dict[int, str] = {}
+    try:
+        from webapp.engines_manager import resolve_port_services, _user_cfg
+        domain_id = domain.id if domain else 0
+        port_services_map = resolve_port_services(domain_id, _user_cfg())
+    except Exception as exc:
+        log.warning("port_services_map build failed: %s", exc)
+
     return render_template("scan_history/detail.html",
-                           scan=rec, hosts=hosts)
+                           scan=rec, hosts=hosts,
+                           port_services_map=port_services_map)
 
 
 # ── Per-row mutators ────────────────────────────────────────────────────

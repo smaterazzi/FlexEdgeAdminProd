@@ -86,8 +86,8 @@
   <div class="card-header py-2 d-flex justify-content-between align-items-center">
     <span><i class="bi bi-list-ul"></i> Hosts ({{ hosts|length }})</span>
     <input type="text" id="filter" class="form-control form-control-sm"
-           placeholder="filter by IP / hostname / MAC / port…"
-           style="max-width:300px;">
+           placeholder="filter by IP / hostname / MAC / port / service…"
+           style="max-width:340px;">
   </div>
   <div class="table-responsive">
     <table class="table table-sm table-hover mb-0 align-middle">
@@ -103,8 +103,18 @@
       </thead>
       <tbody>
         {% for h in hosts %}
+        {# Build the per-row searchable string: ip, hostname, mac, every
+           open port number, AND the service name for each open port (if
+           the SMC tcp/udp_services lookup matched it). Lowercased so the
+           filter JS can do a single substring test. #}
+        {% set _open_ports_list = (h.open_ports_csv or '').split(',') if h.open_ports_csv else [] %}
+        {% set _service_names = [] %}
+        {% for _p in _open_ports_list %}
+          {% set _name = port_services_map.get(_p|int) %}
+          {% if _name %}{% set _ = _service_names.append(_name) %}{% endif %}
+        {% endfor %}
         <tr class="host-row"
-            data-search="{{ h.ip }} {{ h.hostname }} {{ h.mac }} {{ h.open_ports_csv }}">
+            data-search="{{ (h.ip ~ ' ' ~ (h.hostname or '') ~ ' ' ~ (h.mac or '') ~ ' ' ~ (h.open_ports_csv or '') ~ ' ' ~ _service_names|join(' '))|lower }}">
           <td><code>{{ h.ip }}</code></td>
           <td>
             {% if h.icmp_reply %}
@@ -123,9 +133,13 @@
           </td>
           <td>{{ h.hostname or '—' }}</td>
           <td>
-            {% if h.open_ports_csv %}
-              {% for p in h.open_ports_csv.split(',') %}
-                <span class="badge bg-info text-dark me-1">{{ p }}</span>
+            {% if _open_ports_list %}
+              {% for p in _open_ports_list %}
+                {% set _svc = port_services_map.get(p|int) %}
+                <span class="badge bg-info text-dark me-1"
+                      {% if _svc %}title="{{ _svc }}"{% endif %}>
+                  {{ p }}{% if _svc %} <span class="opacity-75">({{ _svc }})</span>{% endif %}
+                </span>
               {% endfor %}
             {% else %}
               <span class="text-muted">—</span>
