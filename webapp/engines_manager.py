@@ -380,7 +380,7 @@ def cluster_detail(engine_name):
 @admin_required
 def credentials_redirect():
     """Permanent redirect to the canonical DHCP-side credentials page."""
-    return redirect(url_for("dhcp.credentials"), code=302)
+    return redirect(url_for("dhcp.credentials_list"), code=302)
 
 
 @engines_bp.route("/tools")
@@ -940,7 +940,7 @@ def node_terminal(cred_id):
     if cred.last_verify_status != "ok":
         flash("This credential is not verified — re-enroll it before using the terminal.",
               "warning")
-        return redirect(url_for("dhcp.credentials"))
+        return redirect(url_for("dhcp.credentials_list"))
     try:
         ws_path = url_for("engines.node_terminal_ws", cred_id=cred_id)
     except Exception:

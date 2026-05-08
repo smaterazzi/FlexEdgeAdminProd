@@ -146,6 +146,92 @@ def _smc_cfg(tenant_or_domain, api_key: ApiKey | None = None) -> SMCConfig:
     )
 
 
+def _wants_json_response() -> bool:
+    """True for AJAX-style requests — same check used inline by every
+    route that branches on response shape."""
+    return (request.headers.get("X-Requested-With") == "XMLHttpRequest"
+            or "application/json" in (request.headers.get("Accept") or ""))
+
+
+def _check_stale_form_or_response(*, redirect_to: str = "dhcp.credentials_list"):
+    """Stale-form detector for routes that POST legacy ``tenant_id`` /
+    ``api_key_id`` form fields.
+
+    Background — the credentials/scopes templates predate the
+    Multi-Domain Revamp. Their forms still carry ``tenant_id`` and
+    sometimes ``api_key_id`` hidden fields populated at render time.
+    The values are sometimes a real Tenant.id (when sourced from a
+    ``<select>``), sometimes a Domain.id (when the template confused
+    ``tid`` for ``c.domain_id``). Either is fine — for the *current*
+    request — when those form values match the active Domain.
+
+    What's NOT fine: the operator switches Domain in the topbar
+    (``session["active_profile"]`` updates), but a still-mounted DOM
+    in this tab (e.g. the wizard, a modal, or a stale browser history
+    entry) submits an AJAX request whose form still references the
+    OLD Domain's IDs. Pre-Revamp code resolved the form's tenant_id
+    via a sloppy ``Domain.query.join(ApiKey).filter(ApiKey.tenant_id ==
+    form_tid)`` fallback, which by coincidence often picked the *new*
+    session Domain — producing the cryptic "no enrollment record for
+    engine X on domain Y" downstream when the engine actually only
+    exists in the OLD Domain's data.
+
+    This helper detects the stale-form case authoritatively from
+    ``g.domain`` and refuses with a clear "page is out of sync,
+    reload" message. AJAX gets HTTP 409 + JSON; form POSTs get a flash
+    + redirect.
+
+    Returns:
+        ``None`` when the form's IDs are consistent with the active
+        Domain (or when no IDs were sent — route does its own
+        validation). The route then proceeds.
+        A Flask response when stale — caller does ``return resp``.
+    """
+    from flask import g
+    domain = getattr(g, "domain", None)
+    if domain is None or domain.api_key is None:
+        # No active Domain at all — let the route's own no-domain
+        # handling fire (each one has its own copy).
+        return None
+
+    expected_did = domain.id
+    expected_tid = domain.api_key.tenant_id
+    expected_kid = domain.api_key.id
+
+    def _to_int(s):
+        try:
+            return int(s) if s else None
+        except (TypeError, ValueError):
+            return None
+
+    form_tid = _to_int(request.form.get("tenant_id"))
+    form_kid = _to_int(request.form.get("api_key_id"))
+
+    # Templates send `tenant_id` for either Tenant.id OR Domain.id —
+    # both are accepted here. Mismatch in BOTH dimensions = stale.
+    tid_ok = (form_tid is None
+              or form_tid == expected_tid
+              or form_tid == expected_did)
+    kid_ok = (form_kid is None or form_kid == expected_kid)
+    if tid_ok and kid_ok:
+        return None
+
+    msg = ("This page was loaded for a different Domain than the one "
+           "currently active in the topbar. Reload the page and try "
+           "again — the form data references stale context.")
+    if _wants_json_response():
+        return jsonify(
+            ok=False, error=msg, code="stale_form",
+            form_tenant_id=form_tid,
+            form_api_key_id=form_kid,
+            active_domain_id=expected_did,
+            active_tenant_id=expected_tid,
+            active_api_key_id=expected_kid,
+        ), 409
+    flash(msg, "warning")
+    return redirect(url_for(redirect_to))
+
+
 def _scope_or_404(scope_id: int) -> DhcpScope:
     scope = db.session.get(DhcpScope, scope_id)
     if not scope:
@@ -542,6 +628,9 @@ def scopes_list():
 @admin_required
 def scopes_discover():
     """Enumerate DHCP-enabled interfaces on a given engine + upsert them."""
+    stale = _check_stale_form_or_response(redirect_to="dhcp.scopes_list")
+    if stale is not None:
+        return stale
     tenant_id = int(request.form["tenant_id"])
     api_key_id = int(request.form["api_key_id"])
     engine_name = request.form["engine_name"].strip()
@@ -1580,10 +1669,11 @@ def credentials_refresh():
         refresh_engine_state, get_engine_freshness, CACHE_TTL_HOURS,
     )
 
-    wants_json = (
-        request.headers.get("X-Requested-With") == "XMLHttpRequest"
-        or "application/json" in (request.headers.get("Accept") or "")
-    )
+    wants_json = _wants_json_response()
+
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
 
     try:
         tenant_id = int(request.form["tenant_id"])
@@ -1741,6 +1831,9 @@ def credentials_discover_nodes():
     IPs + current SSH-rule state so the operator can pick a destination IP
     and decide whether to install a rule.
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     tenant_id = int(request.form["tenant_id"])
     api_key_id = int(request.form["api_key_id"])
     engine_name = request.form["engine_name"].strip()
@@ -1984,6 +2077,9 @@ def credentials_rule_install():
     `destination_ips`. The rule covers all of them so cluster nodes can be
     enrolled in one batch.
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     tenant_id = int(request.form["tenant_id"])
     api_key_id = int(request.form["api_key_id"])
     engine_name = request.form["engine_name"].strip()
@@ -2140,6 +2236,9 @@ def credentials_policy_install():
       * Refresh-state probe reported the rule as "MISSING in SMC" and
         the operator just re-installed it manually in SMC GUI
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     try:
         tenant_id = int(request.form["tenant_id"])
     except (KeyError, ValueError):
@@ -2295,6 +2394,9 @@ def credentials_rule_source_overwrite():
     the operator wants the rule to allow only the new IP. Old IP is
     no longer accepted on the engine.
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     access, domain, cfg, target_label, err = _resolve_drift_context(request.form)
     if access is None:
         return _rule_action_response(False, err, level="warning", http=400)
@@ -2353,6 +2455,9 @@ def credentials_rule_source_add():
     simultaneously. Operator should later return and run Overwrite to
     drop the obsolete source once the cutover is confirmed.
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     access, domain, cfg, target_label, err = _resolve_drift_context(request.form)
     if access is None:
         return _rule_action_response(False, err, level="warning", http=400)
@@ -2410,6 +2515,9 @@ def credentials_rule_remove():
     Refuses if any credentials still reference this engine. The auto-cleanup
     on last-credential-deletion path is in `credentials_delete`.
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     tenant_id = int(request.form["tenant_id"])
     engine_name = request.form["engine_name"].strip()
     # Phase B.3: feature tables are domain-scoped; resolve via tenant's domains.
@@ -2516,6 +2624,9 @@ def credentials_bootstrap():
        5. Verify with the captured fingerprint pinned
        6. Persist the credential (password Fernet-encrypted)
     """
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
     tenant_id = int(request.form["tenant_id"])
     api_key_id = int(request.form["api_key_id"])
     engine_name = request.form["engine_name"].strip()
@@ -2642,10 +2753,11 @@ def credentials_apply():
     explicitly choose 'Overwrite credential' (which rotates the
     password via SMC).
     """
-    wants_json = (
-        request.headers.get("X-Requested-With") == "XMLHttpRequest"
-        or "application/json" in (request.headers.get("Accept") or "")
-    )
+    wants_json = _wants_json_response()
+
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
 
     def _err(msg, http=400):
         if wants_json:
@@ -2765,10 +2877,11 @@ def credentials_bootstrap_batch():
     The whole batch runs inside ONE smc_session and ONE per-engine lock
     acquisition — significantly faster than N sequential single-node calls.
     """
-    wants_json = (
-        request.headers.get("X-Requested-With") == "XMLHttpRequest"
-        or "application/json" in (request.headers.get("Accept") or "")
-    )
+    wants_json = _wants_json_response()
+
+    stale = _check_stale_form_or_response()
+    if stale is not None:
+        return stale
 
     def _err(msg: str, http: int = 400):
         if wants_json:

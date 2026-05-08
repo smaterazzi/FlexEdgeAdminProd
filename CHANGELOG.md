@@ -6,6 +6,71 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Fix: BuildError on Tools/Scan + 5 other broken `dhcp.credentials` refs (2026-05-08)
+
+The credentials route is `dhcp.credentials_list`, not `dhcp.credentials`.
+Six call sites used the wrong endpoint name and would raise
+`werkzeug.routing.BuildError` whenever the `url_for` evaluated:
+
+- `webapp/templates/engines/tools_scan.html` — two banners I added today
+  for credential-gating; pages crashed when the inventory was filtered
+  to zero or any clusters were hidden.
+- `webapp/templates/dhcp/scopes.html` — two banners I added today for
+  the same reason.
+- `webapp/engines_manager.py` — pre-existing breakage in
+  `/engines/credentials` redirect (line 383) and the terminal route's
+  unverified-credential redirect (line 943). Both unreachable from
+  the happy path so they hadn't surfaced before.
+
+All six fixed to `dhcp.credentials_list`.
+
+### Stale-form detection for DHCP + Credentials POSTs (2026-05-08)
+
+TODO-item-3 — fixes the cryptic "Refresh failed: no enrollment record
+for engine 'X' on domain 'Y'" error users hit after switching the
+topbar Domain selector.
+
+**Root cause.** Many `/dhcp/credentials/*` and `/dhcp/scopes/discover`
+routes still POST a legacy `tenant_id` (and sometimes `api_key_id`)
+hidden field that's baked into the page HTML at render time. After
+the operator switches Domain in the topbar, any AJAX form still in
+the DOM (wizard buttons, refresh-state, modals) submits with the OLD
+context. The pre-Multi-Domain-Revamp resolution path
+(`Domain.query.join(ApiKey).filter(ApiKey.tenant_id == form_tid)`)
+sometimes coincidentally resolved to the *new* session Domain,
+producing the unhelpful "no enrollment record for X on Y" downstream
+when the engine actually only existed in the OLD Domain's data.
+
+**Fix.** New helper `_check_stale_form_or_response()` in
+[webapp/dhcp_manager.py](webapp/dhcp_manager.py) compares the form's
+`tenant_id` / `api_key_id` against `g.domain.id`,
+`g.domain.api_key.tenant_id`, and `g.domain.api_key.id`
+(authoritative). On mismatch, refuses with a clear message —
+HTTP 409 + JSON for AJAX (`code: stale_form`), flash + redirect for
+form POSTs:
+
+> This page was loaded for a different Domain than the one currently
+> active in the topbar. Reload the page and try again — the form
+> data references stale context.
+
+Applied at the entry of every form-tenant_id route (11 sites): scope
+discover; credentials refresh / discover-nodes / rule install /
+policy install / rule remove; drift recovery overwrite / add; per-node
+bootstrap / force-reset / bulk-bootstrap. Form fields stay (existing
+downstream code reads them); the helper is a guard that fires before
+domain mis-resolution can happen.
+
+The detection is permissive on the form value's *name* — templates
+sometimes send `tenant_id` carrying a real `Tenant.id`, sometimes
+carrying a `Domain.id` (the credentials.html template historically
+conflated `tid` with `c.domain_id`). Both interpretations are
+accepted as valid when they match the active session; only when
+*neither* matches do we flag stale.
+
+Operator-visible improvement: instead of being told an engine doesn't
+exist when it visibly does on screen, they now get a clear "your page
+is out of sync, reload" message that points at the actual cause.
+
 ### Credential-gated visibility across DHCP and Tools/Scan (2026-05-08)
 
 TODO-item-1 — operator-facing pages now hide engines/scopes that have

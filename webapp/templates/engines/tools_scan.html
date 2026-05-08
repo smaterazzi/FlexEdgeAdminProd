@@ -193,7 +193,7 @@
     <strong>{{ inventory_hidden }}</strong> cluster(s) hidden from this picker
     because they have no fully-verified SSH credentials in this Domain. The
     scan tool runs from inside a node and needs SSH to do its work. Visit
-    <a href="{{ url_for('dhcp.credentials') }}">Credentials</a> to enroll.
+    <a href="{{ url_for('dhcp.credentials_list') }}">Credentials</a> to enroll.
   </div>
 </div>
 {% elif inventory_total == 0 and not inventory_error %}
@@ -206,7 +206,7 @@
   <i class="bi bi-exclamation-triangle"></i>
   All {{ inventory_total }} cluster(s) are hidden — none have fully-verified
   SSH credentials in this Domain. Enroll a cluster's nodes in
-  <a href="{{ url_for('dhcp.credentials') }}">Credentials</a> to use the
+  <a href="{{ url_for('dhcp.credentials_list') }}">Credentials</a> to use the
   scan tool.
 </div>
 {% endif %}
