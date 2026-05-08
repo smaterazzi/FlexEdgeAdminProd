@@ -126,7 +126,10 @@
         </tr>
       </thead>
       <tbody>
-        {% set sorted_ips = scan_report.results.keys() | sort %}
+        {# `sorted_ips` is precomputed server-side as a numeric octet-tuple
+           sort — matches the DHCP leases view criterion so 192.168.1.6
+           lands before 192.168.1.69 (Jinja's default `|sort` is
+           lexicographic and got that wrong). #}
         {% for ip in sorted_ips %}
         {% set r = scan_report.results[ip] %}
         {% set has_open = r.open_ports|length > 0 %}

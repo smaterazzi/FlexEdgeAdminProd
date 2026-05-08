@@ -458,10 +458,25 @@ def tools_scan():
             inventory_error = str(exc)
             log.warning("tools_scan: cluster list failed: %s", exc)
 
+    # Server-side numeric IP sort for the result table — same criterion
+    # as the DHCP leases view (tuple-of-octet-ints). Jinja's default
+    # `|sort` is lexicographic, which puts 192.168.1.69 before
+    # 192.168.1.6.
+    sorted_ips: list[str] = []
+    if scan_report is not None:
+        try:
+            sorted_ips = sorted(
+                scan_report.results.keys(),
+                key=lambda ip: tuple(int(p) for p in ip.split(".")),
+            )
+        except Exception:
+            sorted_ips = sorted(scan_report.results.keys())
+
     return render_template(
         "engines/tools_scan.html",
         scan_running=scan_running,
         scan_report=scan_report,
+        sorted_ips=sorted_ips,
         inventory=inventory,
         inventory_error=inventory_error,
         default_ports=",".join(str(p) for p in DEFAULT_PORTS),
