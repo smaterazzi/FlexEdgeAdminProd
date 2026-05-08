@@ -114,6 +114,62 @@ def _handle_csrf_error(e):
     flash("Your form session expired or was tampered with. Please retry.", "danger")
     return redirect(request.referrer or url_for("index")), 303
 
+
+def _is_ajax_request() -> bool:
+    """True when the caller looks like an XHR / fetch JSON consumer.
+
+    Two signals: the standard ``X-Requested-With`` header set by our
+    `fexFetch` wrapper and other XHR libs, OR an ``Accept`` header that
+    explicitly asks for JSON. Either alone is enough.
+    """
+    if request.headers.get("X-Requested-With") == "XMLHttpRequest":
+        return True
+    accept = request.headers.get("Accept") or ""
+    return "application/json" in accept
+
+
+@app.errorhandler(Exception)
+def _handle_uncaught_exception(e):
+    """Generic last-resort error handler.
+
+    Without this, an uncaught Python exception inside any route returns
+    Flask's default HTML 500 page. AJAX callers then crash trying to
+    parse `<!doctype html>` as JSON ("Unexpected token '<'..." in the
+    browser console). Per-route try/excepts catch business errors but
+    can't catch a SQLAlchemy disconnect, a paramiko hiccup, etc. —
+    those bubble up here.
+
+    For AJAX requests we always return JSON with the error class +
+    message. For HTML page navigation we re-raise so Flask's normal
+    error rendering still produces a readable HTML page.
+    """
+    from werkzeug.exceptions import HTTPException
+    is_http_exc = isinstance(e, HTTPException)
+    code = e.code if is_http_exc and e.code else 500
+
+    if not _is_ajax_request():
+        # Let Flask handle the HTML rendering. Re-raise rather than
+        # suppress — non-AJAX users should still see the dev/prod
+        # error page they expect.
+        if is_http_exc:
+            return e
+        raise e
+
+    # AJAX path — keep the response JSON-shaped so `await r.json()` on
+    # the client side never trips over `<!doctype`. Truncate the
+    # error message defensively (some libraries throw very long ones).
+    if is_http_exc:
+        log.warning("AJAX %d on %s %s: %s",
+                    code, request.method, request.path, e.description)
+        return jsonify(error=e.description or str(e), code=code), code
+
+    log.exception("AJAX uncaught exception on %s %s",
+                  request.method, request.path)
+    return jsonify(
+        error=f"{type(e).__name__}: {str(e)[:500]}",
+        code=500,
+    ), 500
+
 # ── Logging ──────────────────────────────────────────────────────────────
 
 logging.basicConfig(
