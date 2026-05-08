@@ -294,7 +294,16 @@ def deploy_form():
     # TLSDeployment row gets stamped with the active Domain on submit.
     certificates = (ManagedCertificate.query
                     .order_by(ManagedCertificate.domain.asc()).all())
-    tenants = Tenant.query.filter_by(is_active=True).order_by(Tenant.name).all()
+    # Domain-Scoping: only the active Domain's bound Tenant in the
+    # picker. Operator never sees another Domain's Tenant here.
+    domain = getattr(g, "domain", None)
+    bound_tenant_id = (domain.api_key.tenant_id
+                       if domain is not None and domain.api_key is not None
+                       else None)
+    tenants = ([] if bound_tenant_id is None
+               else Tenant.query
+                          .filter_by(id=bound_tenant_id, is_active=True)
+                          .all())
     return render_template(
         "tls/deploy.html", certificates=certificates, tenants=tenants,
     )

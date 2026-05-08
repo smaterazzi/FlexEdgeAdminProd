@@ -480,7 +480,17 @@ def scopes_list():
         scopes = (DhcpScope.query
                   .filter_by(domain_id=domain_id)
                   .order_by(DhcpScope.engine_name, DhcpScope.interface_id).all())
-    tenants = Tenant.query.filter_by(is_active=True).order_by(Tenant.name).all()
+    # Domain-Scoping: only the active Domain's bound Tenant — never a
+    # full Tenant list. The operator should never see another Domain's
+    # infrastructure surfaced here.
+    domain_obj = getattr(g, "domain", None)
+    bound_tenant_id = (domain_obj.api_key.tenant_id
+                       if domain_obj is not None and domain_obj.api_key is not None
+                       else None)
+    tenants = ([] if bound_tenant_id is None
+               else Tenant.query
+                          .filter_by(id=bound_tenant_id, is_active=True)
+                          .all())
     return render_template("dhcp/scopes.html", scopes=scopes, tenants=tenants)
 
 
@@ -1443,7 +1453,23 @@ def credentials_list():
         accesses = (DhcpEngineSshAccess.query
                     .filter_by(domain_id=domain_id)
                     .order_by(DhcpEngineSshAccess.engine_name).all())
-    tenants = Tenant.query.filter_by(is_active=True).order_by(Tenant.name).all()
+    # Domain-Scoping fix: the credentials wizard only ever needs the ONE
+    # Tenant bound to the active Domain's API key — the dropdown that
+    # used to list every Tenant in the deployment was a leak of other
+    # Domains' infrastructure into this view. Narrow to that one row;
+    # the template's existing `{% for t in tenants %}` loops then
+    # render exactly one option, the cascade auto-selects it, and
+    # cross-Domain pivoting via this picker is impossible.
+    domain_obj = getattr(g, "domain", None)
+    bound_tenant_id = (domain_obj.api_key.tenant_id
+                       if domain_obj is not None and domain_obj.api_key is not None
+                       else None)
+    if bound_tenant_id is None:
+        tenants = []
+    else:
+        tenants = (Tenant.query
+                   .filter_by(id=bound_tenant_id, is_active=True)
+                   .all())
     tenants_by_id = {t.id: t for t in tenants}
     # Phase B.3: group credentials by (domain_id, engine) — the canonical
     # scope FK on every feature row.
