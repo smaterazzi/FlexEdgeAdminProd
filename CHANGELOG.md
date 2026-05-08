@@ -6,6 +6,51 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: verbose-log toggle for live troubleshooting (2026-05-08)
+
+When a scan looks empty (the "I see only ICMP, no SYN" symptom
+that uncovered the BusyBox issues earlier today), operators
+need to confirm which commands are actually firing on the
+engine. New picker checkbox surfaces that:
+
+> ☐ Verbose log — show every `busybox ping / arping / nc /
+> nslookup` command in the live watcher (slower; useful for
+> troubleshooting why a scan looks empty).
+
+When ticked, the [scan script](webapp/engine_scan.py) emits
+one extra `EXEC <command>` line BEFORE each network command
+runs. Per Phase:
+
+- Phase 1: `EXEC busybox ping -c 1 -W 1 -q 172.21.20.10`
+- Phase 2: `EXEC busybox arping -c 1 -w 1 -I eth0 172.21.20.10`
+- Phase 3: `EXEC busybox timeout 2 busybox nc 172.21.20.10 443`
+- Phase 4: `EXEC busybox nslookup 172.21.20.10`
+
+The Python parser
+([webapp/engine_scan.py](webapp/engine_scan.py) `_run_scan`)
+recognizes the `EXEC` tag at the front of the line and routes
+it to a new `{tag: "EXEC", command: "…"}` event. The job
+runner
+([webapp/engine_scan_jobs.py](webapp/engine_scan_jobs.py)
+`_on_event`) appends each as `$ <command>` into the
+`log_tail` deque the watcher already polls. Operators see
+the most recent ~10 commands streaming live in the dark
+console block at the bottom of the watcher card.
+
+Off by default — verbose mode multiplies stdout volume by
+2-3× for big scans (one extra line per command per
+ip-port). Stays clean for normal use, flips on cleanly when
+something looks broken.
+
+The verbose flag is per-scan (form POST), not a stored
+setting. Plumbed end-to-end:
+[tools_scan.html](webapp/templates/engines/tools_scan.html)
+checkbox → `tools_scan_start` route reads
+`request.form.get("verbose") == "1"` → `start_scan(...,
+verbose=verbose)` → `_run_scan(..., verbose=verbose)` →
+`$VERBOSE=1` shell script arg. The audit row
+(`engines.scan_started`) records `verbose=1|0` for traceability.
+
 ### Engines → Tools → Scan: service-friendly chip picker + coherent result chips (2026-05-08)
 
 The TCP-ports input in the scan picker was a plain comma-list text

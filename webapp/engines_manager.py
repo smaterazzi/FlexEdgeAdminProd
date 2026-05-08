@@ -778,6 +778,7 @@ def tools_scan_start():
     ports_raw = (request.form.get("ports") or "").strip()
     skip_port_scan = request.form.get("skip_port_scan") == "1"
     accept_warning = request.form.get("accept_warning") == "1"
+    verbose = request.form.get("verbose") == "1"
 
     if not engine_name or not node_index_raw or not iface_id:
         flash("Pick a cluster, node, and interface first.", "warning")
@@ -919,11 +920,13 @@ def tools_scan_start():
         source_iface_id=iface_id,
         source_iface_name=iface_label,
         target_label=target_label,
+        verbose=verbose,
     )
     _log_activity_engines(
         "scan", "scan_started", "ok", target_label,
         f"mode={target_mode} ip_list_size={len(ip_list)} "
-        f"ports={len(ports)} scan_id={scan_id[:8]}",
+        f"ports={len(ports)} verbose={int(verbose)} "
+        f"scan_id={scan_id[:8]}",
     )
     return redirect(url_for("engines.tools_scan", scan_id=scan_id))
 

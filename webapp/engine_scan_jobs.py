@@ -35,7 +35,8 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
                arping_timeout_s: int = 1,
                port_timeout_s: int = 2,
                dns_timeout_s: int = 2,
-               exec_timeout_s: int = 900) -> str:
+               exec_timeout_s: int = 900,
+               verbose: bool = False) -> str:
     """Kick off an engine-scan job in a daemon thread. Returns the scan_id.
 
     Total ops budget: ICMP pass (= len(ip_list)) + arping fallback (a
@@ -64,8 +65,18 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
     results: dict[str, HostResult] = {}
 
     def _on_event(ev: dict) -> None:
-        ip = ev.get("ip", "")
         tag = ev.get("tag", "")
+
+        # Verbose-mode trace: shell script emits one EXEC <command…>
+        # line BEFORE each network command runs. Surface it in the
+        # watcher's live log so the operator can confirm what's
+        # actually executing on the engine.
+        if tag == "EXEC":
+            cmd = ev.get("command") or ""
+            scan_jobs.append_log(scan_id, f"$ {cmd}")
+            return
+
+        ip = ev.get("ip", "")
         r = results.get(ip) or HostResult(ip=ip)
         if tag == "ICMP_OK":
             if not r.icmp_reply:
@@ -120,6 +131,7 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
             port_timeout_s=port_timeout_s,
             dns_timeout_s=dns_timeout_s,
             exec_timeout_s=exec_timeout_s,
+            verbose=verbose,
             on_event=_on_event,
         )
         started_at = scan_jobs.get_started_at(scan_id)

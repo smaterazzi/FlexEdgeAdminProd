@@ -175,7 +175,7 @@ def parse_port_list(raw: str) -> list[int]:
 # Shell builtins (printf, echo, [, read, set, wait, for, :) do NOT
 # need the prefix — ash handles those directly.
 _SCAN_SCRIPT = r"""
-BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; shift 6
+BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; VERBOSE=$7; shift 7
 TMP=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
 REACHABLE=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 : > "$TMP"
@@ -185,6 +185,7 @@ REACHABLE=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 n=0
 for ip in "$@"; do
     (
+        [ "$VERBOSE" = "1" ] && printf 'EXEC busybox ping -c 1 -W %s -q %s\n' "$PT" "$ip"
         if busybox ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
             NEIGH=$(busybox ip neighbor show "$ip" 2>/dev/null | busybox head -1)
             MAC=$(printf '%s\n' "$NEIGH" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
@@ -215,6 +216,7 @@ while IFS= read -r line; do
             printf '%s NO_ROUTE\n' "$ip"
             continue
         fi
+        [ "$VERBOSE" = "1" ] && printf 'EXEC busybox arping -c 1 -w %s -I %s %s\n' "$AT" "$DEV" "$ip"
         OUT=$(busybox arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
         MAC=$(printf '%s\n' "$OUT" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
         if [ -n "$MAC" ]; then
@@ -251,6 +253,7 @@ if [ -n "$PORTS" ]; then
     for ip in "$@"; do
         for port in $(printf '%s' "$PORTS" | busybox tr ',' ' '); do
             (
+                [ "$VERBOSE" = "1" ] && printf 'EXEC busybox timeout %s busybox nc %s %s\n' "$CT" "$ip" "$port"
                 if busybox timeout "$CT" busybox nc "$ip" "$port" < /dev/null > /dev/null 2>&1; then
                     printf '%s PORT %s open\n' "$ip" "$port"
                 else
@@ -270,6 +273,7 @@ if [ -s "$REACHABLE" ]; then
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         (
+            [ "$VERBOSE" = "1" ] && printf 'EXEC busybox nslookup %s\n' "$ip"
             HN=$(busybox nslookup "$ip" 2>/dev/null | busybox awk -F'= ' '/name = / {print $2; exit}' | busybox sed 's/\.$//')
             if [ -n "$HN" ]; then
                 printf '%s HOST %s\n' "$ip" "$HN"
@@ -299,18 +303,27 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
               port_timeout_s: int = 2,
               dns_timeout_s: int = 2,
               exec_timeout_s: int = 900,
+              verbose: bool = False,
               on_event: Optional[EventCallback] = None,
               ) -> tuple[dict[str, HostResult], dict, str]:
     """Open SSH, run the scan script, parse stdout line-by-line.
 
     Returns (results, summary_counters, error_text). On error `results`
     may be partial. Caller wraps in EngineScanReport.
+
+    ``verbose=True`` flips on a $VERBOSE=1 flag in the shell script:
+    every network command (ping / arping / nc / nslookup) emits an
+    extra ``EXEC <command>`` line BEFORE the command runs, which
+    surfaces in the watcher's live log so an operator can confirm
+    the script reached each phase. Off by default — verbose mode
+    multiplies stdout volume by 2-3× for big scans.
     """
     cmd_parts = ["sh", "-c", _SCAN_SCRIPT, "_",
                  str(batch_size),
                  str(ping_timeout_s), str(arping_timeout_s),
                  str(port_timeout_s), str(dns_timeout_s),
-                 ",".join(str(p) for p in ports)]
+                 ",".join(str(p) for p in ports),
+                 "1" if verbose else "0"]
     cmd_parts.extend(ip_list)
     cmd = " ".join(shlex.quote(p) for p in cmd_parts)
 
@@ -331,6 +344,20 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
             parts = raw.strip().split()
             if not parts:
                 continue
+
+            # Verbose-mode trace: shell script emits one
+            # ``EXEC <command…>`` line BEFORE each network command in
+            # verbose mode. Route as a log event without touching the
+            # results dict — it's not tied to a specific IP.
+            if parts[0] == "EXEC":
+                if on_event is not None:
+                    try:
+                        on_event({"tag": "EXEC",
+                                  "command": " ".join(parts[1:])})
+                    except Exception:
+                        log.exception("on_event callback raised — ignored")
+                continue
+
             ip = parts[0]
             tag = parts[1] if len(parts) > 1 else "SILENT"
             r = results.get(ip) or HostResult(ip=ip)
@@ -405,6 +432,7 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
          port_timeout_s: int = 2,
          dns_timeout_s: int = 2,
          exec_timeout_s: int = 900,
+         verbose: bool = False,
          on_event: Optional[EventCallback] = None,
          ) -> EngineScanReport:
     """Synchronous engine-side scan. Returns an EngineScanReport.
@@ -452,6 +480,7 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
         port_timeout_s=port_timeout_s,
         dns_timeout_s=dns_timeout_s,
         exec_timeout_s=exec_timeout_s,
+        verbose=verbose,
         on_event=on_event,
     )
     report.results = results
