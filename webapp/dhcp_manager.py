@@ -3053,6 +3053,57 @@ def credentials_delete(cred_id):
 LEASE_FILE = "/spool/dhcp-server/dhcpd.leases"
 
 
+def _other_domains_with_creds(engine_name: str,
+                              *, exclude_domain_id: int) -> list:
+    """Find other Domains (the current user can access) that have
+    SSH credentials for ``engine_name``.
+
+    Returns a list of dicts ``{slug, display_name, node_count}``,
+    sorted by display_name. Empty list when no match or session has
+    no user. Restricted to Domains the operator actually has access
+    to via `get_user_profiles` so we don't leak info about Domains
+    they can't switch to anyway.
+    """
+    try:
+        email = (session.get("user") or {}).get("email") or ""
+        if not email:
+            return []
+        import user_manager
+        profiles = user_manager.get_user_profiles(email) or []
+        accessible_slugs = {(p.get("tenant") or "").strip()
+                            for p in profiles
+                            if p.get("tenant")}
+        if not accessible_slugs:
+            return []
+
+        rows = (
+            db.session.query(
+                Domain.id, Domain.slug, Domain.display_name,
+                db.func.count(DhcpEngineCredential.id),
+            )
+            .join(DhcpEngineCredential,
+                  DhcpEngineCredential.domain_id == Domain.id)
+            .filter(
+                DhcpEngineCredential.engine_name == engine_name,
+                Domain.id != exclude_domain_id,
+                Domain.slug.in_(accessible_slugs),
+                Domain.is_active.is_(True),
+            )
+            .group_by(Domain.id, Domain.slug, Domain.display_name)
+            .order_by(Domain.display_name.asc())
+            .all()
+        )
+        return [
+            {"id": r[0], "slug": r[1],
+             "display_name": r[2], "node_count": int(r[3] or 0)}
+            for r in rows
+        ]
+    except Exception as exc:
+        log.warning("other_domains_with_creds(%s): lookup failed: %s",
+                    engine_name, exc)
+        return []
+
+
 @dhcp_bp.route("/scopes/<int:scope_id>/leases")
 @admin_required
 def scope_leases(scope_id):
@@ -3120,11 +3171,16 @@ def scope_leases(scope_id):
     # button). The template's `creds_missing` block surfaces an inline
     # alert with a "Enroll credentials" button.
     #
-    # Cross-Domain diagnostic: if the operator is sure they enrolled
-    # credentials for this engine, they may have been enrolled under a
-    # different Domain (legacy data from before the Multi-Domain
-    # Revamp). The empty-state alert mentions the active Domain so a
-    # mismatch becomes visible at a glance.
+    # Cross-Domain diagnostic: same engine name can be reachable under
+    # multiple Domains (multiple API keys hitting the same SMC). Tell
+    # the operator exactly which OTHER Domain has credentials for this
+    # engine and offer a one-click switch — restricted to Domains the
+    # operator actually has access to so we don't leak info.
+    other_domain_creds = []
+    if creds_missing:
+        other_domain_creds = _other_domains_with_creds(
+            scope.engine_name, exclude_domain_id=scope.domain_id,
+        )
 
     reservations = (DhcpReservation.query.filter_by(scope_id=scope.id).all())
     res_by_mac = {r.mac_address: r for r in reservations}
@@ -3155,6 +3211,7 @@ def scope_leases(scope_id):
             untracked_rows=[],
             subnet_size=subnet_size_running,
             creds_missing=creds_missing,
+            other_domain_creds=other_domain_creds,
         )
 
     per_node_results: dict[int, list] = {}
@@ -3342,6 +3399,7 @@ def scope_leases(scope_id):
         untracked_rows=untracked_rows,
         subnet_size=subnet_size,
         creds_missing=creds_missing,
+        other_domain_creds=other_domain_creds,
     )
 
 

@@ -67,10 +67,35 @@
       ({{ g.domain.display_name if g.domain else '—' }})</strong> for this
       engine.
     </div>
+    {% if other_domain_creds %}
+    <div class="small mt-2">
+      <i class="bi bi-info-circle me-1"></i>
+      Credentials for <code>{{ scope.engine_name }}</code> exist in
+      {% if other_domain_creds|length == 1 %}another Domain you can access:
+      {% else %}other Domains you can access:
+      {% endif %}
+      <div class="mt-1 d-flex flex-wrap gap-2">
+        {% for d in other_domain_creds %}
+        <form method="post" action="{{ url_for('switch_domain') }}"
+              class="d-inline">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="slug" value="{{ d.slug }}">
+          <button type="submit" class="btn btn-sm btn-outline-warning">
+            <i class="bi bi-arrow-left-right"></i>
+            Switch to <strong>{{ d.display_name }}</strong>
+            <span class="text-muted">({{ d.node_count }}
+              node{{ '' if d.node_count == 1 else 's' }})</span>
+          </button>
+        </form>
+        {% endfor %}
+      </div>
+    </div>
+    {% else %}
     <div class="small mt-1 text-muted">
       If you've enrolled credentials before, they may be tied to a different
       Domain — switch Domains in the topbar to verify, or re-enroll here.
     </div>
+    {% endif %}
   </div>
   <a href="{{ url_for('dhcp.credentials_list') }}"
      class="btn btn-warning btn-sm align-self-center text-nowrap">
