@@ -18,9 +18,16 @@
                 · {{ detail.nodes|length }} node(s)
             </div>
         </div>
-        <a href="{{ url_for('engines.clusters') }}" class="btn btn-sm btn-outline-secondary">
-            <i class="bi bi-arrow-left"></i> Back
-        </a>
+        <div class="d-flex gap-2">
+            <a href="{{ url_for('engines.sginfo_history', engine=detail.name) }}"
+               class="btn btn-sm btn-outline-info"
+               title="Past sginfo collections for this engine">
+                <i class="bi bi-clipboard-data"></i> sgInfo history
+            </a>
+            <a href="{{ url_for('engines.clusters') }}" class="btn btn-sm btn-outline-secondary">
+                <i class="bi bi-arrow-left"></i> Back
+            </a>
+        </div>
     </div>
 
     {% if detail.errors %}
@@ -92,11 +99,16 @@
                             <th>Status</th>
                             <th>Interfaces</th>
                             <th class="text-end" style="width:6rem;">Terminal</th>
+                            <th class="text-end" style="width:9rem;">Diagnostics</th>
                         </tr>
                     </thead>
                     <tbody>
                         {% for n in detail.nodes %}
                         {% set cred = creds_by_node.get(n.nodeid) %}
+                        {# Map SMC's 1-based nodeid → engine.nodes[i] index
+                           the SDK uses (0-based). Our sginfo route hits
+                           that 0-based index. #}
+                        {% set zero_based_idx = (n.nodeid|int) - 1 if n.nodeid else loop.index0 %}
                         <tr>
                             <td><code>{{ n.nodeid }}</code></td>
                             <td><strong>{{ n.name }}</strong></td>
@@ -147,6 +159,73 @@
                                     <i class="bi bi-terminal"></i>
                                 </button>
                                 {% endif %}
+                            </td>
+                            <td class="text-end">
+                                <button type="button" class="btn btn-sm btn-outline-info"
+                                        data-bs-toggle="modal"
+                                        data-bs-target="#sginfoModal-{{ zero_based_idx }}"
+                                        title="Collect sginfo from this node — works through the SMC management channel even when the node is behind a firewall / uses node-initiated contact.">
+                                    <i class="bi bi-clipboard-data"></i> Collect
+                                </button>
+                                <div class="modal fade" id="sginfoModal-{{ zero_based_idx }}"
+                                     tabindex="-1" aria-hidden="true">
+                                  <div class="modal-dialog">
+                                    <form method="post"
+                                          action="{{ url_for('engines.sginfo_collect', engine_name=detail.name) }}">
+                                      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                      <input type="hidden" name="node_index" value="{{ zero_based_idx }}">
+                                      <input type="hidden" name="node_name" value="{{ n.name }}">
+                                      <div class="modal-content text-start">
+                                        <div class="modal-header">
+                                          <h5 class="modal-title">
+                                            <i class="bi bi-clipboard-data"></i>
+                                            Collect sginfo
+                                          </h5>
+                                          <button type="button" class="btn-close"
+                                                  data-bs-dismiss="modal"></button>
+                                        </div>
+                                        <div class="modal-body small">
+                                          <p>
+                                            Run <code>sginfo</code> on
+                                            <strong>{{ detail.name }}</strong> node {{ n.nodeid }}
+                                            (<code>{{ n.name }}</code>). The engine collects its
+                                            configs, recent logs, and system state into a gzipped
+                                            tar archive and ships it back over the SMC management
+                                            channel. Typical run is 15–60&nbsp;s.
+                                          </p>
+                                          <div class="form-check mb-2">
+                                            <input class="form-check-input" type="checkbox"
+                                                   id="incCore-{{ zero_based_idx }}"
+                                                   name="include_core_files">
+                                            <label class="form-check-label"
+                                                   for="incCore-{{ zero_based_idx }}">
+                                              Include core files
+                                              <span class="text-muted">— bigger, slower; only
+                                              needed when handing the bundle to Forcepoint Support.</span>
+                                            </label>
+                                          </div>
+                                          <div class="form-check">
+                                            <input class="form-check-input" type="checkbox"
+                                                   id="incSlap-{{ zero_based_idx }}"
+                                                   name="include_slapcat_output">
+                                            <label class="form-check-label"
+                                                   for="incSlap-{{ zero_based_idx }}">
+                                              Include slapcat output
+                                              <span class="text-muted">— LDAP user database dump.</span>
+                                            </label>
+                                          </div>
+                                        </div>
+                                        <div class="modal-footer">
+                                          <button type="button" class="btn btn-sm btn-outline-secondary"
+                                                  data-bs-dismiss="modal">Cancel</button>
+                                          <button type="submit" class="btn btn-sm btn-info">
+                                            <i class="bi bi-play-fill"></i> Start collection
+                                          </button>
+                                        </div>
+                                      </div>
+                                    </form>
+                                  </div>
+                                </div>
                             </td>
                         </tr>
                         {% endfor %}

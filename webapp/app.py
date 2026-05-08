@@ -209,6 +209,7 @@ register_feature("auth",      "Authentication")
 register_feature("changes",   "Change Management")
 register_feature("system",    "System")
 register_feature("engine_scan_history", "Engine Scan History")
+register_feature("engine_sginfo", "Engine sgInfo")
 
 # ── Auth ─────────────────────────────────────────────────────────────────
 

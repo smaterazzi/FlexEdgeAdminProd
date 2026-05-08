@@ -24,12 +24,12 @@ from functools import wraps
 
 from flask import (
     Blueprint, render_template, redirect, url_for,
-    flash, session, request, jsonify,
+    flash, session, request, jsonify, Response, send_file, abort,
 )
 
 from shared.db import db
 from webapp.models import (
-    ApiKey, DhcpEngineCredential, Tenant,
+    ApiKey, DhcpEngineCredential, EngineSginfoCollection, Tenant,
 )
 import engine_inquiry
 
@@ -925,6 +925,258 @@ def node_terminal(cred_id):
         "engines/terminal.html",
         cred=cred,
         ws_path=ws_path,
+    )
+
+
+# ── sgInfo (on-demand engine diagnostics) ───────────────────────────────
+#
+# Per-node "Collect sginfo" button on the cluster_detail page. Clicking
+# kicks off a background SMC API call (`node.sginfo()` over the
+# management channel — works for node-initiated-contact engines), saves
+# the gzipped tar to /config/sginfo/<id>/, and renders a viewer that
+# lets the operator browse the archive's members + view individual
+# text files in-browser.
+
+def _record_or_404(record_id: int) -> EngineSginfoCollection:
+    rec = db.session.get(EngineSginfoCollection, record_id)
+    if rec is None:
+        abort(404)
+    domain = _current_domain()
+    if domain is None or rec.domain_id != domain.id:
+        # Don't leak existence across Domains.
+        abort(404)
+    return rec
+
+
+@engines_bp.route("/clusters/<path:engine_name>/sginfo", methods=["POST"])
+@profile_required_admin
+def sginfo_collect(engine_name):
+    """Kick off a sginfo collection for one node of an engine.
+
+    Form fields:
+        node_index               (int, required)  — engine.nodes[i] index
+        node_name                (str, optional)  — display label
+        include_core_files       ('on' / missing) — pass-through to SMC
+        include_slapcat_output   ('on' / missing) — pass-through to SMC
+
+    Returns a redirect to the watcher view. The actual SMC call runs
+    in a daemon thread so the request returns immediately.
+    """
+    domain = _current_domain()
+    if domain is None:
+        flash("Pick a Domain first.", "warning")
+        return redirect(url_for("engines.cluster_detail",
+                                engine_name=engine_name))
+
+    try:
+        node_index = int(request.form.get("node_index", "").strip())
+    except ValueError:
+        flash("Bad form: node_index must be an integer.", "danger")
+        return redirect(url_for("engines.cluster_detail",
+                                engine_name=engine_name))
+
+    node_name = (request.form.get("node_name") or "").strip()
+    include_core = request.form.get("include_core_files") == "on"
+    include_slap = request.form.get("include_slapcat_output") == "on"
+
+    user_id = None
+    user_email = ""
+    try:
+        from webapp.models import User
+        info = session.get("user") or {}
+        user_email = (info.get("email") or "").strip().lower()
+        if user_email:
+            u = User.query.filter_by(email=user_email).first()
+            user_id = u.id if u else None
+    except Exception:
+        pass
+
+    from webapp import engine_sginfo
+    try:
+        result = engine_sginfo.start_collection(
+            domain=domain,
+            engine_name=engine_name,
+            node_index=node_index,
+            node_name=node_name,
+            include_core_files=include_core,
+            include_slapcat_output=include_slap,
+            user_id=user_id,
+            user_email=user_email,
+        )
+    except Exception as exc:
+        log.exception("sginfo_collect: start failed for %s/node%s",
+                      engine_name, node_index)
+        flash(f"Could not start sginfo collection: {exc}", "danger")
+        return redirect(url_for("engines.cluster_detail",
+                                engine_name=engine_name))
+
+    flash(f"sginfo collection started for {engine_name} node {node_index} "
+          f"(record #{result.record_id}). Page will refresh when ready.",
+          "info")
+    return redirect(url_for("engines.sginfo_view",
+                            record_id=result.record_id))
+
+
+@engines_bp.route("/sginfo/<int:record_id>")
+@profile_required_admin
+def sginfo_view(record_id):
+    """Watcher (when running) / file browser (when done) / error page."""
+    rec = _record_or_404(record_id)
+    members = []
+    selected_path = (request.args.get("path") or "").strip()
+    selected_text = ""
+    selected_encoding = ""
+    selected_truncated = False
+    selected_is_text = False
+    selected_size = 0
+    text_error = ""
+
+    if rec.status == "done":
+        try:
+            from webapp import engine_sginfo
+            members = engine_sginfo.list_archive_members(rec)
+        except Exception as exc:
+            log.exception("sginfo_view: index failed for #%s", rec.id)
+            text_error = f"Could not read archive index: {exc}"
+
+    if selected_path and rec.status == "done" and not text_error:
+        member = next((m for m in members if m["path"] == selected_path),
+                      None)
+        if member is None:
+            text_error = f"Member not found in archive: {selected_path}"
+        else:
+            selected_size = member["size"]
+            selected_is_text = member["is_text"]
+            if selected_is_text and selected_size <= 8 * 1024 * 1024:
+                try:
+                    from webapp import engine_sginfo
+                    (selected_text, selected_encoding, selected_truncated
+                     ) = engine_sginfo.read_text_member(rec, selected_path)
+                except Exception as exc:
+                    text_error = f"Could not read {selected_path}: {exc}"
+
+    return render_template(
+        "engines/sginfo_view.html",
+        record=rec,
+        members=members,
+        selected_path=selected_path,
+        selected_text=selected_text,
+        selected_encoding=selected_encoding,
+        selected_truncated=selected_truncated,
+        selected_is_text=selected_is_text,
+        selected_size=selected_size,
+        text_error=text_error,
+    )
+
+
+@engines_bp.route("/sginfo/<int:record_id>/status")
+@profile_required_admin
+def sginfo_status(record_id):
+    """JSON poll target for the watcher."""
+    rec = _record_or_404(record_id)
+    return jsonify(
+        id=rec.id,
+        status=rec.status,
+        error=rec.error,
+        engine_name=rec.engine_name,
+        node_index=rec.node_index,
+        archive_bytes=int(rec.archive_bytes or 0),
+        member_count=int(rec.member_count or 0),
+        duration_ms=int(rec.duration_ms or 0),
+        finished=(rec.status in ("done", "failed")),
+    )
+
+
+@engines_bp.route("/sginfo/<int:record_id>/file")
+@profile_required_admin
+def sginfo_file_download(record_id):
+    """Download a single archive member as the original (binary) bytes."""
+    rec = _record_or_404(record_id)
+    if rec.status != "done":
+        abort(409)
+    member_path = (request.args.get("path") or "").strip()
+    if not member_path:
+        abort(400)
+
+    from webapp import engine_sginfo
+    try:
+        data = engine_sginfo.stream_member_bytes(rec, member_path)
+    except FileNotFoundError:
+        abort(404)
+    except Exception as exc:
+        log.exception("sginfo_file_download: extract failed for #%s/%s",
+                      rec.id, member_path)
+        abort(500)
+
+    # Inline-safe filename (sanitise path separators).
+    fname = member_path.rsplit("/", 1)[-1] or "member.bin"
+    return Response(
+        data,
+        mimetype="application/octet-stream",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Length": str(len(data)),
+        },
+    )
+
+
+@engines_bp.route("/sginfo/<int:record_id>/download")
+@profile_required_admin
+def sginfo_archive_download(record_id):
+    """Raw .gz archive download — for opening in Wireshark, sharing with
+    Forcepoint Support, or local extraction."""
+    rec = _record_or_404(record_id)
+    if rec.status != "done":
+        abort(409)
+    from webapp import engine_sginfo
+    path = engine_sginfo.archive_path(rec)
+    if not path.is_file():
+        abort(404)
+    fname = (f"sginfo-{rec.engine_name}-node{rec.node_index}-"
+             f"{rec.started_at:%Y%m%d-%H%M%S}.gz")
+    return send_file(path, as_attachment=True, download_name=fname,
+                     mimetype="application/gzip")
+
+
+@engines_bp.route("/sginfo/<int:record_id>/delete", methods=["POST"])
+@profile_required_admin
+def sginfo_delete(record_id):
+    rec = _record_or_404(record_id)
+    engine_name = rec.engine_name
+    from webapp import engine_sginfo
+    try:
+        engine_sginfo.delete_record(rec)
+    except Exception as exc:
+        log.exception("sginfo_delete: failed for #%s", record_id)
+        flash(f"Could not delete sginfo record #{record_id}: {exc}",
+              "danger")
+        return redirect(url_for("engines.sginfo_history"))
+    flash(f"sginfo record #{record_id} deleted.", "success")
+    if request.form.get("return_to") == "engine":
+        return redirect(url_for("engines.cluster_detail",
+                                engine_name=engine_name))
+    return redirect(url_for("engines.sginfo_history"))
+
+
+@engines_bp.route("/sginfo")
+@profile_required_admin
+def sginfo_history():
+    """List every sginfo collection in the active Domain (newest first)."""
+    domain = _current_domain()
+    if domain is None:
+        flash("Pick a Domain first.", "warning")
+        return redirect(url_for("index"))
+    engine_filter = (request.args.get("engine") or "").strip()
+    qry = (EngineSginfoCollection.query
+           .filter_by(domain_id=domain.id)
+           .order_by(EngineSginfoCollection.started_at.desc()))
+    if engine_filter:
+        qry = qry.filter(EngineSginfoCollection.engine_name == engine_filter)
+    rows = qry.limit(500).all()
+    return render_template(
+        "engines/sginfo_history.html",
+        rows=rows,
+        engine_filter=engine_filter,
     )
 
 

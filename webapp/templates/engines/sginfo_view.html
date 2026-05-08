@@ -1,0 +1,267 @@
+{% extends "base.html" %}
+{% block title %}sgInfo #{{ record.id }} — {{ record.engine_name }} node {{ record.node_index }}{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.index') }}">Engines</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.clusters') }}">Clusters</a></li>
+    <li class="breadcrumb-item">
+      <a href="{{ url_for('engines.cluster_detail', engine_name=record.engine_name) }}">
+        {{ record.engine_name }}
+      </a>
+    </li>
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.sginfo_history') }}">sgInfo</a></li>
+    <li class="breadcrumb-item active">#{{ record.id }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-start mb-3 flex-wrap gap-2">
+  <div>
+    <h4 class="mb-1">
+      <i class="bi bi-clipboard-data"></i> sginfo
+      <small class="text-muted">— {{ record.engine_name }} ·
+        node {{ record.node_index }}{% if record.node_name %}
+        (<code>{{ record.node_name }}</code>){% endif %}</small>
+    </h4>
+    <div class="text-muted small">
+      Started {{ record.started_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}
+      {% if record.user %} · by <code>{{ record.user.email }}</code>{% endif %}
+      {% if record.include_core_files %} · <span class="badge bg-warning text-dark">core files</span>{% endif %}
+      {% if record.include_slapcat_output %} · <span class="badge bg-info text-dark">slapcat</span>{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-2 flex-wrap">
+    {% if record.status == 'done' %}
+    <a href="{{ url_for('engines.sginfo_archive_download', record_id=record.id) }}"
+       class="btn btn-sm btn-outline-primary">
+      <i class="bi bi-download"></i> Download .gz
+    </a>
+    {% endif %}
+    <form method="post" action="{{ url_for('engines.sginfo_delete', record_id=record.id) }}"
+          onsubmit="return confirm('Delete sginfo record #{{ record.id }} and its archive on disk?');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="return_to" value="engine">
+      <button class="btn btn-sm btn-outline-danger">
+        <i class="bi bi-trash"></i> Delete
+      </button>
+    </form>
+  </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, msg in messages %}
+<div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+{% endfor %}
+{% endwith %}
+
+{# ── Watcher (running) ───────────────────────────────────────────── #}
+{% if record.status == 'running' %}
+<div id="sginfo-watcher" class="card mb-3"
+     data-record-id="{{ record.id }}"
+     data-status-url="{{ url_for('engines.sginfo_status', record_id=record.id) }}"
+     data-view-url="{{ url_for('engines.sginfo_view', record_id=record.id) }}">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+    <span>
+      <i class="bi bi-hourglass-split"></i>
+      Collecting sginfo from <code>{{ record.engine_name }}</code> node {{ record.node_index }}…
+    </span>
+    <span class="small text-muted" id="sginfo-elapsed">just started</span>
+  </div>
+  <div class="card-body py-3">
+    <div class="progress mb-2" style="height: 14px;">
+      <div class="progress-bar progress-bar-striped progress-bar-animated bg-info"
+           role="progressbar" style="width:100%;"></div>
+    </div>
+    <div class="small text-muted">
+      sginfo runs over the SMC management channel — works for
+      node-initiated-contact engines. Typical run is 15–60 s; cores
+      and slapcat take longer. The page reloads automatically when the
+      archive is ready.
+    </div>
+  </div>
+</div>
+{% endif %}
+
+{# ── Failed ─────────────────────────────────────────────────────── #}
+{% if record.status == 'failed' %}
+<div class="alert alert-danger" role="alert">
+  <div class="fw-semibold mb-1">
+    <i class="bi bi-x-octagon"></i> sginfo collection failed
+  </div>
+  <div class="small">
+    <strong>Engine:</strong> <code>{{ record.engine_name }}</code>
+    · <strong>Node:</strong> {{ record.node_index }}
+    {% if record.duration_ms %}
+    · <strong>Failed after:</strong> {{ (record.duration_ms / 1000)|round(1) }} s
+    {% endif %}
+  </div>
+  {% if record.error %}
+  <pre class="mt-2 mb-0 small bg-dark text-light p-2 rounded"
+       style="white-space: pre-wrap;">{{ record.error }}</pre>
+  {% endif %}
+</div>
+{% endif %}
+
+{# ── Done — file browser ───────────────────────────────────────── #}
+{% if record.status == 'done' %}
+<div class="row g-3">
+  <div class="col-12">
+    <div class="card">
+      <div class="card-body py-2 d-flex flex-wrap align-items-center gap-3">
+        <div>
+          <i class="bi bi-archive"></i>
+          <strong>{{ record.member_count }}</strong> file(s) in archive
+        </div>
+        <div class="text-muted small">
+          {{ '%.1f'|format(record.archive_bytes / (1024*1024)) }} MiB ·
+          collected in {{ (record.duration_ms / 1000)|round(1) }} s
+        </div>
+        {% if text_error %}
+        <div class="text-danger small">
+          <i class="bi bi-exclamation-triangle"></i> {{ text_error }}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-4">
+    <div class="card">
+      <div class="card-header py-2">
+        <input id="sginfo-filter" type="search"
+               class="form-control form-control-sm"
+               placeholder="Filter files… (e.g. dhcp, log, conf)"
+               autocomplete="off">
+      </div>
+      <ul id="sginfo-list" class="list-group list-group-flush small"
+          style="max-height: 75vh; overflow-y: auto;">
+        {% for m in members %}
+        <li class="list-group-item p-2 sginfo-item
+                   {% if m.path == selected_path %}active bg-primary text-white{% endif %}"
+            data-path="{{ m.path|lower }}"
+            style="font-family: ui-monospace, SFMono-Regular, monospace;">
+          <a href="{{ url_for('engines.sginfo_view', record_id=record.id, path=m.path) }}"
+             class="text-decoration-none {% if m.path == selected_path %}text-white{% endif %}">
+            {{ m.path }}
+          </a>
+          <div class="text-muted small d-flex justify-content-between
+                      {% if m.path == selected_path %}text-white-50{% endif %}">
+            <span>
+              {% if m.is_text %}<i class="bi bi-file-earmark-text"></i>
+              {% else %}<i class="bi bi-file-earmark-binary"></i>{% endif %}
+              {{ m.size }} bytes
+            </span>
+          </div>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+
+  <div class="col-md-8">
+    <div class="card">
+      <div class="card-header py-2 d-flex justify-content-between align-items-center">
+        <span>
+          {% if selected_path %}
+          <code class="small">{{ selected_path }}</code>
+          {% else %}
+          <span class="text-muted">Select a file to view its content</span>
+          {% endif %}
+        </span>
+        {% if selected_path %}
+        <a href="{{ url_for('engines.sginfo_file_download', record_id=record.id, path=selected_path) }}"
+           class="btn btn-sm btn-outline-secondary">
+          <i class="bi bi-download"></i> Download
+        </a>
+        {% endif %}
+      </div>
+      <div class="card-body p-0">
+        {% if not selected_path %}
+        <div class="p-3 text-muted small">
+          Pick a file from the index on the left. Common entry points:
+          <ul class="mb-0 mt-2">
+            <li><code>data/config/base/*.conf</code> — engine base config (DHCP, TLS, services).</li>
+            <li><code>data/config/dhcp-server/dhcpd.conf</code> — SMC-managed master DHCP config.</li>
+            <li><code>spool/dhcp-server/dhcpd.leases</code> — current DHCP leases (also rendered in
+              the DHCP Manager).</li>
+            <li><code>var/log/sgsystem.log</code>, <code>var/log/messages</code> — recent system logs.</li>
+            <li><code>etc/network/interfaces</code>, routing tables, sysctl, kernel state.</li>
+          </ul>
+        </div>
+        {% elif text_error %}
+        <div class="p-3">
+          <div class="alert alert-warning mb-0">{{ text_error }}</div>
+        </div>
+        {% elif not selected_is_text or selected_size > 8 * 1024 * 1024 %}
+        <div class="p-3 text-muted small">
+          {% if selected_size > 8 * 1024 * 1024 %}
+          File is {{ '%.1f'|format(selected_size / (1024*1024)) }} MiB — too
+          large to render in-browser. Click <strong>Download</strong> above.
+          {% else %}
+          This file looks binary (or unrecognised text format). Click
+          <strong>Download</strong> above to inspect locally.
+          {% endif %}
+        </div>
+        {% else %}
+        {% if selected_truncated %}
+        <div class="alert alert-warning small mb-0 rounded-0">
+          <i class="bi bi-scissors"></i> File is {{ '%.1f'|format(selected_size / (1024*1024)) }}
+          MiB — only the first 2 MiB are shown below. Click
+          <strong>Download</strong> for the full content.
+        </div>
+        {% endif %}
+        <pre class="mb-0 p-3 small bg-dark text-light rounded-0"
+             style="max-height: 75vh; overflow:auto; white-space:pre;">{{ selected_text }}</pre>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+</div>
+{% endif %}
+
+</div>
+
+<script>
+(function() {
+  // ── Watcher: poll status until 'done' or 'failed' ────────────────
+  const watcher = document.getElementById("sginfo-watcher");
+  if (watcher) {
+    const statusUrl = watcher.dataset.statusUrl;
+    const viewUrl = watcher.dataset.viewUrl;
+    const startedAt = Date.now();
+
+    function tick() {
+      fetch(statusUrl, { headers: { "Accept": "application/json" } })
+        .then(r => r.json())
+        .then(s => {
+          if (s.finished) {
+            window.location.assign(viewUrl);
+            return;
+          }
+          const sec = Math.floor((Date.now() - startedAt) / 1000);
+          const e = document.getElementById("sginfo-elapsed");
+          if (e) e.textContent = sec + " s elapsed";
+          setTimeout(tick, 1500);
+        })
+        .catch(() => setTimeout(tick, 3000));
+    }
+    setTimeout(tick, 1500);
+  }
+
+  // ── File-list filter ─────────────────────────────────────────────
+  const filterInput = document.getElementById("sginfo-filter");
+  const list = document.getElementById("sginfo-list");
+  if (filterInput && list) {
+    filterInput.addEventListener("input", () => {
+      const q = filterInput.value.trim().toLowerCase();
+      for (const li of list.querySelectorAll(".sginfo-item")) {
+        const path = li.dataset.path || "";
+        li.style.display = (!q || path.includes(q)) ? "" : "none";
+      }
+    });
+  }
+})();
+</script>
+{% endblock %}

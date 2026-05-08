@@ -776,6 +776,50 @@ class EngineScanHost(db.Model):
         return f"<EngineScanHost #{self.id} scan={self.scan_id} ip={self.ip}>"
 
 
+class EngineSginfoCollection(db.Model):
+    """One sginfo archive collected from a node via SMC.
+
+    The actual gzipped tar lives on disk under `archive_path` (typically
+    `/config/sginfo/<id>/sginfo.gz`). The DB row is the operator-facing
+    handle: status, audit metadata, error text, and a JSON index of the
+    archive's members so the viewer can render the file tree without
+    re-scanning the tarball on every page load.
+    """
+    __tablename__ = "engine_sginfo_collections"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"),
+                        nullable=True)
+
+    engine_name = db.Column(db.String(255), nullable=False, index=True)
+    node_index = db.Column(db.Integer, nullable=False)
+    node_name = db.Column(db.String(255), default="", nullable=False)
+
+    include_core_files = db.Column(db.Boolean, default=False, nullable=False)
+    include_slapcat_output = db.Column(db.Boolean, default=False, nullable=False)
+
+    status = db.Column(db.String(16), default="running", nullable=False, index=True)
+    error = db.Column(db.Text, default="", nullable=False)
+
+    archive_path = db.Column(db.String(512), default="", nullable=False)
+    archive_bytes = db.Column(db.BigInteger, default=0, nullable=False)
+    member_count = db.Column(db.Integer, default=0, nullable=False)
+    member_index_json = db.Column(db.Text, default="", nullable=False)
+
+    duration_ms = db.Column(db.Integer, default=0, nullable=False)
+    started_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    finished_at = db.Column(db.DateTime, nullable=True)
+
+    domain = db.relationship("Domain")
+    user = db.relationship("User", foreign_keys=[user_id])
+
+    def __repr__(self):
+        return (f"<EngineSginfoCollection #{self.id} {self.engine_name}/"
+                f"node{self.node_index} status={self.status}>")
+
+
 # ── Platform-wide log management (replaces per-feature activity tables) ──
 #
 # Standing rule (memory: feedback_logging_standing_rule, 2026-04-29): every
