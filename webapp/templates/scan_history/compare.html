@@ -1,0 +1,157 @@
+{% extends "base.html" %}
+{% block title %}Compare scans — {{ report.scope_engine }}/{{ report.scope_iface }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="small mb-2">
+  <ol class="breadcrumb mb-0">
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.clusters') }}">Engines</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_history.history') }}">Scan history</a></li>
+    <li class="breadcrumb-item active">Compare</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
+  <div>
+    <h2 class="mb-1">
+      <i class="bi bi-arrow-left-right"></i>
+      Compare {{ report.scans|length }} scans
+    </h2>
+    <div class="text-muted small">
+      Scope: <code>{{ report.scope_engine }}</code> / <code>{{ report.scope_iface or '—' }}</code>
+      &nbsp;·&nbsp; {{ report.hosts|length }} unique hosts across the timeline
+    </div>
+  </div>
+  <div class="d-flex gap-2 align-items-center">
+    <div class="form-check form-switch m-0">
+      <input class="form-check-input" type="checkbox" role="switch" id="diff-only">
+      <label class="form-check-label small" for="diff-only">
+        Diff only ({{ report.hosts | selectattr('has_changes') | list | length }})
+      </label>
+    </div>
+    <a href="{{ url_for('scan_history.history') }}" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-x-lg"></i> Close
+    </a>
+  </div>
+</div>
+
+{% if not report.hosts %}
+  <div class="alert alert-info">No host data captured in any of the selected scans.</div>
+{% else %}
+
+<div class="card">
+  <div class="table-responsive" style="max-height: calc(100vh - 220px); overflow: auto;">
+    <table class="table table-sm table-hover compare-table mb-0 align-middle">
+      <thead class="position-sticky top-0 bg-body-tertiary" style="z-index: 2;">
+        <tr>
+          <th class="position-sticky start-0 bg-body-tertiary" style="min-width: 160px; z-index: 3;">
+            Host
+          </th>
+          {% for s in report.scans %}
+          <th class="small" style="min-width: 240px;" title="Scan #{{ s.id }} · {{ s.source }}{% if s.starred %} · ⭐{% endif %}">
+            <a href="{{ url_for('scan_history.detail', scan_id=s.id) }}"
+               class="text-decoration-none">
+              <div>{{ s.started_at_human }}</div>
+              <div class="text-muted small fw-normal">
+                #{{ s.id }} · {{ s.source }}
+                {% if s.starred %}<i class="bi bi-star-fill text-warning"></i>{% endif %}
+                · {{ s.online_ips }} online
+              </div>
+              {% if s.comment %}
+              <div class="text-truncate text-muted small fst-italic"
+                   style="max-width: 220px;" title="{{ s.comment }}">
+                {{ s.comment }}
+              </div>
+              {% endif %}
+            </a>
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in report.hosts %}
+        <tr class="host-row" data-changed="{{ '1' if h.has_changes else '0' }}">
+          <td class="position-sticky start-0 bg-body" style="z-index: 1;">
+            <code>{{ h.ip }}</code>
+            {% if h.last_hostname %}
+              <div class="small text-muted">{{ h.last_hostname }}</div>
+            {% endif %}
+            {% if h.last_mac %}
+              <div class="small text-muted"><code>{{ h.last_mac }}</code></div>
+            {% endif %}
+          </td>
+          {% for c in h.cells %}
+          <td class="cell-{{ c.delta_status }}">
+            {% if not c.seen %}
+              {% if c.delta_status == 'gone' %}
+                <span class="badge bg-danger">gone</span>
+              {% else %}
+                <span class="text-muted small">— not seen —</span>
+              {% endif %}
+            {% else %}
+              <div class="d-flex flex-wrap gap-1 align-items-center small">
+                {% if c.icmp %}<span class="badge bg-success">ICMP</span>{% endif %}
+                {% if c.arp and not c.icmp %}<span class="badge bg-warning text-dark">ARP</span>{% endif %}
+                {% if c.delta_status == 'first' %}
+                  <span class="badge bg-primary">new</span>
+                {% endif %}
+              </div>
+              <div class="small mt-1">
+                {% if c.open_ports %}
+                  {% for p in c.open_ports %}
+                    {% if p in c.delta_open_added %}
+                      <span class="badge bg-success me-1" title="newly open">+{{ p }}</span>
+                    {% else %}
+                      <span class="badge bg-info text-dark me-1">{{ p }}</span>
+                    {% endif %}
+                  {% endfor %}
+                {% else %}
+                  <span class="text-muted">no open ports</span>
+                {% endif %}
+                {% for p in c.delta_open_removed %}
+                  <span class="badge bg-danger me-1" title="closed since previous scan">−{{ p }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div class="small text-muted mt-2">
+  <i class="bi bi-info-circle"></i>
+  Deltas are computed against the nearest previous scan where the host was seen.
+  <span class="badge bg-success">+22</span> = newly open,
+  <span class="badge bg-danger">−3389</span> = closed since previous,
+  <span class="badge bg-primary">new</span> = first-time appearance,
+  <span class="badge bg-danger">gone</span> = host stopped responding.
+</div>
+
+{% endif %}
+
+<style>
+  .compare-table th { vertical-align: top; }
+  .compare-table td { vertical-align: top; }
+  .cell-changed { background: rgba(13, 202, 240, 0.06); }
+  .cell-first   { background: rgba(13, 110, 253, 0.06); }
+  .cell-gone    { background: rgba(220, 53, 69, 0.06); }
+  /* keep the sticky first column readable on hover */
+  .compare-table tr:hover > .position-sticky.start-0 { background: var(--bs-tertiary-bg) !important; }
+</style>
+
+<script>
+  (function() {
+    const sw = document.getElementById("diff-only");
+    if (!sw) return;
+    sw.addEventListener("change", () => {
+      const on = sw.checked;
+      document.querySelectorAll(".host-row").forEach(tr => {
+        tr.style.display = (!on || tr.dataset.changed === "1") ? "" : "none";
+      });
+    });
+  })();
+</script>
+{% endblock %}

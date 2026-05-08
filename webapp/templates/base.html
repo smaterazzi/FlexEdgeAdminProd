@@ -279,6 +279,18 @@
                         <i class="bi bi-tools"></i> Tools
                     </a>
                 </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if request.path.startswith('/engines/scans') and '/graph' not in request.path %}active{% endif %}"
+                       href="{{ url_for('scan_history.history') }}">
+                        <i class="bi bi-clock-history"></i> Scan history
+                    </a>
+                </li>
+                <li class="nav-item">
+                    <a class="nav-link {% if '/engines/scans/graph' in request.path %}active{% endif %}"
+                       href="{{ url_for('scan_history.graph') }}">
+                        <i class="bi bi-graph-up"></i> Time graph
+                    </a>
+                </li>
             </ul>
 
             <div class="section-label">DHCP Manager</div>

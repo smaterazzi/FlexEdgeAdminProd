@@ -1,0 +1,311 @@
+{% extends "base.html" %}
+{% block title %}Scan history — Time graph{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="small mb-2">
+  <ol class="breadcrumb mb-0">
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.clusters') }}">Engines</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_history.history') }}">Scan history</a></li>
+    <li class="breadcrumb-item active">Time graph</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+  <h2 class="mb-0">
+    <i class="bi bi-graph-up"></i> Online IPs over time
+  </h2>
+</div>
+
+<div class="card mb-3">
+  <div class="card-body py-2">
+    <form method="get" class="row g-2 align-items-end small">
+      <div class="col-auto">
+        <label class="form-label mb-1">Engine</label>
+        <select name="engine" class="form-select form-select-sm">
+          <option value="">— any —</option>
+          {% set seen_eng = [] %}
+          {% for f in facets %}
+            {% if f.engine and f.engine not in seen_eng %}
+              {% if seen_eng.append(f.engine) %}{% endif %}
+              <option value="{{ f.engine }}" {% if f.engine == f_engine %}selected{% endif %}>{{ f.engine }}</option>
+            {% endif %}
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-auto">
+        <label class="form-label mb-1">Interface</label>
+        <select name="iface" class="form-select form-select-sm">
+          <option value="">— any —</option>
+          {% set seen_if = [] %}
+          {% for f in facets %}
+            {% if f.iface and f.iface not in seen_if %}
+              {% if seen_if.append(f.iface) %}{% endif %}
+              <option value="{{ f.iface }}" {% if f.iface == f_iface %}selected{% endif %}>{{ f.iface }}</option>
+            {% endif %}
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-auto">
+        <label class="form-label mb-1">Range</label>
+        <select name="days" class="form-select form-select-sm">
+          <option value="1"  {% if f_days == 1 %}selected{% endif %}>24 h</option>
+          <option value="7"  {% if f_days == 7 %}selected{% endif %}>7 d</option>
+          <option value="30" {% if f_days == 30 %}selected{% endif %}>30 d</option>
+          <option value="90" {% if f_days == 90 %}selected{% endif %}>90 d</option>
+          <option value="0"  {% if not f_days %}selected{% endif %}>all</option>
+        </select>
+      </div>
+      <div class="col-auto">
+        <button type="submit" class="btn btn-sm btn-outline-primary">Apply</button>
+        <a href="{{ url_for('scan_history.graph') }}" class="btn btn-sm btn-outline-secondary">Clear</a>
+      </div>
+      <div class="col text-end small text-muted">
+        Click any point to open its scan record. Triangle = scheduled, ⭐ = starred, • = manual.
+      </div>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-body p-0">
+    <div id="chart-host" style="position: relative; padding: 1rem;">
+      <div id="chart-empty" class="text-center text-muted py-5" hidden>
+        <i class="bi bi-bar-chart"></i>
+        No scans match the current filter — run a scan or widen the range.
+      </div>
+      <div id="chart-loading" class="text-center text-muted py-5">Loading…</div>
+      <svg id="chart-svg" width="100%" height="380" hidden
+           role="img" aria-label="Online IPs over time"></svg>
+      <div id="chart-tooltip" class="position-absolute small px-2 py-1 rounded bg-dark text-light shadow-sm"
+           style="display:none; pointer-events:none; z-index:10; max-width:260px;"></div>
+    </div>
+    <div id="chart-summary" class="px-3 py-2 small text-muted border-top"></div>
+  </div>
+</div>
+
+<script>
+(function() {
+  const host = document.getElementById("chart-host");
+  const svg = document.getElementById("chart-svg");
+  const tooltip = document.getElementById("chart-tooltip");
+  const empty = document.getElementById("chart-empty");
+  const loading = document.getElementById("chart-loading");
+  const summary = document.getElementById("chart-summary");
+
+  // ── Settings ──────────────────────────────────────────────────────────
+  const PAD = { top: 24, right: 24, bottom: 36, left: 48 };
+  const SERIES = [
+    { key: "online_ips",      label: "Online IPs",   color: "#198754", width: 2.0 },
+    { key: "hosts_with_open", label: "Hosts w/ open", color: "#0dcaf0", width: 1.4, dashed: true },
+  ];
+
+  function fetchData() {
+    const params = new URLSearchParams(window.location.search);
+    const url = "{{ url_for('scan_history.graph_json') }}" + "?" + params.toString();
+    return fetch(url, { headers: { "Accept": "application/json" } })
+      .then(r => r.ok ? r.json() : Promise.reject(r.statusText));
+  }
+
+  function fmtTs(ms) {
+    const d = new Date(ms);
+    const Y = d.getFullYear(), M = String(d.getMonth()+1).padStart(2,"0"),
+          D = String(d.getDate()).padStart(2,"0"),
+          h = String(d.getHours()).padStart(2,"0"),
+          m = String(d.getMinutes()).padStart(2,"0");
+    return `${Y}-${M}-${D} ${h}:${m}`;
+  }
+
+  function render(points) {
+    // Clear svg children but keep size attributes.
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    const N = points.length;
+    if (!N) {
+      svg.setAttribute("hidden", "true");
+      loading.setAttribute("hidden", "true");
+      empty.removeAttribute("hidden");
+      summary.textContent = "";
+      return;
+    }
+    empty.setAttribute("hidden", "true");
+    loading.setAttribute("hidden", "true");
+    svg.removeAttribute("hidden");
+
+    const rect = svg.getBoundingClientRect();
+    const W = Math.max(640, rect.width || 800);
+    const H = 380;
+    svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+
+    const xs = points.map(p => p.ts_ms);
+    const xMin = Math.min(...xs), xMax = Math.max(...xs);
+    const xSpan = Math.max(1, xMax - xMin);
+    const yMaxRaw = Math.max(1, ...points.flatMap(p => [p.online_ips, p.hosts_with_open]));
+    // Round Y up to a nice tick step.
+    const niceMax = niceCeil(yMaxRaw);
+    const xScale = ms => PAD.left + (ms - xMin) / xSpan * (W - PAD.left - PAD.right);
+    const yScale = v  => H - PAD.bottom - (v / niceMax) * (H - PAD.top - PAD.bottom);
+
+    // Axes ────
+    const axisG = mk("g", { class: "axes" });
+    // Y grid + ticks (5 lines)
+    for (let i = 0; i <= 5; i++) {
+      const v = (niceMax * i) / 5;
+      const y = yScale(v);
+      axisG.appendChild(mk("line", { x1: PAD.left, x2: W - PAD.right, y1: y, y2: y,
+                                     stroke: "#ffffff14", "stroke-width": 1 }));
+      axisG.appendChild(mk("text", { x: PAD.left - 8, y: y + 4,
+                                     "text-anchor": "end",
+                                     "font-size": 11,
+                                     fill: "#ffffff80" }, String(Math.round(v))));
+    }
+    // X ticks: 5 evenly spaced labels
+    for (let i = 0; i <= 5; i++) {
+      const t = xMin + (xSpan * i) / 5;
+      const x = xScale(t);
+      axisG.appendChild(mk("line", { x1: x, x2: x, y1: H - PAD.bottom, y2: H - PAD.bottom + 4,
+                                     stroke: "#ffffff40", "stroke-width": 1 }));
+      axisG.appendChild(mk("text", { x: x, y: H - PAD.bottom + 18,
+                                     "text-anchor": "middle",
+                                     "font-size": 11,
+                                     fill: "#ffffff80" }, fmtTs(t)));
+    }
+    // axis baseline
+    axisG.appendChild(mk("line", { x1: PAD.left, x2: W - PAD.right,
+                                   y1: H - PAD.bottom, y2: H - PAD.bottom,
+                                   stroke: "#ffffff60", "stroke-width": 1 }));
+    svg.appendChild(axisG);
+
+    // Series lines
+    SERIES.forEach(s => {
+      const d = points.map((p, i) => `${i ? "L" : "M"}${xScale(p.ts_ms).toFixed(1)} ${yScale(p[s.key]).toFixed(1)}`).join(" ");
+      const path = mk("path", {
+        d, fill: "none", stroke: s.color, "stroke-width": s.width,
+        "stroke-linecap": "round", "stroke-linejoin": "round",
+      });
+      if (s.dashed) path.setAttribute("stroke-dasharray", "4 4");
+      svg.appendChild(path);
+    });
+
+    // Markers (interactive)
+    const markersG = mk("g", { class: "markers" });
+    points.forEach(p => {
+      const cx = xScale(p.ts_ms), cy = yScale(p.online_ips);
+      const isScheduled = (p.source === "scheduled");
+      const isStarred = p.starred;
+      let node;
+      if (isStarred) {
+        // 5-point star (~r=7)
+        node = mk("path", { d: starPath(cx, cy, 7), fill: "#ffc107", stroke: "#fff", "stroke-width": 1 });
+      } else if (isScheduled) {
+        // Triangle (~size=10)
+        node = mk("path", { d: trianglePath(cx, cy, 6), fill: "#0d6efd", stroke: "#fff", "stroke-width": 1 });
+      } else {
+        node = mk("circle", { cx, cy, r: 4, fill: "#198754", stroke: "#fff", "stroke-width": 1 });
+      }
+      node.style.cursor = "pointer";
+      node.addEventListener("mouseenter", e => showTip(e, p));
+      node.addEventListener("mousemove", e => moveTip(e));
+      node.addEventListener("mouseleave", hideTip);
+      node.addEventListener("click", () => {
+        window.location = "{{ url_for('scan_history.history') }}".replace(/\/$/, "") + "/" + p.scan_id;
+      });
+      markersG.appendChild(node);
+    });
+    svg.appendChild(markersG);
+
+    // Legend
+    const legendG = mk("g", { class: "legend" });
+    SERIES.forEach((s, i) => {
+      const x = PAD.left + i * 160, y = 14;
+      const ln = mk("line", { x1: x, x2: x + 24, y1: y, y2: y,
+                              stroke: s.color, "stroke-width": s.width });
+      if (s.dashed) ln.setAttribute("stroke-dasharray", "4 4");
+      legendG.appendChild(ln);
+      legendG.appendChild(mk("text", { x: x + 30, y: y + 4,
+                                       "font-size": 12, fill: "#ffffffb0" }, s.label));
+    });
+    svg.appendChild(legendG);
+
+    summary.textContent =
+      `${N} scan${N === 1 ? "" : "s"} · `
+      + `peak online ${Math.max(...points.map(p => p.online_ips))} · `
+      + `peak hosts-with-open ${Math.max(...points.map(p => p.hosts_with_open))} · `
+      + `range ${fmtTs(xMin)} → ${fmtTs(xMax)}`;
+  }
+
+  // ── tooltip ──────────────────────────────────────────────────────────
+  function showTip(ev, p) {
+    tooltip.innerHTML =
+      `<div><strong>${fmtTs(p.ts_ms)}</strong> · #${p.scan_id}</div>`
+      + `<div>online: <strong>${p.online_ips}</strong> · hosts w/ open: <strong>${p.hosts_with_open}</strong></div>`
+      + `<div class="text-muted">${escapeHtml(p.engine)} / ${escapeHtml(p.iface)} · ${escapeHtml(p.source)}${p.starred ? " · ⭐" : ""}</div>`
+      + (p.comment ? `<div class="fst-italic">${escapeHtml(p.comment)}</div>` : "");
+    tooltip.style.display = "block";
+    moveTip(ev);
+  }
+  function moveTip(ev) {
+    const r = host.getBoundingClientRect();
+    let x = ev.clientX - r.left + 12;
+    let y = ev.clientY - r.top + 12;
+    // Avoid spilling past the right edge.
+    if (x + tooltip.offsetWidth > host.offsetWidth - 8) {
+      x = ev.clientX - r.left - tooltip.offsetWidth - 12;
+    }
+    tooltip.style.left = x + "px";
+    tooltip.style.top  = y + "px";
+  }
+  function hideTip() { tooltip.style.display = "none"; }
+
+  // ── helpers ──────────────────────────────────────────────────────────
+  function mk(tag, attrs, text) {
+    const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+    if (attrs) for (const k in attrs) el.setAttribute(k, attrs[k]);
+    if (text != null) el.textContent = text;
+    return el;
+  }
+  function trianglePath(cx, cy, r) {
+    const h = r * Math.sqrt(3);
+    return `M${cx} ${cy - r} L${cx + h * 0.6} ${cy + r * 0.8} L${cx - h * 0.6} ${cy + r * 0.8} Z`;
+  }
+  function starPath(cx, cy, r) {
+    let path = "";
+    const inner = r * 0.4;
+    for (let i = 0; i < 10; i++) {
+      const ang = (Math.PI / 5) * i - Math.PI / 2;
+      const rad = (i % 2 === 0) ? r : inner;
+      const x = cx + Math.cos(ang) * rad;
+      const y = cy + Math.sin(ang) * rad;
+      path += (i ? " L" : "M") + x.toFixed(2) + " " + y.toFixed(2);
+    }
+    return path + " Z";
+  }
+  function niceCeil(v) {
+    if (v <= 5) return 5;
+    if (v <= 10) return 10;
+    if (v <= 25) return 25;
+    if (v <= 50) return 50;
+    if (v <= 100) return 100;
+    if (v <= 250) return 250;
+    if (v <= 500) return 500;
+    if (v <= 1000) return 1000;
+    return Math.ceil(v / 500) * 500;
+  }
+  function escapeHtml(s) {
+    return String(s ?? "")
+      .replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;")
+      .replace(/"/g,"&quot;").replace(/'/g,"&#39;");
+  }
+
+  // Re-render on resize so the chart stays sharp.
+  let cached = null;
+  window.addEventListener("resize", () => { if (cached) render(cached); });
+
+  fetchData()
+    .then(d => { cached = d.points; render(cached); })
+    .catch(err => {
+      loading.setAttribute("hidden", "true");
+      empty.removeAttribute("hidden");
+      empty.innerHTML = `<i class="bi bi-exclamation-triangle"></i> Failed to load: ${escapeHtml(err)}`;
+    });
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% block title %}Scan #{{ scan.id }}{% endblock %}
+
+{% block content %}
+<nav aria-label="breadcrumb" class="small mb-2">
+  <ol class="breadcrumb mb-0">
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.clusters') }}">Engines</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('engines.tools_scan') }}">Scan tool</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('scan_history.history') }}">History</a></li>
+    <li class="breadcrumb-item active">#{{ scan.id }}</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-start flex-wrap gap-2 mb-3">
+  <div>
+    <h2 class="mb-1">
+      <i class="bi bi-radar"></i>
+      Scan #{{ scan.id }}
+      {% if scan.starred %}
+        <i class="bi bi-star-fill text-warning ms-1" title="Starred"></i>
+      {% endif %}
+    </h2>
+    <div class="text-muted small">
+      <code>{{ scan.engine_name }}</code> / <code>{{ scan.source_iface_label or '—' }}</code>
+      &nbsp;·&nbsp; node {{ scan.node_index }}
+      &nbsp;·&nbsp; target <code>{{ scan.target_label }}</code>
+      &nbsp;·&nbsp; mode <code>{{ scan.target_mode }}</code>
+    </div>
+    <div class="text-muted small">
+      Started {{ scan.started_at.strftime('%Y-%m-%d %H:%M:%S UTC') }}
+      &nbsp;·&nbsp; took {{ scan.duration_ms }} ms
+      &nbsp;·&nbsp; source <span class="badge bg-secondary">{{ scan.source }}</span>
+      {% if scan.user %}&nbsp;·&nbsp; by {{ scan.user.email }}{% endif %}
+    </div>
+  </div>
+  <div class="d-flex gap-1">
+    <form method="post" action="{{ url_for('scan_history.toggle_star', scan_id=scan.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-sm btn-outline-warning">
+        {% if scan.starred %}
+          <i class="bi bi-star"></i> Unstar
+        {% else %}
+          <i class="bi bi-star-fill"></i> Star
+        {% endif %}
+      </button>
+    </form>
+    <a href="{{ url_for('scan_history.export_csv', scan_id=scan.id) }}"
+       class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-filetype-csv"></i> CSV
+    </a>
+    <form method="post" action="{{ url_for('scan_history.delete', scan_id=scan.id) }}"
+          onsubmit="return confirm('Delete this scan? This cannot be undone.');">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-sm btn-outline-danger">
+        <i class="bi bi-trash"></i> Delete
+      </button>
+    </form>
+  </div>
+</div>
+
+<div class="row g-2 mb-3 small">
+  <div class="col-auto"><span class="badge bg-success">{{ scan.icmp_replies }} ICMP</span></div>
+  <div class="col-auto"><span class="badge bg-warning text-dark">{{ scan.arp_replies }} ARP</span></div>
+  <div class="col-auto"><span class="badge bg-info text-dark">{{ scan.hosts_with_open }} hosts w/ open ports</span></div>
+  <div class="col-auto"><span class="badge bg-secondary">{{ scan.total_targets }} targets</span></div>
+  <div class="col-auto"><span class="badge bg-light text-dark">{{ (scan.ports_csv or '').count(',') + 1 if scan.ports_csv else 0 }} ports scanned</span></div>
+</div>
+
+<div class="card mb-3">
+  <div class="card-header py-2">
+    <i class="bi bi-chat-left-text"></i> Comment
+  </div>
+  <div class="card-body py-2">
+    <form method="post" action="{{ url_for('scan_history.update_comment', scan_id=scan.id) }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <textarea name="comment" rows="2" class="form-control form-control-sm mb-2"
+                maxlength="4000"
+                placeholder="Add a note (visible only to admins of this Domain)…"
+        >{{ scan.comment or '' }}</textarea>
+      <button type="submit" class="btn btn-sm btn-primary">Save</button>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+    <span><i class="bi bi-list-ul"></i> Hosts ({{ hosts|length }})</span>
+    <input type="text" id="filter" class="form-control form-control-sm"
+           placeholder="filter by IP / hostname / MAC / port…"
+           style="max-width:300px;">
+  </div>
+  <div class="table-responsive">
+    <table class="table table-sm table-hover mb-0 align-middle">
+      <thead>
+        <tr class="small">
+          <th>IP</th>
+          <th>ICMP</th>
+          <th>ARP / MAC</th>
+          <th>Hostname</th>
+          <th>Open ports</th>
+          <th class="text-muted">Closed</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for h in hosts %}
+        <tr class="host-row"
+            data-search="{{ h.ip }} {{ h.hostname }} {{ h.mac }} {{ h.open_ports_csv }}">
+          <td><code>{{ h.ip }}</code></td>
+          <td>
+            {% if h.icmp_reply %}
+              <span class="badge bg-success">✓</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if h.arp_reply %}
+              <span class="badge bg-warning text-dark">ARP</span>
+              <code class="ms-1">{{ h.mac or '—' }}</code>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td>{{ h.hostname or '—' }}</td>
+          <td>
+            {% if h.open_ports_csv %}
+              {% for p in h.open_ports_csv.split(',') %}
+                <span class="badge bg-info text-dark me-1">{{ p }}</span>
+              {% endfor %}
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td class="text-muted small">
+            {{ h.closed_ports_csv or '' }}
+          </td>
+        </tr>
+        {% endfor %}
+        {% if not hosts %}
+        <tr><td colspan="6" class="text-center text-muted py-3">No host results stored.</td></tr>
+        {% endif %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+  (function() {
+    const f = document.getElementById("filter");
+    if (!f) return;
+    f.addEventListener("input", () => {
+      const q = f.value.trim().toLowerCase();
+      document.querySelectorAll(".host-row").forEach(tr => {
+        const hay = (tr.dataset.search || "").toLowerCase();
+        tr.style.display = (q === "" || hay.includes(q)) ? "" : "none";
+      });
+    });
+  })();
+</script>
+{% endblock %}

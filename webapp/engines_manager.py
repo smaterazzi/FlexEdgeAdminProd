@@ -440,6 +440,30 @@ def tools_scan():
                     f"duration={scan_report.duration_ms}ms "
                     f"node={scan_report.source_node_index}",
                 )
+                # Persist to scan history (Phase 1 of Engines-ScanHistory).
+                # Best-effort: in-memory results still render even on DB
+                # failure. On success, redirect to the persistent detail
+                # view so the operator lands on a URL that survives the
+                # 15-min in-memory TTL.
+                try:
+                    from webapp.scan_history import service as _scan_history
+                    domain_for_history = _current_domain()
+                    user_obj = None
+                    user_email_addr = (session.get("user") or {}).get("email", "")
+                    if user_email_addr:
+                        from webapp.models import User as _U
+                        user_obj = _U.query.filter_by(email=user_email_addr).first()
+                    record = _scan_history.register_scan(
+                        domain_for_history, scan_report,
+                        user_id=getattr(user_obj, "id", None),
+                        source="manual",
+                        source_correlation=scan_id[:64] if scan_id else "",
+                    )
+                    if record is not None:
+                        return redirect(url_for(
+                            "scan_history.detail", scan_id=record.id))
+                except Exception as exc:
+                    log.warning("scan_history persist failed: %s", exc)
 
     # Build the source picker payload — current cluster inventory so
     # the cascading dropdowns can render without a second round-trip.

@@ -152,6 +152,7 @@ register_feature("admin",     "Admin Portal")
 register_feature("auth",      "Authentication")
 register_feature("changes",   "Change Management")
 register_feature("system",    "System")
+register_feature("engine_scan_history", "Engine Scan History")
 
 # ── Auth ─────────────────────────────────────────────────────────────────
 
@@ -195,6 +196,16 @@ for _endpoint in ("tls.api_renew", "tls.api_check_renewals"):
 from engines_manager import engines_bp, init_engines_manager
 app.register_blueprint(engines_bp)
 init_engines_manager(app)
+
+# ── Engine Scan History (Phase 1 of docs/Engines-ScanHistory.md) ────────
+# Persists every scan into the DB; provides /engines/scans/* UI for
+# history list, detail view, comments, star, retention sweep. Compare /
+# time-graph / scheduler land in later phases. Re-usable: any future
+# feature that wants scan persistence calls
+# `webapp.scan_history.service.register_scan(domain, report, ...)`.
+
+from webapp import scan_history
+scan_history.register_blueprint(app)
 
 # ── Change Management Queue ─────────────────────────────────────────────
 # Operator-facing UI for the two-phase commit queue. Backed by the push

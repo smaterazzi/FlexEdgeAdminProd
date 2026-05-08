@@ -693,6 +693,89 @@ class OptimizationSubmission(db.Model):
         return f"<OptimizationSubmission #{self.id} policy={self.policy_name!r} status={self.status}>"
 
 
+# ── Engine scan history (Phase 1 of docs/Engines-ScanHistory.md) ─────────
+#
+# One row per persisted scan. Hosts are stored 1:N. Schedules + comparison
+# + time-graph are layered on top in later phases — these two tables are
+# the foundation.
+
+class EngineScanRecord(db.Model):
+    __tablename__ = "engine_scan_records"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"),
+                        nullable=True)
+    schedule_id = db.Column(db.Integer, nullable=True, index=True)  # FK reserved for Phase 4
+
+    engine_name = db.Column(db.String(255), nullable=False, index=True)
+    node_index = db.Column(db.Integer, nullable=False)
+    source_iface_id = db.Column(db.String(64), default="", nullable=False)
+    source_iface_vlan = db.Column(db.String(32), default="", nullable=False)
+    source_iface_label = db.Column(db.String(128), default="", nullable=False)  # "1.42"
+    source_subnet_cidr = db.Column(db.String(64), default="", nullable=False)
+    target_label = db.Column(db.String(255), default="", nullable=False)
+    target_mode = db.Column(db.String(32), default="subnet", nullable=False)  # subnet|single_ip|custom_range
+    ports_csv = db.Column(db.Text, default="", nullable=False)
+
+    total_targets = db.Column(db.Integer, default=0, nullable=False)
+    duration_ms = db.Column(db.Integer, default=0, nullable=False)
+    icmp_replies = db.Column(db.Integer, default=0, nullable=False)
+    arp_replies = db.Column(db.Integer, default=0, nullable=False)
+    hosts_with_open = db.Column(db.Integer, default=0, nullable=False)
+    online_ips = db.Column(db.Integer, default=0, nullable=False)
+
+    comment = db.Column(db.Text, default="", nullable=False)
+    starred = db.Column(db.Boolean, default=False, nullable=False, index=True)
+    source = db.Column(db.String(32), default="manual", nullable=False)  # manual|scheduled|api
+    source_correlation = db.Column(db.String(64), default="", nullable=False)
+
+    started_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    finished_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    domain = db.relationship("Domain")
+    user = db.relationship("User", foreign_keys=[user_id])
+    hosts = db.relationship("EngineScanHost", back_populates="scan",
+                            cascade="all, delete-orphan", lazy="dynamic")
+
+    __table_args__ = (
+        db.Index("ix_engine_scan_records_scope",
+                 "domain_id", "engine_name", "source_iface_label",
+                 "started_at"),
+    )
+
+    def __repr__(self):
+        return (f"<EngineScanRecord #{self.id} {self.engine_name}/"
+                f"{self.source_iface_label} @ {self.started_at:%Y-%m-%d %H:%M}>")
+
+
+class EngineScanHost(db.Model):
+    __tablename__ = "engine_scan_hosts"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    scan_id = db.Column(db.Integer, db.ForeignKey("engine_scan_records.id", ondelete="CASCADE"),
+                        nullable=False, index=True)
+    ip = db.Column(db.String(45), nullable=False)
+    ip_int = db.Column(db.BigInteger, default=0, nullable=False)  # numeric sort key
+    icmp_reply = db.Column(db.Boolean, default=False, nullable=False)
+    arp_reply = db.Column(db.Boolean, default=False, nullable=False)
+    mac = db.Column(db.String(32), default="", nullable=False)
+    hostname = db.Column(db.String(255), default="", nullable=False)
+    open_ports_csv = db.Column(db.Text, default="", nullable=False)
+    closed_ports_csv = db.Column(db.Text, default="", nullable=False)
+
+    scan = db.relationship("EngineScanRecord", back_populates="hosts")
+
+    __table_args__ = (
+        db.UniqueConstraint("scan_id", "ip", name="uq_engine_scan_hosts_scan_ip"),
+        db.Index("ix_engine_scan_hosts_sort", "scan_id", "ip_int"),
+    )
+
+    def __repr__(self):
+        return f"<EngineScanHost #{self.id} scan={self.scan_id} ip={self.ip}>"
+
+
 # ── Platform-wide log management (replaces per-feature activity tables) ──
 #
 # Standing rule (memory: feedback_logging_standing_rule, 2026-04-29): every
