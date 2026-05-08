@@ -187,6 +187,38 @@ def _active_domain_id() -> int | None:
     return domain.id if domain is not None else None
 
 
+def _assert_active_domain_match(tenant_id: int, key_id: int):
+    """Reject URL-provided ``(tenant_id, api_key_id)`` pairs that don't
+    belong to the active Domain.
+
+    The legacy ``/dhcp/api/tenants/<tid>/api-keys/<kid>/...`` cascade
+    endpoints take both IDs from the URL. They predate the Multi-Domain
+    Revamp and used to assume the operator could span every Tenant.
+    Today the operator's effective scope is exactly one Domain, so the
+    only legitimate ``(tid, kid)`` pair is the one bound to
+    ``g.domain``. Any other pair is either a stale dropdown value or
+    URL crafting — refuse with 403.
+
+    Returns ``None`` on success, a ``(flask.Response, 403)`` tuple the
+    caller forwards to the client on mismatch.
+    """
+    domain = getattr(g, "domain", None)
+    if domain is None:
+        return jsonify({"error": "no active domain"}), 400
+    bound_key = getattr(domain, "api_key", None)
+    if (bound_key is None
+            or bound_key.id != key_id
+            or bound_key.tenant_id != tenant_id):
+        return jsonify({
+            "error": "cross-Domain access refused",
+            "detail": ("The (tenant_id, api_key_id) in the URL does not "
+                       "belong to the active Domain. Switch Domains in "
+                       "the topbar or refresh the page to reload the "
+                       "cascading dropdowns."),
+        }), 403
+    return None
+
+
 def _domain_ids_for_tenant(tenant_id: int) -> list[int]:
     """All active Domain ids belonging to the tenant via its ApiKeys.
 
@@ -3615,12 +3647,24 @@ def _platform_retention_days() -> int:
         return 90
 
 
-def sweep_old_logs(retention_days: int | None = None) -> dict:
+def sweep_old_logs(retention_days: int | None = None,
+                   domain_id: int | None = None) -> dict:
     """Delete deployment + legacy-activity rows older than ``retention_days``.
 
-    Returns a summary dict of how many rows were removed per table. The
-    platform side (`platform_logs`) is swept via shared.logging — this
-    helper handles only the rich-payload tables that aren't covered there.
+    When ``domain_id`` is provided, the sweep is scoped to that Domain:
+
+      * `dhcp_deployments` rows are filtered through their parent
+        `DhcpScope` (which carries `domain_id`).
+      * `platform_logs` rows are filtered by `domain_id` directly via
+        `shared.logging.sweep_old_logs`.
+      * `dhcp_activity_logs` is the legacy pre-multi-domain table with
+        no `domain_id` column. When ``domain_id`` is set, those rows
+        are LEFT ALONE (a Domain-scoped sweep must never touch other
+        Domains' rows; the legacy table predates the boundary). When
+        ``domain_id`` is None (CLI cross-Domain sweep), the legacy
+        rows are purged as before.
+
+    Returns a summary dict of how many rows were removed per table.
     """
     if retention_days is None:
         retention_days = _platform_retention_days()
@@ -3628,39 +3672,49 @@ def sweep_old_logs(retention_days: int | None = None) -> dict:
         raise ValueError("retention_days must be positive")
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
 
-    activity_deleted = (
-        DhcpActivityLog.query
-        .filter(DhcpActivityLog.created_at < cutoff)
-        .filter(~((DhcpActivityLog.category == PHASE0_CATEGORY) &
-                  (DhcpActivityLog.action == PHASE0_ACTION)))
-        .delete(synchronize_session=False)
-    )
-    deployments_deleted = (
-        DhcpDeployment.query
-        .filter(DhcpDeployment.created_at < cutoff)
-        .delete(synchronize_session=False)
-    )
+    if domain_id is None:
+        activity_deleted = (
+            DhcpActivityLog.query
+            .filter(DhcpActivityLog.created_at < cutoff)
+            .filter(~((DhcpActivityLog.category == PHASE0_CATEGORY) &
+                      (DhcpActivityLog.action == PHASE0_ACTION)))
+            .delete(synchronize_session=False)
+        )
+    else:
+        # Legacy table has no domain_id — skip when scoped.
+        activity_deleted = 0
+
+    deployments_q = DhcpDeployment.query.filter(
+        DhcpDeployment.created_at < cutoff)
+    if domain_id is not None:
+        deployments_q = (deployments_q
+                         .join(DhcpScope, DhcpScope.id == DhcpDeployment.scope_id)
+                         .filter(DhcpScope.domain_id == domain_id))
+    deployments_deleted = deployments_q.delete(synchronize_session=False)
     db.session.commit()
 
-    # Also sweep the platform-wide log table.
+    # Also sweep the platform-wide log table — same Domain scope.
     from shared.logging import sweep_old_logs as platform_sweep
-    plog_result = platform_sweep(retention_days)
+    plog_result = platform_sweep(retention_days, domain_id=domain_id)
     platform_deleted = plog_result.get("deleted", 0)
 
     summary = {
         "retention_days": retention_days,
         "cutoff": cutoff.isoformat(),
+        "domain_id": domain_id,
         "activity_deleted": activity_deleted,
         "deployments_deleted": deployments_deleted,
         "platform_log_deleted": platform_deleted,
     }
+    scope_note = (f"domain_id={domain_id}" if domain_id is not None
+                  else "all Domains")
     _log_activity("system", "log_retention_sweep", "ok",
                   target=f"retention={retention_days}d",
                   detail=(f"Deleted {activity_deleted} legacy activity row(s), "
                           f"{deployments_deleted} deployment row(s), "
                           f"{platform_deleted} platform_logs row(s) older "
-                          f"than {cutoff.isoformat()}. Phase 0 validation "
-                          f"rows preserved."))
+                          f"than {cutoff.isoformat()} ({scope_note}). "
+                          f"Phase 0 validation rows preserved."))
     return summary
 
 
@@ -3682,8 +3736,14 @@ def system_sweep_logs():
         flash("retention_days must be ≥ 1.", "danger")
         return redirect(url_for("dhcp.activity"))
 
+    # Domain-scoped sweep: the operator's button only ever wipes the
+    # active Domain's rows. Cross-Domain sweeps run via the CLI helper.
+    domain_id = _active_domain_id()
+    if domain_id is None:
+        flash("No active Domain — pick one first.", "warning")
+        return redirect(url_for("dhcp.activity"))
     try:
-        summary = sweep_old_logs(retention)
+        summary = sweep_old_logs(retention, domain_id=domain_id)
     except Exception as exc:
         _log_activity("system", "log_retention_sweep", "failed",
                       target=f"retention={retention}d", detail=str(exc))
@@ -3704,13 +3764,29 @@ def system_sweep_logs():
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys")
 @admin_required
 def api_tenant_keys(tenant_id):
-    keys = ApiKey.query.filter_by(tenant_id=tenant_id, is_active=True).all()
+    # Domain-scope guard: the active Domain's API key must belong to the
+    # tenant in the URL. Otherwise an admin in Domain A could enumerate
+    # Domain B's API keys via URL crafting.
+    domain = getattr(g, "domain", None)
+    if (domain is None
+            or getattr(domain, "api_key", None) is None
+            or domain.api_key.tenant_id != tenant_id):
+        return jsonify({"error": "cross-Domain access refused"}), 403
+    # Narrow further to the active Domain's bound key — every legitimate
+    # cascade only ever needs that one row.
+    keys = (ApiKey.query
+            .filter_by(tenant_id=tenant_id, is_active=True)
+            .filter(ApiKey.id == domain.api_key_id)
+            .all())
     return jsonify([{"id": k.id, "name": k.name} for k in keys])
 
 
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines")
 @admin_required
 def api_tenant_engines(tenant_id, key_id):
+    guard = _assert_active_domain_match(tenant_id, key_id)
+    if guard is not None:
+        return guard
     tenant = db.session.get(Tenant, tenant_id)
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
@@ -3732,6 +3808,9 @@ def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
     Use this when scope discovery returns 0 to inspect the actual shape of
     the SMC API payload (it varies slightly between engine types / versions).
     """
+    guard = _assert_active_domain_match(tenant_id, key_id)
+    if guard is not None:
+        return guard
     tenant = db.session.get(Tenant, tenant_id)
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
@@ -3748,6 +3827,9 @@ def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/scopes")
 @admin_required
 def api_engine_scopes(tenant_id, key_id, engine_name):
+    guard = _assert_active_domain_match(tenant_id, key_id)
+    if guard is not None:
+        return guard
     tenant = db.session.get(Tenant, tenant_id)
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:

@@ -242,12 +242,20 @@ def _write(*, level: str, feature: str, action: str,
 
 # ── Retention sweep ──────────────────────────────────────────────────────
 
-def sweep_old_logs(retention_days: Optional[int] = None) -> dict:
+def sweep_old_logs(retention_days: Optional[int] = None,
+                   domain_id: Optional[int] = None) -> dict:
     """Delete platform_logs rows older than the retention horizon.
 
     `system` feature rows that match well-known sentinel actions are
     preserved (Phase 0 validation marker, etc.) — the retention sweep
     must never erase the gate signals that gate Phase 4 deploys.
+
+    When ``domain_id`` is provided, only rows for that Domain (plus
+    `system`-feature rows that have NO domain_id, which are global
+    bootstrap markers) are eligible. This is what the per-Domain
+    "Sweep retention now" button uses so an operator in Domain A
+    cannot wipe Domain B's logs. When ``None``, every Domain's rows
+    are eligible (CLI cross-Domain sweep).
     """
     if retention_days is None:
         retention_days = current_retention_days()
@@ -263,11 +271,19 @@ def sweep_old_logs(retention_days: Optional[int] = None) -> dict:
             ~((PlatformLog.feature == "system")
               & (PlatformLog.action.in_(preserved_actions)))
         )
+        if domain_id is not None:
+            # Domain-scoped sweep: also keep system rows that don't have
+            # a domain_id (bootstrap / migration markers — they're not
+            # tied to any one Domain and shouldn't be deleted by an
+            # operator in any single one).
+            q = q.filter(PlatformLog.domain_id == domain_id)
         deleted = q.delete(synchronize_session=False)
         db.session.commit()
-        log.info("platform log sweep: deleted %d rows older than %s",
-                 deleted, cutoff.isoformat())
-        return {"deleted": deleted, "cutoff": cutoff.isoformat()}
+        log.info("platform log sweep: deleted %d rows older than %s "
+                 "(domain_id=%s)", deleted, cutoff.isoformat(),
+                 domain_id if domain_id is not None else "ALL")
+        return {"deleted": deleted, "cutoff": cutoff.isoformat(),
+                "domain_id": domain_id}
     except Exception as exc:
         log.error("platform log sweep failed: %s", exc)
         try:

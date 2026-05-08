@@ -147,15 +147,42 @@ def init_tls_manager(app):
 
 # ── Dashboard ───────────────────────────────────────────────────────────
 
+def _certs_in_active_domain(domain_id):
+    """ManagedCertificate rows that have at least one TLSDeployment in
+    the given Domain (Domain-Scoping Audit fix C, Path I).
+
+    `ManagedCertificate` itself has no `domain_id` column — its
+    `domain` field is a DNS hostname, and a cert lineage on the
+    FEA host can be deployed to engines across multiple Domains.
+    Visibility is therefore implicit through the linked
+    `TLSDeployment` rows (which ARE Domain-scoped). An operator in
+    Domain B never sees the existence of a cert deployed only in
+    Domain A.
+
+    Returns an empty list when ``domain_id is None`` (no active
+    Domain → no rows).
+    """
+    if domain_id is None:
+        return []
+    return (ManagedCertificate.query
+            .join(TLSDeployment,
+                  TLSDeployment.certificate_id == ManagedCertificate.id)
+            .filter(TLSDeployment.domain_id == domain_id)
+            .distinct()
+            .order_by(ManagedCertificate.domain.asc())
+            .all())
+
+
 @tls_bp.route("/")
 @admin_required
 def dashboard():
     domain = getattr(g, "domain", None)
     domain_id = domain.id if domain is not None else None
 
-    # ManagedCertificate is platform-global — it tracks certbot lineages on
-    # disk (`/etc/letsencrypt/live/*`) which exist per host, not per Domain.
-    certificates = ManagedCertificate.query.all()
+    # Domain-scoped via the linked TLSDeployment rows. A cert tracked
+    # but never deployed in this Domain stays hidden — visit
+    # /tls/deploy to deploy it for the first time.
+    certificates = _certs_in_active_domain(domain_id)
 
     if domain_id is None:
         deployments, deploy_logs, activity_logs = [], [], []
@@ -185,7 +212,13 @@ def dashboard():
 @tls_bp.route("/certificates")
 @admin_required
 def certificates_list():
-    managed = ManagedCertificate.query.all()
+    domain = getattr(g, "domain", None)
+    domain_id = domain.id if domain is not None else None
+    # Same Path I scoping as the dashboard — only certs deployed in the
+    # active Domain are visible here. Discovered (untracked) certs from
+    # the certbot live dir are still listed; they're host-level, not
+    # Domain-level.
+    managed = _certs_in_active_domain(domain_id)
     live_dir = current_app.config.get("CERTBOT_LIVE_DIR", "/etc/letsencrypt/live")
     discovered = discover_certificates(live_dir)
     managed_domains = {c.domain for c in managed}
@@ -253,7 +286,14 @@ def deploy_form():
         flash(f"Deployment created for {dep.service_name}.", "success")
         return redirect(url_for("tls.deploy_execute", deployment_id=dep.id))
 
-    certificates = ManagedCertificate.query.all()
+    # The deploy form is a write-side picker — the operator may be
+    # creating the FIRST deployment of a tracked cert into the active
+    # Domain, in which case Path I scoping (subquery via TLSDeployment)
+    # would hide every never-deployed-here cert and produce an empty
+    # dropdown (chicken-and-egg). Show every tracked cert; the actual
+    # TLSDeployment row gets stamped with the active Domain on submit.
+    certificates = (ManagedCertificate.query
+                    .order_by(ManagedCertificate.domain.asc()).all())
     tenants = Tenant.query.filter_by(is_active=True).order_by(Tenant.name).all()
     return render_template(
         "tls/deploy.html", certificates=certificates, tenants=tenants,

@@ -210,6 +210,15 @@ def _enqueue_scope_reservations(scope, selected, project_id, correlation_id,
                 host_name = _make_host_name(scope, ip, mac, desc, project_id)
 
                 # Insert DhcpReservation in queued state.
+                #
+                # Domain-Scoping note (audit fix D3): `DhcpReservation` has
+                # NO `domain_id` column — Domain scope is inherited via
+                # `scope_id → DhcpScope.domain_id` (FK with ON DELETE
+                # CASCADE). The downstream queue helper
+                # `enqueue_reservation_create` reads `scope.domain_id` and
+                # stamps it on the PendingChange row directly. Don't try
+                # to add a `domain_id=` kwarg here — there's no column
+                # for it; the FK propagation is the canonical path.
                 row = DhcpReservation(
                     scope_id=scope.id,
                     smc_host_name=host_name,

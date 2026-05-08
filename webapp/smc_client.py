@@ -131,7 +131,12 @@ ELEMENT_TYPES = {
     "icmp_services":   {"cls": ICMPService,     "label": "ICMP Services"},
     "service_groups":  {"cls": ServiceGroup,    "label": "Service Groups"},
     "fw_policies":     {"cls": FirewallPolicy,  "label": "Firewall Policies"},
-    "l3_firewalls":    {"cls": Layer3Firewall,  "label": "Layer-3 Firewall Engines"},
+    # Legacy entry — kept so the dashboard tile + sidebar item still
+    # render. The /browse/l3_firewalls route hard-redirects to
+    # /engines/clusters because that page covers every engine type
+    # (clusters, virtual engines, IPS, masters), not just the
+    # Layer3Firewall subclass we'd see here.
+    "l3_firewalls":    {"cls": Layer3Firewall,  "label": "Engines"},
 }
 
 

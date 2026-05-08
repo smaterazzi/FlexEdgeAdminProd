@@ -480,17 +480,50 @@
         const token = tokenEl ? tokenEl.getAttribute('content') : '';
         window.CSRF_TOKEN = token;
 
-        // Drop-in fetch wrapper: same signature as fetch(), auto-adds the
-        // X-CSRFToken header for unsafe methods.
+        // Global session-expired guard for ALL fetch() callers.
+        //
+        // When a session expires mid-AJAX, the auth decorators reply with
+        // a 302 to /login. fetch() follows redirects transparently, so the
+        // caller gets back the rendered login HTML page. If the caller
+        // then does `await r.json()` it crashes with "Unexpected token '<',
+        // \"<!doctype \"... is not valid JSON" — confusing for the operator.
+        //
+        // Patching window.fetch (rather than only fexFetch) means raw
+        // fetch() callers in tls/deploy.html, dhcp/credentials.html,
+        // engines/tools_scan.html etc. all benefit without per-template
+        // edits. We bounce the page to /login?next=... and throw so any
+        // .catch handler fires and stops follow-up work — by then the
+        // navigation is already in flight.
+        const _origFetch = window.fetch.bind(window);
+        window.fetch = async function (input, opts) {
+            const res = await _origFetch(input, opts);
+            const looksLikeAuth = res.redirected && /\/(login|auth\/)/.test(res.url);
+            if (looksLikeAuth || res.status === 401 || res.status === 403) {
+                // Skip the bounce when we're already on a login-ish path
+                // (avoids loops if /login itself made an AJAX call).
+                if (!/\/(login|auth\/)/.test(window.location.pathname)) {
+                    const here = encodeURIComponent(
+                        window.location.pathname + window.location.search);
+                    window.location.replace('/login?next=' + here);
+                }
+                throw new Error('session expired — redirecting to login');
+            }
+            return res;
+        };
+
+        // Drop-in fetch wrapper for callers that need automatic CSRF on
+        // unsafe methods. Auth-redirect handling is provided by the
+        // window.fetch patch above, so this stays a thin layer.
         window.fexFetch = function (url, opts) {
             opts = opts || {};
             const method = (opts.method || 'GET').toUpperCase();
+            opts.headers = Object.assign({}, opts.headers || {}, {
+                'X-Requested-With': 'XMLHttpRequest',
+            });
             if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
-                opts.headers = Object.assign({}, opts.headers || {}, {
-                    'X-CSRFToken': token,
-                });
+                opts.headers['X-CSRFToken'] = token;
             }
-            return fetch(url, opts);
+            return window.fetch(url, opts);
         };
     })();
 

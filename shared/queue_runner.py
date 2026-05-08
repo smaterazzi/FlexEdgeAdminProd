@@ -287,6 +287,55 @@ def _invalidate_cache_for_change(change):
                       section, exc)
 
 
+# ── SMC error humanizer ──────────────────────────────────────────────────
+#
+# Every handler funnels its failure string through `_mark_push_failed`
+# below. Wrapping that one chokepoint with a tiny pattern-matcher means
+# every handler — install_ssh_rule, deploy_tls, create_*, upload_policy,
+# anything future — automatically picks up clearer remediation hints
+# without touching individual handlers.
+#
+# Patterns are conservative: we prepend a one-liner remediation, then
+# include the raw SMC error verbatim so debugging never loses signal.
+# Anything unmatched falls through unchanged.
+
+def _humanize_smc_error(exc_msg: str) -> str:
+    """Detect well-known SMC failure classes and prepend a remediation
+    hint. Returns the unchanged message when nothing matches.
+    """
+    if not exc_msg:
+        return exc_msg
+    s = exc_msg.lower()
+
+    # Policy lock contention — another SMC session is editing this
+    # policy and holds its lock. Common SMC phrasings observed in the
+    # wild:
+    #   "policy is locked by user <name>"
+    #   "policy <X> is currently locked"
+    #   "the element is currently locked by another administrator"
+    #   "cannot obtain lock on the policy"
+    #   "lock is owned by"
+    lock_signals = (
+        "policy is locked",
+        "is currently locked",
+        "currently locked by",
+        "locked by another",
+        "locked by the user",
+        "locked by user",
+        "cannot obtain lock",
+        "lock is owned by",
+        "unable to obtain lock",
+    )
+    if any(sig in s for sig in lock_signals):
+        return ("Policy is locked by another SMC session — somebody is "
+                "currently editing it in SMC Management Client (or another "
+                "automation holds the lock). Ask the holder to commit or "
+                "discard their changes, then retry this row from /changes/. "
+                f"[raw: {exc_msg}]")
+
+    return exc_msg
+
+
 # ── State-transition primitives ──────────────────────────────────────────
 
 def _mark_pushed(change, *, applied: bool, detail: str = ""):
@@ -304,13 +353,20 @@ def _mark_pushed(change, *, applied: bool, detail: str = ""):
 
 
 def _mark_push_failed(change, error: str):
-    """QUEUED → PUSH_FAILED. Commits + audits."""
+    """QUEUED → PUSH_FAILED. Commits + audits.
+
+    Runs the raw error through `_humanize_smc_error` so well-known SMC
+    failure classes (policy lock, etc.) get a clearer remediation hint
+    prepended before the operator sees them on /changes/. The audit log
+    receives the same humanised text so /logs is consistent.
+    """
     from shared.db import db
+    friendly = _humanize_smc_error(error or "")
     change.state = "push_failed"
-    change.push_error_text = (error or "")[:4000]
+    change.push_error_text = friendly[:4000]
     change.push_error_at = _utcnow()
     db.session.commit()
-    _audit("push.failed", change, status="failed", detail=error)
+    _audit("push.failed", change, status="failed", detail=friendly)
 
 
 def _mark_aborted(change, reason: str = ""):

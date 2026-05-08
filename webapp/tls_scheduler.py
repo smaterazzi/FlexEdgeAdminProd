@@ -29,7 +29,18 @@ def cert_file_hash(lineage_path: str) -> str:
 
 
 def handle_renewal_webhook(domain: str) -> dict:
-    """Re-deploy all active deployments tied to a domain's certificate."""
+    """Re-deploy all active deployments tied to a domain's certificate.
+
+    Cross-Domain by design (Domain-Scoping Audit, exception E2): the
+    certbot renewal hook fires at host level, not Domain level, so a
+    single cert lineage may legitimately fan out to engines across
+    multiple FlexEdgeAdmin Domains. To keep the audit trail honest,
+    this emits ONE audit row per affected Domain with
+    `feature="tls"`, `action="renew.cross_domain"`, the Domain id and
+    the count of redeployments. Operators reading `/logs` in any one
+    Domain see exactly the renewal actions that touched THEIR engines,
+    not a global "the cert renewed" line for the whole host.
+    """
     cert = ManagedCertificate.query.filter_by(domain=domain).first()
     if not cert:
         return {"error": f"No managed certificate for domain: {domain}", "renewed": 0}
@@ -42,22 +53,54 @@ def handle_renewal_webhook(domain: str) -> dict:
     ).all()
 
     results = []
+    # Per-Domain bucket so we can emit one audit row per Domain at the
+    # end with its own count + status breakdown.
+    by_domain: dict[int, dict] = {}
     for dep in deps:
         if not dep.tenant.is_active or not dep.api_key.is_active:
             results.append({
                 "deployment_id": dep.id, "status": "skipped",
                 "reason": "inactive tenant or API key",
             })
+            bucket = by_domain.setdefault(
+                dep.domain_id or 0,
+                {"deployed": 0, "failed": 0, "skipped": 0, "engines": []},
+            )
+            bucket["skipped"] += 1
             continue
         result = run_deployment(dep.id, action="renew")
+        outcome = "deployed" if result.success else "failed"
         results.append({
             "deployment_id": dep.id,
             "service_name": dep.service_name,
             "engine": dep.engine_name,
-            "status": "deployed" if result.success else "failed",
+            "status": outcome,
             "error": result.error,
             "steps": result.steps,
         })
+        bucket = by_domain.setdefault(
+            dep.domain_id or 0,
+            {"deployed": 0, "failed": 0, "skipped": 0, "engines": []},
+        )
+        bucket[outcome] += 1
+        bucket["engines"].append(dep.engine_name)
+
+    # One audit row per Domain affected by this renewal.
+    try:
+        from shared.logging import audit
+        for did, b in by_domain.items():
+            engines = ", ".join(sorted(set(b["engines"])))[:200]
+            status = "ok" if b["failed"] == 0 else (
+                "partial" if b["deployed"] > 0 else "failed")
+            audit("tls", "renew.cross_domain",
+                  status=status,
+                  target=domain,                      # the DNS hostname (cert lineage)
+                  detail=(f"deployed={b['deployed']} failed={b['failed']} "
+                          f"skipped={b['skipped']} engines=[{engines}]"),
+                  domain_id=did or None,              # FEA Domain — None for legacy rows
+                  source_correlation_id=f"tls-renew-{cert.id}")
+    except Exception as exc:
+        logger.warning("audit emission failed for renewal of %s: %s", domain, exc)
 
     return {"domain": domain, "renewed": len(results), "results": results}
 

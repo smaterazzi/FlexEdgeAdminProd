@@ -756,6 +756,13 @@ def browse(type_key):
     """List all elements of a given type."""
     if type_key not in smc_client.ELEMENT_TYPES:
         return redirect(url_for("index"))
+    # Engines have a dedicated, richer view at /engines/clusters that
+    # covers every engine type (clusters, virtual, IPS, masters), not
+    # just the Layer3Firewall subclass this generic explorer enumerates.
+    # Hard-redirect so any old bookmark + the dashboard tile both land
+    # on the canonical page.
+    if type_key == "l3_firewalls":
+        return redirect(url_for("engines.clusters"))
     filter_text = request.args.get("q", "").strip()
     fgt_only = request.args.get("fgt", "0") == "1"
     label = smc_client.ELEMENT_TYPES[type_key]["label"]
@@ -1905,11 +1912,16 @@ def _load_submission_in_active_domain(sub_id):
     submissions tied to the Domain currently in `g.domain`.
     """
     from flask import abort
-    sub = OptimizationSubmission.query.get_or_404(sub_id)
     domain_id = g.domain.id if getattr(g, "domain", None) else None
-    if domain_id is None or sub.domain_id != domain_id:
+    if domain_id is None:
         abort(404)
-    return sub
+    # Filter at the query level (defence-in-depth — a future code path
+    # that reuses this helper will not bypass the scope check). Any
+    # mismatch returns 404, never reveal that a row exists in another
+    # Domain.
+    return (OptimizationSubmission.query
+            .filter_by(id=sub_id, domain_id=domain_id)
+            .first_or_404())
 
 
 @app.route("/optimize/submissions/<int:sub_id>")
@@ -2008,13 +2020,18 @@ def logs_index():
     standing rule (memory: feedback_logging_standing_rule). Per-feature
     activity tables are no longer written, only read for legacy backfill.
 
-    Filtering: feature, level, status, since-hours, free-text. Default
-    scope is the active Domain plus rows with `domain_id IS NULL`
-    (system events). Toggle `active_only=0` to widen to every Domain
-    the operator has access to.
+    Scope (Domain-Scoping Audit, fix B): always filtered to the active
+    Domain. System rows with `domain_id IS NULL` (bootstrap markers,
+    pre-Domain events) stay visible because they belong to no Domain
+    and are domain-agnostic — they don't constitute a cross-Domain
+    leak. The legacy `active_only=0` widen branch was removed; an
+    operator who needs to inspect another Domain's logs must switch
+    Domains in the topbar selector first.
+
+    Filtering: feature, level, status, since-hours, free-text.
     """
     from datetime import datetime, timezone, timedelta
-    from webapp.models import PlatformLog, Domain
+    from webapp.models import PlatformLog
     from shared.logging import list_features, current_log_mode
 
     feature = (request.args.get("feature") or "").strip()
@@ -2029,8 +2046,6 @@ def logs_index():
         limit = max(50, min(2000, int(request.args.get("limit", "200"))))
     except ValueError:
         limit = 200
-    active_only_raw = (request.args.get("active_only") or "1").strip()
-    active_only = active_only_raw not in ("0", "false", "off", "")
 
     qry = PlatformLog.query
     if feature:
@@ -2048,25 +2063,16 @@ def logs_index():
                          (PlatformLog.detail.ilike(like)) |
                          (PlatformLog.action.ilike(like)))
 
-    if active_only:
-        active_id = g.domain.id if getattr(g, "domain", None) else None
-        if active_id is None:
-            qry = qry.filter(PlatformLog.domain_id.is_(None))
-        else:
-            qry = qry.filter((PlatformLog.domain_id == active_id) |
-                             (PlatformLog.domain_id.is_(None)))
+    # Domain-scoping invariant: only the active Domain's rows + system
+    # (domain_id IS NULL) rows are eligible. There is NO Super-Admin
+    # widen toggle on this view — switch Domains in the topbar to see
+    # another Domain's history.
+    active_id = g.domain.id if getattr(g, "domain", None) else None
+    if active_id is None:
+        qry = qry.filter(PlatformLog.domain_id.is_(None))
     else:
-        # Show every Domain the user has access to + system rows.
-        email = (session.get("user") or {}).get("email", "")
-        my_profiles = user_manager.get_user_profiles(email)
-        my_domain_slugs = [p.get("tenant") for p in my_profiles if p.get("tenant")]
-        if my_domain_slugs:
-            my_domain_ids = [d.id for d in
-                             Domain.query.filter(Domain.slug.in_(my_domain_slugs)).all()]
-            qry = qry.filter(PlatformLog.domain_id.in_(my_domain_ids) |
-                             PlatformLog.domain_id.is_(None))
-        else:
-            qry = qry.filter(PlatformLog.domain_id.is_(None))
+        qry = qry.filter((PlatformLog.domain_id == active_id) |
+                         (PlatformLog.domain_id.is_(None)))
 
     total_count = qry.count()
     logs = qry.order_by(PlatformLog.timestamp.desc()).limit(limit).all()
@@ -2077,7 +2083,6 @@ def logs_index():
         total_count=total_count,
         features=list_features(),
         log_mode=current_log_mode(),
-        active_only=active_only,
         filters={
             "feature": feature, "level": level, "status": status,
             "q": q, "since_hours": since_hours,

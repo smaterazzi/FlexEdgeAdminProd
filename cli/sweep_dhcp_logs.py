@@ -45,6 +45,15 @@ def main() -> int:
         help="Suppress JSON output on success; only print on failure. "
              "Useful for cron entries that should stay silent on the happy path.",
     )
+    parser.add_argument(
+        "--domain", "-d", type=str, default=None,
+        help="Sweep only the given Domain (by slug). If omitted, every "
+             "active Domain is swept independently — each gets its own "
+             "scoped delete pass + audit log entry. Use this when the "
+             "cron-friendly default ('sweep all Domains') is what you "
+             "want for shared retention; pass an explicit slug for "
+             "targeted maintenance.",
+    )
     args = parser.parse_args()
 
     if args.retention <= 0:
@@ -65,16 +74,47 @@ def main() -> int:
 
     try:
         with app.app_context():
-            summary = sweep_old_logs(args.retention)
+            from webapp.models import Domain
+            if args.domain:
+                # Targeted Domain sweep.
+                d = Domain.query.filter_by(slug=args.domain).first()
+                if d is None:
+                    print(json.dumps({"ok": False,
+                                      "error": f"unknown domain slug {args.domain!r}"}),
+                          file=sys.stderr)
+                    return 4
+                summary = sweep_old_logs(args.retention, domain_id=d.id)
+                summary["domain_slug"] = d.slug
+                summaries = [summary]
+            else:
+                # Cross-Domain sweep — iterate every active Domain so each
+                # gets its own scoped pass (this fires per-Domain audit
+                # entries, instead of one global "wiped everything" row).
+                summaries = []
+                for d in Domain.query.filter_by(is_active=True).all():
+                    s = sweep_old_logs(args.retention, domain_id=d.id)
+                    s["domain_slug"] = d.slug
+                    summaries.append(s)
     except Exception as exc:
         print(json.dumps({"ok": False,
                           "error": f"{type(exc).__name__}: {exc}"}),
               file=sys.stderr)
         return 1
 
-    summary["ok"] = True
+    payload = {
+        "ok": True,
+        "retention_days": args.retention,
+        "scope": ("single" if args.domain else "all_domains"),
+        "domain_count": len(summaries),
+        "totals": {
+            "activity_deleted": sum(s.get("activity_deleted", 0) for s in summaries),
+            "deployments_deleted": sum(s.get("deployments_deleted", 0) for s in summaries),
+            "platform_log_deleted": sum(s.get("platform_log_deleted", 0) for s in summaries),
+        },
+        "per_domain": summaries,
+    }
     if not args.quiet:
-        print(json.dumps(summary, default=str))
+        print(json.dumps(payload, default=str))
     return 0
 
 

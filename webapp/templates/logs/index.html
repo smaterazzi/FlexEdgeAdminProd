@@ -82,13 +82,12 @@
       <div class="d-flex justify-content-between align-items-center mt-2">
         <span class="small text-muted">
           Showing {{ logs|length }} of {{ total_count }} ({{ active_domain or 'no domain' }})
-          {% if active_only %} — current Domain only{% else %} — all visible Domains{% endif %}
+          — current Domain only
         </span>
         <div class="d-flex gap-2 align-items-center">
-          <a href="{{ url_for('logs_index', **strip_args(request.args, 'active_only')) }}{% if not active_only %}?active_only=1{% endif %}"
-             class="small text-muted">
-            {% if active_only %}Show all my Domains{% else %}Limit to current Domain{% endif %}
-          </a>
+          <span class="small text-muted" title="Cross-Domain log inspection requires switching Domains in the topbar selector.">
+            <i class="bi bi-info-circle"></i> Domain-scoped
+          </span>
           <a href="{{ url_for('logs_index') }}" class="small text-muted">Reset</a>
         </div>
       </div>
