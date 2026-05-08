@@ -277,14 +277,19 @@ def _reload_dhcpd(target: SSHTarget, cred: SSHCredential) -> str:
 
     Forcepoint engines run the daemon under a few possible names; we try
     them in order and stop at the first that signals at least one process.
+
+    Implementation note: we use ``busybox killall`` rather than ``pkill``
+    because ``pkill`` isn't a BusyBox applet on Forcepoint NGFW (it's not
+    in the engine BusyBox build at all). BusyBox ``killall`` matches the
+    process basename exactly by default, which is what we want — same
+    semantics as ``pkill -x``. Going through ``busybox <applet>`` rather
+    than a bare ``killall`` covers engines whose /bin symlinks aren't
+    populated.
     """
-    # Exact-match (-x) on argv[0] so we never HUP an unrelated process
-    # whose cmdline happens to contain the string (e.g. an editor session
-    # on dhcp-server.conf, a tail -f, etc.).
     candidates = [
         # name, command (must exit 0 if signal was sent to ≥1 process)
-        ("dhcp-server", "pkill -HUP -x dhcp-server"),
-        ("dhcpd",       "pkill -HUP -x dhcpd"),
+        ("dhcp-server", "busybox killall -HUP dhcp-server"),
+        ("dhcpd",       "busybox killall -HUP dhcpd"),
     ]
     for name, cmd in candidates:
         try:
@@ -293,7 +298,7 @@ def _reload_dhcpd(target: SSHTarget, cred: SSHCredential) -> str:
             return f"reload skipped: SSH error during {name!r}: {exc}"
         if rc == 0:
             return ""    # ≥1 matching process signalled
-        # rc=1 from pkill means "no process matched" — try the next name.
+        # rc=1 from busybox killall means "no process matched" — try the next.
         if rc != 1:
             return (f"reload command {cmd!r} returned rc={rc} "
                     f"stdout={stdout!r} stderr={stderr!r}")

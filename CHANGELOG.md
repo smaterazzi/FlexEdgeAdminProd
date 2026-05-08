@@ -6,6 +6,61 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### SSH-issued shell scripts: `busybox <applet>` invocation everywhere (2026-05-08)
+
+Operator confirmed via the engine's `busybox --help` output that the
+Forcepoint NGFW BusyBox build on their cluster does NOT populate
+applet symlinks under /bin for every applet. The applet listing —
+which includes `nc`, `arping`, `nslookup`, `awk`, `ip`, `head`,
+`grep`, `sed`, `mktemp`, `rm`, `tr`, `killall` — comes with the
+note that "[applets] are usable only using the busybox command".
+Bare `nc -z` / `arping` / `nslookup` invocations were silently
+returning "command not found" exit codes, which is why the scan
+tool's Phase 3 reported every port as `closed` and the firewall
+saw zero TCP SYN egress.
+
+Audit and fix landed across three files:
+
+1. **[webapp/engine_scan.py](webapp/engine_scan.py)** `_SCAN_SCRIPT`
+   — every applet (`ping`, `ip neighbor`, `head`, `grep`, `arping`,
+   `ip route`, `awk`, `nc`, `tr`, `nslookup`, `sed`, `mktemp`,
+   `rm`) now prefixed with `busybox`. Shell builtins (`printf`,
+   `[`, `read`, `set`, `wait`, `for`, `:`) left bare.
+2. **[webapp/dhcp_subnet_scan.py](webapp/dhcp_subnet_scan.py)**
+   `_SCAN_SCRIPT` — same fix for its 2-phase ICMP+arping scan
+   (Phase 2 was hitting the same silent-skip on engines without
+   the symlinks).
+3. **[webapp/dhcp_pusher.py](webapp/dhcp_pusher.py)**
+   `_reload_dhcpd` — replaced `pkill -HUP -x <name>` with
+   `busybox killall -HUP <name>`. `pkill` is **not in the
+   BusyBox applet table at all** on the engine; only `kill` and
+   `killall` are. BusyBox `killall` matches process basename
+   exactly by default, which is the same semantics `pkill -x`
+   provides — so behavior is preserved on engines that worked
+   before AND fixed on engines where the legacy command was
+   silently failing.
+
+`busybox <applet>` is universally safe — it works on every
+BusyBox build because `busybox` itself is always on PATH, and
+`busybox <applet>` is the canonical multi-call invocation. On
+engines that DO populate symlinks (so bare `nc` would also
+work), going through `busybox` adds one syscall per command
+and is otherwise a no-op.
+
+Standing rule (saved to memory `feedback_busybox_applet_prefix`):
+every shell script we ship over SSH from FlexEdge to a Forcepoint
+NGFW must invoke external utilities as `busybox <applet>`, never
+bare. Shell builtins handled directly by ash do not need the
+prefix. When adding a new SSH-issued command, double-check the
+applet name against the engine's `busybox --list` (the operator's
+list is the canonical reference); commands not in that list need
+a different applet entirely (e.g. `pkill` → `killall`).
+
+Files NOT touched: [webapp/dhcp_ssh.py](webapp/dhcp_ssh.py)
+(only issues `echo flexedge-ok` / `echo flexedge-first-contact`
+— `echo` is a shell builtin), [webapp/engine_terminal.py](webapp/engine_terminal.py)
+(interactive PTY, the operator types their own commands).
+
 ### Engines → Tools → Scan: port → service-name labels in result table (2026-05-08)
 
 Open-port badges in the scan-result table now show the SMC service

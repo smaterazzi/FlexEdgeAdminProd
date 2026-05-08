@@ -164,10 +164,20 @@ def parse_port_list(raw: str) -> list[int]:
 # servers behind firewalls that drop ICMP). Phase 4 (RDNS) only resolves
 # hostnames for hosts that did reply, since reverse-DNS on dead IPs is
 # noise.
+# Every external utility (ping, ip, arping, nc, nslookup, awk, grep,
+# head, sed, tr, mktemp, rm) is invoked through `busybox <applet>`
+# rather than a bare command name. On Forcepoint NGFW BusyBox builds
+# the applet symlinks under /bin are not all present — running plain
+# `nc -z` / `arping` / `nslookup` returns "command not found" so the
+# script silently records every port as closed and fires no SYN
+# packets at all. Going through the `busybox` multi-call binary
+# always works because BusyBox itself is on PATH on every engine.
+# Shell builtins (printf, echo, [, read, set, wait, for, :) do NOT
+# need the prefix — ash handles those directly.
 _SCAN_SCRIPT = r"""
 BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; shift 6
-TMP=$(mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
-REACHABLE=$(mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
+TMP=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
+REACHABLE=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 : > "$TMP"
 : > "$REACHABLE"
 
@@ -175,9 +185,9 @@ REACHABLE=$(mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 n=0
 for ip in "$@"; do
     (
-        if ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
-            NEIGH=$(ip neighbor show "$ip" 2>/dev/null | head -1)
-            MAC=$(printf '%s\n' "$NEIGH" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+        if busybox ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
+            NEIGH=$(busybox ip neighbor show "$ip" 2>/dev/null | busybox head -1)
+            MAC=$(printf '%s\n' "$NEIGH" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
             if [ -n "$MAC" ]; then
                 printf '%s ICMP_OK %s\n' "$ip" "$MAC"
             else
@@ -200,13 +210,13 @@ while IFS= read -r line; do
     set -- $line
     ip=$1; state=$2
     if [ "$state" = "ICMP_FAIL" ]; then
-        DEV=$(ip route get "$ip" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
+        DEV=$(busybox ip route get "$ip" 2>/dev/null | busybox awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
         if [ -z "$DEV" ]; then
             printf '%s NO_ROUTE\n' "$ip"
             continue
         fi
-        OUT=$(arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
-        MAC=$(printf '%s\n' "$OUT" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+        OUT=$(busybox arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
+        MAC=$(printf '%s\n' "$OUT" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
         if [ -n "$MAC" ]; then
             printf '%s ARP_OK %s\n' "$ip" "$MAC"
             printf '%s\n' "$ip" >> "$REACHABLE"
@@ -222,9 +232,9 @@ done < "$TMP"
 # whole point of running Tools→Scan against a remote subnet.
 if [ -n "$PORTS" ]; then
     for ip in "$@"; do
-        for port in $(printf '%s' "$PORTS" | tr ',' ' '); do
+        for port in $(printf '%s' "$PORTS" | busybox tr ',' ' '); do
             (
-                if nc -z -w "$CT" "$ip" "$port" >/dev/null 2>&1; then
+                if busybox nc -z -w "$CT" "$ip" "$port" >/dev/null 2>&1; then
                     printf '%s PORT %s open\n' "$ip" "$port"
                 else
                     printf '%s PORT %s closed\n' "$ip" "$port"
@@ -243,7 +253,7 @@ if [ -s "$REACHABLE" ]; then
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         (
-            HN=$(nslookup "$ip" 2>/dev/null | awk -F'= ' '/name = / {print $2; exit}' | sed 's/\.$//')
+            HN=$(busybox nslookup "$ip" 2>/dev/null | busybox awk -F'= ' '/name = / {print $2; exit}' | busybox sed 's/\.$//')
             if [ -n "$HN" ]; then
                 printf '%s HOST %s\n' "$ip" "$HN"
             fi
@@ -254,7 +264,7 @@ if [ -s "$REACHABLE" ]; then
     wait
 fi
 
-rm -f "$TMP" "$REACHABLE"
+busybox rm -f "$TMP" "$REACHABLE"
 """
 
 

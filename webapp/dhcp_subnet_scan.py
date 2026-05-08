@@ -94,20 +94,27 @@ class ScanReport:
 #
 # Portable POSIX sh — runs on Forcepoint NGFW BusyBox shells.
 #
+# Every external utility (ping, ip, arping, awk, grep, head, mktemp,
+# rm) is invoked through `busybox <applet>` — see the matching block
+# in webapp/engine_scan.py for the rationale. On engines whose /bin
+# applet symlinks aren't all populated, bare `ping` / `arping` /
+# `awk` would return "command not found" and Phase 2 would silently
+# skip every ICMP-failed host. Shell builtins (printf, [, read, set,
+# wait, for, :) don't need the prefix.
 _SCAN_SCRIPT = r"""
 BATCH=$1; PT=$2; AT=$3; shift 3
-TMP=$(mktemp 2>/dev/null || echo /tmp/.fea-scan.$$)
+TMP=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-scan.$$)
 : > "$TMP"
 n=0
 for ip in "$@"; do
     (
-        if ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
+        if busybox ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
             # Kernel populated the ARP cache during ping resolution —
             # read the MAC from `ip neighbor show` so the upper UI can
             # promote the host into the reservable list. May be empty if
             # the cache evicted the entry by the time we look (rare).
-            NEIGH=$(ip neighbor show "$ip" 2>/dev/null | head -1)
-            MAC=$(printf '%s\n' "$NEIGH" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+            NEIGH=$(busybox ip neighbor show "$ip" 2>/dev/null | busybox head -1)
+            MAC=$(printf '%s\n' "$NEIGH" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
             if [ -n "$MAC" ]; then
                 line="$ip ICMP_OK $MAC"
             else
@@ -129,13 +136,13 @@ while IFS= read -r line; do
     set -- $line
     ip=$1; state=$2
     if [ "$state" = "ICMP_FAIL" ]; then
-        DEV=$(ip route get "$ip" 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
+        DEV=$(busybox ip route get "$ip" 2>/dev/null | busybox awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
         if [ -z "$DEV" ]; then
             printf '%s NO_ROUTE\n' "$ip"
             continue
         fi
-        OUT=$(arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
-        MAC=$(printf '%s\n' "$OUT" | grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | head -1)
+        OUT=$(busybox arping -c 1 -w "$AT" -I "$DEV" "$ip" 2>&1)
+        MAC=$(printf '%s\n' "$OUT" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
         if [ -n "$MAC" ]; then
             printf '%s ARP_OK %s\n' "$ip" "$MAC"
         else
@@ -143,7 +150,7 @@ while IFS= read -r line; do
         fi
     fi
 done < "$TMP"
-rm -f "$TMP"
+busybox rm -f "$TMP"
 """
 
 
