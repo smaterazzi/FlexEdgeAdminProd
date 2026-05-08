@@ -230,11 +230,28 @@ done < "$TMP"
 # Hosts that drop ICMP and aren't L2-adjacent (e.g. firewalled servers
 # across a routed boundary) can still have open TCP ports — that's the
 # whole point of running Tools→Scan against a remote subnet.
+#
+# TCP probe form: ``busybox timeout $CT busybox nc <ip> <port>
+# < /dev/null > /dev/null 2>&1``. The Forcepoint engine BusyBox build
+# has a stripped ``nc`` that only supports ``-iN -wN -l -p -f -e`` —
+# there is NO ``-z`` (zero-I/O scan) flag. So we open a real
+# connection, immediately send EOF from /dev/null (which closes our
+# write side), and let the remote close. ``busybox timeout`` wraps
+# the call to bound wall-clock time on blackholed targets where the
+# kernel's TCP RTO would otherwise stretch past 1s. Exit code:
+#   0   = connect succeeded and remote closed within $CT seconds
+#   124 = timeout fired (blackholed OR remote refused to close —
+#         treated as "closed" either way, the latter is a known
+#         false-negative for chatty long-lived services like RDP)
+#   1   = connection refused fast (RST received)
+# Any non-zero is reported as "closed" by the parser. False-negative
+# rate on real-world ports is acceptable; if it becomes a problem
+# we'd need a Python-side paramiko TCP probe instead of nc.
 if [ -n "$PORTS" ]; then
     for ip in "$@"; do
         for port in $(printf '%s' "$PORTS" | busybox tr ',' ' '); do
             (
-                if busybox nc -z -w "$CT" "$ip" "$port" >/dev/null 2>&1; then
+                if busybox timeout "$CT" busybox nc "$ip" "$port" < /dev/null > /dev/null 2>&1; then
                     printf '%s PORT %s open\n' "$ip" "$port"
                 else
                     printf '%s PORT %s closed\n' "$ip" "$port"
@@ -279,7 +296,7 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
               batch_size: int = 32,
               ping_timeout_s: int = 1,
               arping_timeout_s: int = 1,
-              port_timeout_s: int = 1,
+              port_timeout_s: int = 2,
               dns_timeout_s: int = 2,
               exec_timeout_s: int = 900,
               on_event: Optional[EventCallback] = None,
@@ -385,7 +402,7 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
          batch_size: int = 32,
          ping_timeout_s: int = 1,
          arping_timeout_s: int = 1,
-         port_timeout_s: int = 1,
+         port_timeout_s: int = 2,
          dns_timeout_s: int = 2,
          exec_timeout_s: int = 900,
          on_event: Optional[EventCallback] = None,

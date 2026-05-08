@@ -33,7 +33,7 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
                batch_size: int = 32,
                ping_timeout_s: int = 1,
                arping_timeout_s: int = 1,
-               port_timeout_s: int = 1,
+               port_timeout_s: int = 2,
                dns_timeout_s: int = 2,
                exec_timeout_s: int = 900) -> str:
     """Kick off an engine-scan job in a daemon thread. Returns the scan_id.

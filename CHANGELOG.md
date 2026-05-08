@@ -6,6 +6,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: Phase 3 probe form rewritten — BusyBox `nc` lacks `-z` (2026-05-08)
+
+Even after the `busybox <applet>` prefix fix landed, the operator
+ran `busybox nc -h` on the engine and reported the actual flag
+list:
+
+```text
+Usage: nc [-iN] [-wN] [-l] [-p PORT] [-f FILE|IPADDR PORT] [-e PROG]
+```
+
+No `-z`. The Forcepoint engine's BusyBox `nc` build is stripped
+of zero-I/O scan mode entirely. `busybox nc -z -w 1 host port`
+was being parsed as "unknown option `-z`", failing fast, and
+recording every port as `closed` — same downstream symptom as
+before, just one layer up.
+
+Fix in [webapp/engine_scan.py](webapp/engine_scan.py) Phase 3:
+
+```sh
+busybox timeout "$CT" busybox nc "$ip" "$port" < /dev/null > /dev/null 2>&1
+```
+
+We open a real connection (no `-z`), immediately send EOF from
+`/dev/null` so our write side closes, and let the remote close.
+`busybox timeout` wraps the call to bound wall-clock time on
+blackholed targets where the kernel's TCP RTO would otherwise
+stretch past `$CT` seconds. Exit-code mapping the parser uses:
+
+| Exit | Meaning | Reported as |
+| ---- | ------- | ----------- |
+| `0` | Connect succeeded and remote closed within `$CT` seconds | `open` |
+| `1` | Connection refused fast (RST received) | `closed` |
+| `124` | Timeout fired (blackholed firewall OR remote refused to close) | `closed` |
+
+Default `port_timeout_s` bumped from `1` → `2` (in both
+[webapp/engine_scan.py](webapp/engine_scan.py) and
+[webapp/engine_scan_jobs.py](webapp/engine_scan_jobs.py)) to give
+slow-closing services more time before the timeout misclassifies
+them as closed. Operator's lab test confirmed `timeout 2` reliably
+distinguishes open vs closed against a sshd target on the engine.
+
+**Known false-negative**: chatty long-lived services that accept a
+connection and then sit there waiting for a request without
+honoring our half-close (some custom apps, RDP) get killed by
+`timeout` and reported `closed`. Acceptable for v1 — if it becomes
+a problem, a Python-side paramiko TCP probe (controlled close, no
+shell timing) would replace this entirely.
+
+`arping` flag set fully matches what the script uses (`-c`, `-w`,
+`-I`) — no change needed there.
+
 ### SSH-issued shell scripts: `busybox <applet>` invocation everywhere (2026-05-08)
 
 Operator confirmed via the engine's `busybox --help` output that the
