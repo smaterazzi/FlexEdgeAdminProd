@@ -4,7 +4,252 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-05-07
+## [2.2.0-dev] - 2026-04-29 → 2026-05-08
+
+### UI: top-center search bar, pinned bookmarks, evident sidebar sections (2026-05-08)
+
+Three quality-of-life improvements landing together in
+[webapp/templates/base.html](webapp/templates/base.html):
+
+- **Sidebar section labels are now obvious.** Bumped from `0.7rem
+  #6b7280` (gray-on-gray, lost against the sidebar bg) to
+  `0.78rem #d1d5db` **bold**, with a top border separating each
+  section + extra top padding. The `.nav-link` font shrank to
+  `0.86rem` so the section header visually dominates its items.
+  First-section border is masked so the sidebar doesn't open with a
+  stray line. Operators stop hunting for which section a feature
+  belongs to.
+- **Top-center quick search** with `Cmd/Ctrl+K` to focus from
+  anywhere. Debounced 200 ms; queries `<2` chars don't fire. Results
+  group **Features** (every menu destination, label/href/icon
+  curated server-side) and **Cached SMC elements** (best-effort walk
+  of `shared.smc_cache._section_caches` for items with a `name`
+  field — translated to navigable URLs: `smc.explorer.<type>` →
+  `/browse/<type>`, `engines.list` → `/engines/clusters`). Arrow
+  keys + Enter navigate; Esc / outside-click closes. Backed by the
+  new `GET /api/quick-search?q=...` endpoint (admin-protected,
+  capped at 30 results, deduped).
+- **Pinned bookmarks bar.** Star button on the topbar pins the
+  current page (label inferred from the active sidebar entry or
+  document title; icon inherited from the active link). Pin chips
+  render in a thin bar between topbar and content; each has an X to
+  remove. localStorage-backed (`flexedge_pins_v1`), per-browser, max
+  12 (FIFO past that). Bar self-hides when empty. Star icon flips
+  to `bi-star-fill` (yellow) when the current page is pinned.
+
+No backend schema change. No new dependency. ~150 LoC across one
+template file + 80 LoC for the search endpoint.
+
+### Domain-Scoping audit + 7 fixes (2026-05-08)
+
+Spec: [docs/DomainScopingAudit.md](docs/DomainScopingAudit.md). The
+operator's mental model is "the topbar Domain selector controls
+everything I see"; the audit surfaced six places where that wasn't
+strictly true and one where the audit-trail couldn't tell you who did
+what. All seven landed in this commit batch.
+
+| # | Severity | Location | Fix |
+| - | -------- | -------- | --- |
+| D1 | **HIGH** — direct exfil via URL crafting | 4 DHCP cascade endpoints `/dhcp/api/tenants/<tid>/api-keys/...` | New `_assert_active_domain_match(tid, kid)` helper at the top of [webapp/dhcp_manager.py](webapp/dhcp_manager.py); 403 if URL IDs don't match `g.domain.api_key_id` / its tenant. |
+| D2 | **MEDIUM** — cross-Domain data loss | DHCP `sweep_old_logs` and `cli/sweep_dhcp_logs.py` | New `domain_id` parameter on the sweeper (and on `shared.logging.sweep_old_logs`). Web button scopes to active Domain; CLI iterates every Domain explicitly so each gets its own audit row. New `--domain <slug>` flag for targeted sweeps. |
+| A | LOW (defense-in-depth) | `webapp/app.py:1915` `_load_submission_in_active_domain` | `OptimizationSubmission.query.filter_by(id=sub_id, domain_id=g.domain.id).first_or_404()` — filter at query level instead of post-load check. |
+| B | MEDIUM — log visibility leak | `webapp/app.py` `view_logs` | Removed the "show all my Domains" widen branch entirely. `/logs` is now strictly scoped to the active Domain (system-feature rows with `domain_id IS NULL` still visible — they're domain-agnostic bootstrap markers). Toggle removed from the template. |
+| C | MEDIUM — visibility leak | `webapp/tls_manager.py` 3 cert listing routes | New `_certs_in_active_domain(domain_id)` helper using a `TLSDeployment` subquery (Path I, no schema change). Dashboard + certificates list scoped to it. Deploy form's cert dropdown intentionally NOT scoped (write-side picker; chicken-and-egg if you've never deployed in this Domain yet) — comment explains. |
+| D3 | LOW (defensive comment) | `webapp/migration_dhcp_writer.py` | `DhcpReservation` has no `domain_id` column — Domain inherits via `scope_id → DhcpScope.domain_id`. Added a defense-in-depth note at the insert site so future refactors don't try to add a `domain_id=` kwarg to a column that doesn't exist. |
+| E2 | Audit-trail gap | `webapp/tls_scheduler.py` `handle_renewal_webhook` | Bucket renewal results by `dep.domain_id`; emit one `audit("tls", "renew.cross_domain", ...)` row per affected Domain with the `engines=[...]` list and `deployed/failed/skipped` counts. Operators reading `/logs` in their Domain see exactly the renewals that touched THEIR engines, not a cryptic global "the cert renewed" line. |
+
+Plus three secondary fixes folded into the same batch after the user
+flagged related leaks:
+
+- DHCP `credentials_list`, DHCP `scopes_list`, TLS `deploy_form` —
+  the "Tenant" dropdown narrowed from `Tenant.query.all()` to just
+  the one Tenant bound to the active Domain's API key. Operator
+  never sees another Domain's Tenant in any picker.
+- `/dhcp/scopes/<id>/leases` no longer redirects to `/dhcp/credentials`
+  when no SSH credentials are enrolled. The route now renders the
+  leases page in place with an inline empty-state alert that names
+  the active Domain so a "creds enrolled under another Domain"
+  mismatch becomes visible at a glance, plus a one-click button to
+  the credentials wizard. Operator stays in their context.
+- Browser link to `/browse/l3_firewalls` (Infrastructure → "Layer-3
+  Firewall Engines") relabeled to "Engines" and hard-redirects to
+  `/engines/clusters`. The legacy SDK-class-filtered explorer only
+  showed the `Layer3Firewall` subclass, missing clusters / virtual
+  engines / IPS / masters; the dedicated Engines page covers
+  everything.
+
+Intentionally cross-Domain (no change): admin portal Tenants /
+Users / API Keys / Domains pages (Super Admin infrastructure
+management), TLS certbot renewal webhook (host-level, fires across
+Domains by design).
+
+### Web UX hardening: AJAX error transparency + auth-redirect bounce (2026-05-08)
+
+Two related fixes. Symptom that motivated them: operators seeing
+*"Failed at stage network: SyntaxError: Unexpected token '<', '<!doctype'... is not valid JSON"*
+in the credentials wizard whenever the server returned an HTML
+response (Flask's default 500 page or the login redirect) to an
+AJAX call.
+
+- **`window.fetch` patch** in
+  [webapp/templates/base.html](webapp/templates/base.html). When the
+  response was redirected to `/login` or `/auth/`, OR the status is
+  `401` / `403`, redirect the page to `/login?next=<current>` and
+  throw so any caller `.catch` fires. Skip the bounce if we're
+  already on a login-ish path (avoids loops). Patches `window.fetch`
+  itself rather than only `fexFetch`, so raw `fetch(...)` callers
+  (graph, scan watchers, TLS deploy form, DHCP credentials, etc.)
+  benefit without per-template edits.
+- **Generic AJAX exception handler** in
+  [webapp/app.py](webapp/app.py). When any uncaught exception or
+  `HTTPException` fires inside a request that looks AJAX
+  (`X-Requested-With: XMLHttpRequest` or `Accept: application/json`),
+  return JSON like `{"error": "TypeError: ...", "code": 500}`
+  instead of Flask's HTML debug page. Non-AJAX requests fall through
+  to the default HTML rendering. **Beneficial side-effect:** the
+  pre-existing `tcp_probe` `NameError` in `credentials_apply` (top-
+  level import was missing) is now visible as a clean error message
+  instead of Flask's HTML 500 page that JS choked on. Fixed the
+  import too: `tcp_probe` is now in the module-level
+  `from webapp.dhcp_ssh import ...` block.
+
+### Queue runner: SMC error humanizer (2026-05-08)
+
+[shared/queue_runner.py](shared/queue_runner.py) `_mark_push_failed`
+now runs the raw SMC error through `_humanize_smc_error()` before
+persisting to `pending_changes.push_error_text` and the audit log.
+First pattern covered: policy lock contention. Patterns matched
+(case-insensitive substrings on the SMC error string):
+
+- `policy is locked`
+- `is currently locked`
+- `currently locked by`
+- `locked by another`
+- `locked by user` / `locked by the user`
+- `cannot obtain lock`
+- `lock is owned by`
+- `unable to obtain lock`
+
+Any of those triggers prepended remediation:
+*"Policy is locked by another SMC session — somebody is currently
+editing it in SMC Management Client (or another automation holds the
+lock). Ask the holder to commit or discard their changes, then retry
+this row from /changes/. [raw: ...]"*. Raw SMC string preserved at
+the end so debugging stays sharp. Anything unmatched falls through
+unchanged. Single chokepoint means **every** queue handler — `install_ssh_rule`, `deploy_tls`, `create_*`, `update`, `upload_policy`, anything future — automatically inherits the friendlier message.
+
+### Engines → Tools → Scan: VLAN sub-interface picker fix (2026-05-08)
+
+The cascading interface picker on `/engines/tools/scan` was missing
+every VLAN sub-interface — only physical parent interfaces appeared
+in the dropdown. Three layers of bug, one root cause: the SDK
+`PhysicalInterface.data.data` returns the SMC payload, but
+`engine_inquiry._walk_interfaces` was reading `pi.data` directly
+(without the second `.data` unwrap), then keying VLANs by a
+`vlan_id` field that doesn't exist (the SDK encodes the VLAN id
+inside the entry's `interface_id` as `"1.42"`).
+
+Fixes in [webapp/engine_inquiry.py](webapp/engine_inquiry.py):
+
+1. Unwrap `pi.data.data` like
+   [webapp/smc_dhcp_client.py](webapp/smc_dhcp_client.py) already
+   does for DHCP scope discovery.
+2. Read VLAN identity from the entry's composite `interface_id`
+   (`"1.42"`) and split on `.` to get `(parent_id="1", vlan_id="42")`.
+3. Handle wrapped payloads (`{"physical_interface": {...}}`) +
+   snake_case `vlan_interfaces` key variant — same defensive
+   pattern as DHCP.
+
+[webapp/engines_manager.py](webapp/engines_manager.py)
+`api_cluster_interfaces` deduplicates on the composite
+`(interface_id, vlan_id)` key (was just `interface_id`, which
+collapsed every VLAN into the parent) and sorts iface-then-vlan
+numerically. The picker form gains a hidden `vlan_id` input that
+the JS syncs from each option's `data-vlan-id` so the scan-start
+POST has both halves of the composite key.
+
+Same fix benefits the cluster_detail Interfaces tab — VLAN IDs
+finally render in their column.
+
+### Engines → Tools → Scan history (Phases 1-3 of the spec) (2026-05-08)
+
+Spec: [docs/Engines-ScanHistory.md](docs/Engines-ScanHistory.md).
+Three phases of the four-phase plan landed in one session.
+Phase 4 (scheduler) is deferred to a focused commit so the
+in-process ticker thread under multi-worker gunicorn can be
+lab-validated without entangling the rest of the work.
+
+**Phase 1 — persistence + history list + detail + retention.**
+
+- Two new tables in [webapp/models.py](webapp/models.py):
+  `engine_scan_records` (one row per scan; comment, starred,
+  source_correlation, scope keys, summary stats), `engine_scan_hosts`
+  (one row per IP per scan with `ip_int` for numeric sort, port CSVs
+  for compact storage). `db.create_all()` picks them up; no manual
+  migration.
+- New re-usable sub-package `webapp/scan_history/` with one public
+  service API: `register_scan(domain, report, ...)`,
+  `list_scans(domain, ...)`, `get_scan(domain, id)`, `set_comment`,
+  `set_starred`, `delete_scan`, `bulk_set_starred`, `bulk_delete`,
+  `get_settings`, `set_settings`. Any future feature that produces
+  an `EngineScanReport`-shaped dataclass plugs in via
+  `register_scan` and gets the entire UI for free.
+- Routes at `/engines/scans/*` (Blueprint at
+  [webapp/scan_history/routes.py](webapp/scan_history/routes.py)):
+  history list with filters (engine / iface / starred / date) +
+  bulk star + bulk delete + retention form, detail view with comment
+  editor + star toggle + CSV export + IP-numeric-sorted host table
+  with live filter, manual sweep button.
+- Retention rotation: count or days mode (default `count = 20`,
+  per-scope), starred always survive. Lazy hourly sweep fires when
+  someone visits the history page.
+- `engines_manager.tools_scan` wired to call `register_scan` on
+  scan complete and redirect to `/engines/scans/<id>` so the
+  operator lands on a URL that survives the in-memory 15-min TTL.
+- Audit feature `engine_scan_history` registered in
+  [webapp/app.py](webapp/app.py); every state change emits
+  `audit("engine_scan_history", "scan.persist|comment|star|unstar|delete|retention.sweep|settings.update", ...)`.
+- Engines sidebar gains "Scan history" sub-entry.
+
+**Phase 2 — compare 2-10 scans of the same scope.**
+
+- New [webapp/scan_history/compare.py](webapp/scan_history/compare.py)
+  with pure-diff helpers: `CompareReport`, `HostTimeline`,
+  `HostCell` dataclasses; `compare_scans(domain, ids)` fetches
+  records + hosts in two queries, scope-checks `(engine, iface)`,
+  sorts ASC by `started_at`, computes per-host port-set deltas vs
+  the nearest previous-seen cell.
+- `GET|POST /engines/scans/compare` accepts `scan_ids[]` from a
+  POST form OR `?ids=1,2,3` for deep-linkable URLs.
+- Compare button on the history list, with selection-aware JS:
+  enabled only when 2-10 rows selected AND all share `(engine,
+  iface)`. Cross-scope selection keeps it disabled with explanatory
+  tooltip.
+- Compare template: sticky-header table, IP rows × scan columns,
+  reachability badges + open-port set with `+22` (newly open) /
+  `−3389` (closed since previous) / `new` (first sighting) /
+  `gone` (host disappeared) markers. "Diff only" toggle hides
+  unchanged rows.
+
+**Phase 3 — time graph.**
+
+- New [webapp/templates/scan_history/graph.html](webapp/templates/scan_history/graph.html)
+  with a vanilla SVG line renderer (~250 lines of JS, zero deps).
+  Two series: *Online IPs* (solid green) + *Hosts w/ open* (dashed
+  cyan). Per-point markers: ⭐ for starred, triangle for scheduled,
+  dot for manual. Hover tooltip shows ts / scan id / counts /
+  engine / iface / source / comment. Click any point → deep-link
+  to `/engines/scans/<id>`. Auto-resize on window resize.
+- `GET /engines/scans/graph` (HTML page) +
+  `GET /engines/scans/graph.json` (data feed) — both honor
+  `?engine=&iface=&days=` filters.
+- New `aggregate_for_graph(domain, ...)` helper on the service layer.
+- Vanilla SVG instead of Chart.js: zero deploy steps for the
+  operator (no vendor download), works air-gapped, full control over
+  click-through + per-point markers. Honors the
+  `feedback_deployment_scenarios` standing rule (vendor functional
+  assets locally — by avoiding the dependency entirely).
+- "Time graph" sub-entry in the Engines sidebar.
 
 ### Engines → Tools → Scan landed (2026-05-07)
 

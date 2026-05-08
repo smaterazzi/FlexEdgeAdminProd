@@ -5,13 +5,15 @@ Forcepoint NGFW administration platform with web UI, CLI tools, and a web-based 
 ## Features
 
 - **Admin Portal** — web-based management of tenants, users, and API keys with encrypted database storage
-- **SMC Explorer** — browse SMC objects, policies, and services in a dark-themed Bootstrap 5 UI
+- **SMC Explorer** — browse SMC objects, policies, and services in a dark-themed Bootstrap 5 UI. Top-center quick-search (`Cmd/Ctrl+K`) covers every menu feature plus cached SMC elements; pinned bookmarks bar lets operators star their go-to pages
 - **Migration Manager** — 7-step guided workflow to import FortiGate configs into Forcepoint SMC
 - **TLS Manager** — automated certbot → Forcepoint TLS credential lifecycle, engine assignment, inspection rules, and auto-renewal on cert renewal (setup in [deployment guide](docs/deployment-guide.md#tls-manager--certbot-integration))
-- **DHCP Manager** — manages MAC→IP reservations on engines with the internal DHCP server enabled. Reservations live as SMC Host objects (MAC stored inline as `[flexedge:mac=...]` in the comment). Auto-managed SSH-allow rule + per-node password rotation via SMC API; cluster-wide lease viewer; engine-side reservation push pending Phase 4 (see [DHCP-ReservationStrategy.md](docs/DHCP-ReservationStrategy.md))
+- **DHCP Manager** — manages MAC→IP reservations on engines with the internal DHCP server enabled. Reservations live as SMC Host objects (MAC stored inline as `[flexedge:mac=...]` in the comment). Auto-managed SSH-allow rule + per-node password rotation via SMC API; cluster-wide lease viewer; engine-side reservation push (see [DHCP-ReservationStrategy.md](docs/DHCP-ReservationStrategy.md))
+- **Engines** — cluster/node inventory, SSH credentials, and a network scan tool that runs ICMP + arping + TCP-port-probe + reverse DNS from any engine interface. Scans persist to history with comment, star, retention, and a side-by-side **compare** view across runs (port-set deltas highlighted) plus a **time graph** of online IPs. See [docs/Engines-ScanTool.md](docs/Engines-ScanTool.md) and [docs/Engines-ScanHistory.md](docs/Engines-ScanHistory.md)
+- **Change Queue** — two-phase commit between operator clicks and SMC writes. Drift detector reconciles registered SMC objects against live state. Cross-Domain isolation enforced — see [docs/DomainScopingAudit.md](docs/DomainScopingAudit.md)
 - **CLI Tools** — command-line firewall management, object queries, and connection testing
 - **Encrypted at rest** — API keys stored with Fernet encryption (AES-128-CBC + HMAC-SHA256)
-- **Multi-tenant, multi-user** — Microsoft Entra ID (Azure AD) authentication with per-user SMC profiles
+- **Multi-tenant, multi-Domain** — Microsoft Entra ID (Azure AD) authentication. Operator picks a Domain in the topbar; every list / selector / log / dropdown is strictly scoped to that Domain. See [docs/MultiDomainRevamp.md](docs/MultiDomainRevamp.md)
 - **Docker-ready** — single image with nginx reverse proxy and Let's Encrypt TLS
 
 ## Deployment Options
@@ -41,6 +43,7 @@ make dev                     # Same as --dev, shorter
 ```
 
 First visit:
+
 1. Log in with Azure AD → Setup wizard creates your admin account
 2. Admin Portal (`/admin/`) → add tenants, create API keys, invite users
 
