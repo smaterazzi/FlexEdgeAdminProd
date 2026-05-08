@@ -6,6 +6,79 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: service-friendly chip picker + coherent result chips (2026-05-08)
+
+The TCP-ports input in the scan picker was a plain comma-list text
+field — operators had to remember which port number is which
+service. The result table already shows `443 · HTTPS` style names
+(landed earlier today via TODO #2), so the picker felt
+inconsistent.
+
+**Picker now uses chips + autocomplete** in
+[webapp/templates/engines/tools_scan.html](webapp/templates/engines/tools_scan.html):
+
+- The 25 default ports render as chips on first paint, each
+  showing `443 · HTTPS` / `22 · SSH` / `3389 · RDP` (matched from
+  the operator's own SMC `tcp_services` list — same cache the
+  result table reads from).
+- Each chip has an `×` button to remove that port from the scan.
+- A typeahead input below — type `rdp` to find SMC service
+  RDP, type `8443` to add a raw port, type `8000-8010` to add a
+  range. Up to 12 suggestions shown (services first by name
+  match, with raw-port/range as the top suggestion when the
+  query parses as numeric).
+- Reset link → repopulate with the default 25 chips. Clear
+  link → drop all chips. The "Skip port scan" checkbox now
+  auto-derives from the chip count: empty chips = scan skipped,
+  any chips = scan runs.
+- A live counter ("· 25 ports selected" / "· no ports — port
+  scan will be skipped") next to the form-text help line.
+
+**Source-of-truth state** is a `Set<int>` of selected port
+numbers in the JS module. A hidden `<input name="ports">` is
+kept in sync as comma-separated so the existing server-side
+parser (`parse_port_list`) needs no changes. Form posts
+behave exactly as before.
+
+**Picker payload** — the route handler builds two structures
+on the picker render (cached via the same
+`smc.explorer.tcp_services` section as the chip-name resolver):
+
+- `picker_port_services_map`: `{port: name}` for the chip
+  labels.
+- `tcp_services_for_picker`: `[{name, port_low, port_high,
+  label, search}]` for autocomplete suggestions. UDP services
+  intentionally excluded — the scan tool is TCP-only in v1.
+  Catch-all ranges (>256 ports) skipped to keep "TCP All" out
+  of the suggestion list.
+
+**Result-table chips polished** for coherence with the picker:
+
+- Open-port chips use `bg-info text-dark` when the port has an
+  SMC name match, `bg-secondary` (gray) when it doesn't —
+  visually identical to the picker chips so operators can
+  follow the same `443 · HTTPS` pattern from "what to scan" to
+  "what came back".
+- The `Closed` column previously printed every closed port
+  number as a comma-separated string (typically 20+ entries
+  per host, dominating row height). Collapsed to a single `N
+  closed` count with the full list in a `title=` tooltip on
+  hover. Same treatment in
+  [webapp/templates/scan_history/detail.html](webapp/templates/scan_history/detail.html)
+  (the primary results view) and
+  [webapp/templates/engines/tools_scan.html](webapp/templates/engines/tools_scan.html)
+  (in-memory fallback).
+
+Helpers added in
+[webapp/engines_manager.py](webapp/engines_manager.py):
+
+- `list_tcp_services_for_picker(domain_id, cfg)` — picker-ready
+  TCP service list. Reuses the SMC Explorer cache section so
+  one fetch serves both the chip-name resolver
+  (`resolve_port_services`) and the typeahead list. Empty
+  list on any failure → picker degrades gracefully to
+  typing-only port input.
+
 ### Engines → Tools → Scan: Phase 3 probe form rewritten — BusyBox `nc` lacks `-z` (2026-05-08)
 
 Even after the `busybox <applet>` prefix fix landed, the operator

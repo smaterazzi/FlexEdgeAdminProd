@@ -107,6 +107,72 @@ def _current_domain():
     return getattr(g, "domain", None)
 
 
+def list_tcp_services_for_picker(domain_id: int, cfg: dict) -> list[dict]:
+    """Picker-ready TCP service list from cached SMC tcp_services.
+
+    Returns ``[{"name": "HTTPS", "port_low": 443, "port_high": 443,
+    "label": "443 · HTTPS", "search": "https 443"}, ...]`` sorted by
+    name (case-insensitive). UDP services are intentionally excluded —
+    the scan tool is TCP-only in v1. Catch-all ranges (>256 ports)
+    are skipped because expanding "TCP All" (1-65535) into the
+    operator's port list would never be what they meant.
+
+    Uses the same ``smc.explorer.tcp_services`` cache section as
+    ``resolve_port_services`` (key ``(domain_id, "", "")``) so a
+    single cache miss serves both helpers. Empty list on any failure
+    — picker degrades gracefully to typing-only input.
+    """
+    from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
+    from webapp import smc_client
+
+    if not cfg:
+        return []
+
+    def _fetch():
+        with smc_client.smc_session(cfg):
+            return smc_client.list_elements("tcp_services")
+
+    try:
+        cv = cache_get_or_fetch(
+            section="smc.explorer.tcp_services",
+            key_parts=(domain_id, "", ""),
+            fetcher=_fetch,
+            ttl=get_quick_ttl(),
+        )
+        elements = cv.data or []
+    except Exception as exc:
+        log.warning("tcp_services picker fetch failed: %s", exc)
+        return []
+
+    out: list[dict] = []
+    for elem in elements:
+        name = (elem.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            lo = int(elem.get("min_dst_port") or 0)
+            hi = int(elem.get("max_dst_port") or lo)
+        except (TypeError, ValueError):
+            continue
+        if lo < 1 or hi < lo or hi > 65535:
+            continue
+        if (hi - lo) > 256:
+            continue
+        if hi == lo:
+            label = f"{lo} · {name}"
+        else:
+            label = f"{lo}-{hi} · {name}"
+        out.append({
+            "name": name,
+            "port_low": lo,
+            "port_high": hi,
+            "label": label,
+            "search": f"{name} {lo} {hi}".lower(),
+        })
+    out.sort(key=lambda r: r["name"].lower())
+    return out
+
+
 def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
     """Build a ``{port: service_name}`` map from cached SMC tcp/udp_services.
 
@@ -640,6 +706,22 @@ def tools_scan():
         except Exception as exc:
             log.warning("port_services_map build failed: %s", exc)
 
+    # Picker mode: build the SMC-services payload that drives the
+    # chips-with-autocomplete port input. Both lookups share the
+    # ``smc.explorer.tcp_services`` cache section so a single fetch
+    # serves both the chip-name resolver and the typeahead list.
+    tcp_services_for_picker: list[dict] = []
+    picker_port_services_map: dict[int, str] = {}
+    if not scan_running and not scan_report:
+        try:
+            domain_obj = _current_domain()
+            domain_id = domain_obj.id if domain_obj else 0
+            cfg = _user_cfg()
+            tcp_services_for_picker = list_tcp_services_for_picker(domain_id, cfg)
+            picker_port_services_map = resolve_port_services(domain_id, cfg)
+        except Exception as exc:
+            log.warning("picker service lists failed: %s", exc)
+
     return render_template(
         "engines/tools_scan.html",
         scan_running=scan_running,
@@ -652,6 +734,9 @@ def tools_scan():
         inventory_hidden=max(0, inventory_total - len(inventory)),
         inventory_cache_meta=inventory_cache_meta,
         default_ports=",".join(str(p) for p in DEFAULT_PORTS),
+        default_ports_list=list(DEFAULT_PORTS),
+        tcp_services_for_picker=tcp_services_for_picker,
+        picker_port_services_map=picker_port_services_map,
     )
 
 

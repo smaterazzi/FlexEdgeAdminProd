@@ -136,9 +136,10 @@
             {% if _open_ports_list %}
               {% for p in _open_ports_list %}
                 {% set _svc = port_services_map.get(p|int) %}
-                <span class="badge bg-info text-dark me-1"
-                      {% if _svc %}title="{{ _svc }}"{% endif %}>
-                  {{ p }}{% if _svc %} <span class="opacity-75">({{ _svc }})</span>{% endif %}
+                <span class="badge {% if _svc %}bg-info text-dark{% else %}bg-secondary{% endif %} me-1"
+                      style="font-weight: 500;"
+                      {% if _svc %}title="{{ _svc }} (matched from SMC TCP services)"{% endif %}>
+                  {{ p }}{% if _svc %} · {{ _svc }}{% endif %}
                 </span>
               {% endfor %}
             {% else %}
@@ -146,7 +147,14 @@
             {% endif %}
           </td>
           <td class="text-muted small">
-            {{ h.closed_ports_csv or '' }}
+            {# Collapsed view — closed-port lists are typically 20+ entries
+               and dominate the table. Hover the count for the full list. #}
+            {% set _closed_count = (h.closed_ports_csv.count(',') + 1) if h.closed_ports_csv else 0 %}
+            {% if _closed_count > 0 %}
+              <span title="{{ h.closed_ports_csv }}">{{ _closed_count }} closed</span>
+            {% else %}
+              —
+            {% endif %}
           </td>
         </tr>
         {% endfor %}

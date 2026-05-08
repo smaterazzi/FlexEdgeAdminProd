@@ -194,9 +194,10 @@
           <td class="small">
             {% for p in r.open_ports %}
               {% set _svc = port_services_map.get(p) %}
-              <span class="badge bg-success me-1"
-                    {% if _svc %}title="{{ _svc }}"{% endif %}>
-                {{ p }}{% if _svc %} <span class="opacity-75">({{ _svc }})</span>{% endif %}
+              <span class="badge {% if _svc %}bg-info text-dark{% else %}bg-secondary{% endif %} me-1"
+                    style="font-weight: 500;"
+                    {% if _svc %}title="{{ _svc }} (matched from SMC TCP services)"{% endif %}>
+                {{ p }}{% if _svc %} · {{ _svc }}{% endif %}
               </span>
             {% else %}
               <span class="text-muted">—</span>
@@ -320,14 +321,36 @@
 
     <div class="row g-3">
       <div class="col-md-12">
-        <label class="form-label small mb-1">TCP ports</label>
-        <input type="text" name="ports" class="form-control form-control-sm font-monospace"
-               value="{{ default_ports }}" id="ports-input">
+        <label class="form-label small mb-1">TCP ports / services</label>
+
+        {# Hidden input is what the server parses (comma-separated port
+           numbers, ranges allowed). The chip UI keeps it in sync via
+           JS so existing server-side validation is unchanged. #}
+        <input type="hidden" name="ports" id="ports-input" value="{{ default_ports }}">
+
+        <div id="port-chips" class="d-flex flex-wrap gap-1 mb-2 p-2 border rounded"
+             style="min-height: 42px; background-color: var(--bs-tertiary-bg, #f8f9fa);"
+             aria-live="polite">
+          {# Chips rendered by JS on DOMContentLoaded — empty server-side. #}
+        </div>
+
+        <div class="position-relative" style="max-width: 480px;">
+          <input type="text" id="port-add-input"
+                 class="form-control form-control-sm"
+                 placeholder="Add service or port — type a name, number, or range"
+                 autocomplete="off">
+          <div id="port-add-suggestions"
+               class="dropdown-menu shadow-sm w-100"
+               style="display:none; max-height: 240px; overflow-y: auto;">
+            {# JS populates / shows / hides this. #}
+          </div>
+        </div>
+
         <div class="form-text small">
-          Comma- or space-separated. Ranges allowed (<code>1-1024</code>).
-          Default = curated common-services set (25 ports).
+          Pick from your SMC TCP services or add raw ports.
+          <span id="port-count-hint" class="ms-1"></span>
           <a href="#" id="reset-ports" class="ms-1">Reset to default</a> ·
-          <a href="#" id="clear-ports" class="ms-1">Clear (skip port scan)</a>
+          <a href="#" id="clear-ports" class="ms-1">Clear all</a>
         </div>
         <div class="form-check mt-2">
           <input class="form-check-input" type="checkbox" name="skip_port_scan"
@@ -338,6 +361,17 @@
         </div>
       </div>
     </div>
+
+    {# Picker payload — JSON-serialized so the chip UI JS can read it. #}
+    <script type="application/json" id="picker-port-services-map">
+      {{ picker_port_services_map|tojson }}
+    </script>
+    <script type="application/json" id="picker-tcp-services">
+      {{ tcp_services_for_picker|tojson }}
+    </script>
+    <script type="application/json" id="picker-default-ports">
+      {{ default_ports_list|tojson }}
+    </script>
 
     <hr>
 
@@ -466,52 +500,205 @@
 })();
 
 // ─────────────────────────────────────────────────────────────────────
-//  Picker — port-list helpers + warning gate
+//  Picker — chip-based port/service selector + warning gate
 // ─────────────────────────────────────────────────────────────────────
 (function portsAndWarning() {
   const portsInput = document.getElementById("ports-input");
   const skipBox    = document.getElementById("skipPortScan");
   const warnBlock  = document.getElementById("warning-block");
   const startBtn   = document.getElementById("start-scan-btn");
-  if (!portsInput) return;
+  const chipsBox   = document.getElementById("port-chips");
+  const addInput   = document.getElementById("port-add-input");
+  const sugBox     = document.getElementById("port-add-suggestions");
+  const countHint  = document.getElementById("port-count-hint");
+  if (!portsInput || !chipsBox || !addInput) return;
 
-  const DEFAULT_PORTS_RAW = portsInput.value;
+  // Picker payload — Jinja embeds these as <script type="application/json">
+  // so the JS state machine can pick them up without a fetch round-trip.
+  function readJSON(id, fallback) {
+    const el = document.getElementById(id);
+    if (!el) return fallback;
+    try { return JSON.parse(el.textContent); } catch { return fallback; }
+  }
+  const PORT_SERVICES = readJSON("picker-port-services-map", {});
+  const TCP_SERVICES  = readJSON("picker-tcp-services", []);
+  const DEFAULT_PORTS = readJSON("picker-default-ports", []);
+
+  function nameForPort(p) {
+    // JSON keys come back as strings; tolerate both.
+    return PORT_SERVICES[p] || PORT_SERVICES[String(p)] || "";
+  }
+
+  // Source of truth: a Set of currently-selected port numbers.
+  let selectedPorts = new Set(DEFAULT_PORTS.map(p => +p));
+
+  function syncHidden() {
+    const sorted = [...selectedPorts].sort((a, b) => a - b);
+    portsInput.value = sorted.join(",");
+    if (countHint) {
+      if (sorted.length === 0) {
+        countHint.textContent = "· no ports (port scan will be skipped)";
+        countHint.className = "ms-1 text-warning";
+      } else {
+        countHint.textContent = `· ${sorted.length} port${sorted.length === 1 ? "" : "s"} selected`;
+        countHint.className = "ms-1 text-muted";
+      }
+    }
+    // Auto-derive the skip-port-scan flag from the chip count so the
+    // server sees a coherent (skip=1, ports="") or (skip=0, ports=...).
+    skipBox.checked = (sorted.length === 0);
+    updateWarn();
+  }
+
+  function makeChip(port) {
+    const name = nameForPort(port);
+    const chip = document.createElement("span");
+    chip.className = name
+      ? "badge bg-info text-dark d-inline-flex align-items-center gap-1"
+      : "badge bg-secondary d-inline-flex align-items-center gap-1";
+    chip.style.fontSize = "0.85em";
+    chip.style.fontWeight = "500";
+    const label = document.createElement("span");
+    label.textContent = name ? `${port} · ${name}` : String(port);
+    chip.appendChild(label);
+    const x = document.createElement("button");
+    x.type = "button";
+    x.className = "btn-close p-0 ms-1";
+    x.style.fontSize = "0.6em";
+    x.setAttribute("aria-label", `Remove port ${port}`);
+    x.title = `Remove port ${port}`;
+    x.addEventListener("click", () => {
+      selectedPorts.delete(port);
+      renderChips();
+      syncHidden();
+    });
+    chip.appendChild(x);
+    return chip;
+  }
+
+  function renderChips() {
+    chipsBox.innerHTML = "";
+    const sorted = [...selectedPorts].sort((a, b) => a - b);
+    if (!sorted.length) {
+      const empty = document.createElement("span");
+      empty.className = "text-muted small fst-italic align-self-center";
+      empty.textContent = "No ports selected — pick a service below or type a port number / range.";
+      chipsBox.appendChild(empty);
+      return;
+    }
+    for (const p of sorted) chipsBox.appendChild(makeChip(p));
+  }
+
+  // Autocomplete: try the input as a port/range first, then match
+  // against the SMC TCP-service search column.
+  function buildSuggestions(query) {
+    const q = (query || "").trim().toLowerCase();
+    if (!q) return [];
+    const out = [];
+    const numMatch = q.match(/^(\d+)(?:\s*-\s*(\d+))?$/);
+    if (numMatch) {
+      const a = parseInt(numMatch[1], 10);
+      const b = numMatch[2] ? parseInt(numMatch[2], 10) : a;
+      if (a >= 1 && b <= 65535 && b >= a) {
+        const span = b - a + 1;
+        if (span <= 256) {
+          let label;
+          if (a === b) {
+            const nm = nameForPort(a);
+            label = `Add port ${a}` + (nm ? ` · ${nm}` : "");
+          } else {
+            label = `Add port range ${a}-${b} (${span} ports)`;
+          }
+          out.push({ ports: [a, b], label });
+        }
+      }
+    }
+    for (const svc of TCP_SERVICES) {
+      if (svc.search && svc.search.includes(q)) {
+        out.push({
+          ports: [svc.port_low, svc.port_high],
+          label: svc.label,
+        });
+      }
+      if (out.length >= 12) break;
+    }
+    return out;
+  }
+
+  function showSuggestions(matches) {
+    sugBox.innerHTML = "";
+    if (!matches.length) {
+      sugBox.style.display = "none";
+      return;
+    }
+    for (const m of matches) {
+      const item = document.createElement("button");
+      item.type = "button";
+      item.className = "dropdown-item small";
+      item.textContent = m.label;
+      item.addEventListener("click", () => applyMatch(m));
+      sugBox.appendChild(item);
+    }
+    sugBox.style.display = "block";
+  }
+
+  function hideSuggestions() { sugBox.style.display = "none"; }
+
+  function applyMatch(m) {
+    const [lo, hi] = m.ports;
+    for (let p = lo; p <= hi; p++) selectedPorts.add(p);
+    addInput.value = "";
+    hideSuggestions();
+    renderChips();
+    syncHidden();
+    addInput.focus();
+  }
+
+  addInput.addEventListener("input", () => {
+    showSuggestions(buildSuggestions(addInput.value));
+  });
+  addInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      const matches = buildSuggestions(addInput.value);
+      if (matches.length) applyMatch(matches[0]);
+    } else if (ev.key === "Escape") {
+      hideSuggestions();
+    }
+  });
+  addInput.addEventListener("focus", () => {
+    if (addInput.value.trim()) showSuggestions(buildSuggestions(addInput.value));
+  });
+  document.addEventListener("click", (ev) => {
+    if (ev.target !== addInput && !sugBox.contains(ev.target)) hideSuggestions();
+  });
+
   const resetLink = document.getElementById("reset-ports");
   const clearLink = document.getElementById("clear-ports");
   if (resetLink) resetLink.addEventListener("click", (ev) => {
     ev.preventDefault();
-    portsInput.value = DEFAULT_PORTS_RAW;
-    skipBox.checked = false;
-    portsInput.disabled = false;
-    updateWarn();
+    selectedPorts = new Set(DEFAULT_PORTS.map(p => +p));
+    renderChips();
+    syncHidden();
   });
   if (clearLink) clearLink.addEventListener("click", (ev) => {
     ev.preventDefault();
-    portsInput.value = "";
-    skipBox.checked = true;
-    portsInput.disabled = true;
-    updateWarn();
+    selectedPorts.clear();
+    renderChips();
+    syncHidden();
   });
   skipBox.addEventListener("change", () => {
-    portsInput.disabled = skipBox.checked;
-    if (skipBox.checked) portsInput.value = "";
-    updateWarn();
+    if (skipBox.checked) {
+      selectedPorts.clear();
+    } else if (selectedPorts.size === 0) {
+      selectedPorts = new Set(DEFAULT_PORTS.map(p => +p));
+    }
+    renderChips();
+    syncHidden();
   });
 
   function approxPortCount() {
-    if (skipBox.checked) return 0;
-    const raw = portsInput.value.trim();
-    if (!raw) return 0;
-    let count = 0;
-    for (const tok of raw.split(/[,\s]+/)) {
-      if (!tok) continue;
-      const m = tok.match(/^(\d+)(?:-(\d+))?$/);
-      if (!m) continue;
-      const a = parseInt(m[1], 10);
-      const b = m[2] ? parseInt(m[2], 10) : a;
-      if (b >= a) count += (b - a + 1);
-    }
-    return count;
+    return skipBox.checked ? 0 : selectedPorts.size;
   }
 
   // Approximate the IP count from the selected target mode. When the
@@ -547,12 +734,16 @@
     if (warnBlock) warnBlock.style.display = ops > 8000 ? "" : "none";
   }
 
-  document.querySelectorAll('input[name="target_mode"], #pick-iface, input[name="custom_start"], input[name="custom_end"], #ports-input')
+  document.querySelectorAll('input[name="target_mode"], #pick-iface, input[name="custom_start"], input[name="custom_end"]')
     .forEach(el => {
       el.addEventListener("change", updateWarn);
       el.addEventListener("input", updateWarn);
     });
-  updateWarn();
+
+  // Initial render — paints the default-25 chips and primes the
+  // hidden input + skip-box state so the form is ready to submit.
+  renderChips();
+  syncHidden();
 
   if (startBtn) {
     startBtn.closest("form").addEventListener("submit", () => {
