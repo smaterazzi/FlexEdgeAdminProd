@@ -186,6 +186,31 @@
 </div>
 {% endif %}
 
+{% if inventory_hidden %}
+<div class="alert alert-info small d-flex align-items-start gap-2 py-2">
+  <i class="bi bi-info-circle mt-1"></i>
+  <div class="flex-grow-1">
+    <strong>{{ inventory_hidden }}</strong> cluster(s) hidden from this picker
+    because they have no fully-verified SSH credentials in this Domain. The
+    scan tool runs from inside a node and needs SSH to do its work. Visit
+    <a href="{{ url_for('dhcp.credentials') }}">Credentials</a> to enroll.
+  </div>
+</div>
+{% elif inventory_total == 0 and not inventory_error %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle"></i>
+  No clusters reachable in this Domain. Check the active SMC profile.
+</div>
+{% elif inventory|length == 0 and inventory_total > 0 %}
+<div class="alert alert-warning small">
+  <i class="bi bi-exclamation-triangle"></i>
+  All {{ inventory_total }} cluster(s) are hidden — none have fully-verified
+  SSH credentials in this Domain. Enroll a cluster's nodes in
+  <a href="{{ url_for('dhcp.credentials') }}">Credentials</a> to use the
+  scan tool.
+</div>
+{% endif %}
+
 <form method="POST" action="{{ url_for('engines.tools_scan') }}" class="card mb-3">
   <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
   <div class="card-body">

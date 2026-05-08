@@ -49,9 +49,30 @@
 </div>
 
 <div class="card">
-  <div class="card-header">
+  <div class="card-header d-flex justify-content-between align-items-center">
     <h5 class="mb-0">Tracked scopes</h5>
+    {% if show_all %}
+    <a href="{{ url_for('dhcp.scopes_list') }}" class="btn btn-sm btn-outline-secondary"
+       title="Hide scopes whose engine has no fully-verified SSH credentials.">
+      <i class="bi bi-funnel"></i> Hide unusable
+    </a>
+    {% elif hidden_count %}
+    <a href="{{ url_for('dhcp.scopes_list', show_all=1) }}"
+       class="btn btn-sm btn-outline-warning"
+       title="Reveal scopes whose engine has no fully-verified SSH credentials. Useful for cleanup of stale scopes.">
+      <i class="bi bi-eye"></i> Show all (+{{ hidden_count }} hidden)
+    </a>
+    {% endif %}
   </div>
+  {% if hidden_count and not show_all %}
+  <div class="alert alert-info small mb-0 rounded-0 border-0 border-bottom">
+    <i class="bi bi-info-circle"></i>
+    {{ hidden_count }} scope(s) hidden — their engine has no fully-verified
+    SSH credentials in this Domain. Enroll every cluster node in
+    <a href="{{ url_for('dhcp.credentials') }}">Credentials</a> to use them,
+    or click <strong>Show all</strong> above to reveal for cleanup.
+  </div>
+  {% endif %}
   {% if scopes %}
   <div class="table-responsive">
     <table class="table table-hover mb-0">
@@ -97,7 +118,17 @@
     </table>
   </div>
   {% else %}
+  {% if hidden_count and not show_all %}
+  <div class="p-3 text-muted small">
+    All {{ hidden_count }} discovered scope(s) are hidden because their
+    engines have no fully-verified SSH credentials in this Domain.
+    <a href="{{ url_for('dhcp.credentials') }}">Enroll credentials</a> or
+    <a href="{{ url_for('dhcp.scopes_list', show_all=1) }}">show them anyway</a>
+    for cleanup.
+  </div>
+  {% else %}
   <div class="p-3 text-muted small">No scopes tracked. Use the form above to discover scopes on an engine.</div>
+  {% endif %}
   {% endif %}
 </div>
 

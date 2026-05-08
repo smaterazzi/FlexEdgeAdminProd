@@ -154,6 +154,35 @@ def _scope_or_404(scope_id: int) -> DhcpScope:
     return scope
 
 
+def _scope_with_creds_or_redirect(scope_id: int) -> DhcpScope:
+    """Like ``_scope_or_404`` but also refuses if the scope's engine
+    has no fully-verified SSH credentials in the active Domain.
+
+    Returns ``None`` and flashes; callers redirect (typically to
+    ``/dhcp/scopes`` or back-referrer). Used by every operation that
+    needs SSH access to the engine — leases viewer, subnet scan,
+    Phase 4 deploy, reservation CRUD. Pure-FlexEdge ops (delete /
+    enable / disable / sync) skip this guard.
+
+    TODO-item-1 (2026-05-08): hide unusable items entirely; admin can
+    still reach them via /dhcp/scopes?show_all=1 for cleanup.
+    """
+    scope = _scope_or_404(scope_id)
+    if scope is None:
+        return None
+    from webapp.engine_credentials import is_engine_credentials_valid
+    if not is_engine_credentials_valid(scope.domain_id, scope.engine_name):
+        flash(
+            f"Engine {scope.engine_name!r} has no fully-verified SSH "
+            f"credentials in this Domain. Every cluster node must be "
+            f"enrolled and verified before this scope can be used. "
+            f"Enroll in Credentials, then come back.",
+            "warning",
+        )
+        return None
+    return scope
+
+
 def _domain_from_form(tenant_id: int, api_key_id: int) -> Domain | None:
     """Resolve the Domain from the (tenant_id, api_key_id) pair the
     cascading admin forms still POST today.
@@ -474,12 +503,26 @@ def system_phase0_revoke():
 @admin_required
 def scopes_list():
     domain_id = _active_domain_id()
+    show_all = request.args.get("show_all") == "1"
     if domain_id is None:
         scopes = []
+        hidden_count = 0
     else:
-        scopes = (DhcpScope.query
-                  .filter_by(domain_id=domain_id)
-                  .order_by(DhcpScope.engine_name, DhcpScope.interface_id).all())
+        all_scopes = (DhcpScope.query
+                      .filter_by(domain_id=domain_id)
+                      .order_by(DhcpScope.engine_name, DhcpScope.interface_id).all())
+        # TODO-item-1 gate: hide scopes whose engine has no fully-verified
+        # SSH credentials in this Domain. ?show_all=1 bypasses the filter
+        # so an admin can clean up stale scopes (delete) without
+        # re-enrolling credentials first.
+        from webapp.engine_credentials import valid_engines_for_domain
+        valid = valid_engines_for_domain(domain_id)
+        if show_all:
+            scopes = all_scopes
+            hidden_count = 0
+        else:
+            scopes = [s for s in all_scopes if s.engine_name in valid]
+            hidden_count = len(all_scopes) - len(scopes)
     # Domain-Scoping: only the active Domain's bound Tenant — never a
     # full Tenant list. The operator should never see another Domain's
     # infrastructure surfaced here.
@@ -491,7 +534,8 @@ def scopes_list():
                else Tenant.query
                           .filter_by(id=bound_tenant_id, is_active=True)
                           .all())
-    return render_template("dhcp/scopes.html", scopes=scopes, tenants=tenants)
+    return render_template("dhcp/scopes.html", scopes=scopes, tenants=tenants,
+                           hidden_count=hidden_count, show_all=show_all)
 
 
 @dhcp_bp.route("/scopes/discover", methods=["POST"])
@@ -615,7 +659,7 @@ def scope_delete(scope_id):
 @dhcp_bp.route("/scopes/<int:scope_id>")
 @admin_required
 def scope_detail(scope_id):
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -712,7 +756,7 @@ def scope_sync_hosts(scope_id):
 @dhcp_bp.route("/scopes/<int:scope_id>/reservations/new", methods=["GET", "POST"])
 @admin_required
 def reservation_new(scope_id):
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -822,7 +866,9 @@ def reservation_edit(reservation_id):
     if not res:
         flash("Reservation not found.", "danger")
         return redirect(url_for("dhcp.scopes_list"))
-    scope = res.scope
+    scope = _scope_with_creds_or_redirect(res.scope_id)
+    if not scope:
+        return redirect(url_for("dhcp.scopes_list"))
     domain = scope.domain
     if domain is None or domain.api_key is None:
         flash("Scope has no Domain or ApiKey on file. Re-enroll via Admin Portal.", "danger")
@@ -940,7 +986,7 @@ def reservations_bulk_delete(scope_id):
     DB-only deletes (operator unticks "also delete SMC Host") still run
     immediately — no SMC mutation, no queue.
     """
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -1299,7 +1345,7 @@ def scope_preview(scope_id):
     """
     from webapp.dhcp_pusher import preview_scope
 
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -1338,7 +1384,7 @@ def _run_push(scope_id: int, action: str):
     """
     from webapp.dhcp_pusher import push_scope_to_engine
 
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -3120,7 +3166,7 @@ def scope_leases(scope_id):
     and renders the enriched view (Discovery column + untracked card).
     Failures flash and fall through to the plain leases view.
     """
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -3418,7 +3464,7 @@ def scope_scan(scope_id):
     On success, redirects to /leases?scan_id=X. The leases page polls
     /scan/status and switches to the enriched view on completion.
     """
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
@@ -3426,6 +3472,9 @@ def scope_scan(scope_id):
              .filter_by(domain_id=scope.domain_id,
                         engine_name=scope.engine_name)
              .order_by(DhcpEngineCredential.node_index).all())
+    # Defence in depth — `_scope_with_creds_or_redirect` already filtered
+    # the case where no enrolled creds exist, but credentials could have
+    # been deleted between the gate-check and this point.
     if not creds:
         flash(f"No SSH credentials enrolled for {scope.engine_name}. "
               f"Enroll each cluster node in Credentials first.", "warning")
@@ -3568,7 +3617,7 @@ def scope_leases_reserve(scope_id):
     per-lease failures are collected and surfaced via flash messages without
     aborting the batch.
     """
-    scope = _scope_or_404(scope_id)
+    scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 

@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Credential-gated visibility across DHCP and Tools/Scan (2026-05-08)
+
+TODO-item-1 — operator-facing pages now hide engines/scopes that have
+no fully-verified SSH credentials in the active Domain. Hard-filter
+style (entries are removed, not greyed-out); admins can reveal them
+for cleanup via `?show_all=1`.
+
+**Validity rule** (in `webapp/engine_credentials.py`):
+
+- New helpers `is_engine_credentials_valid(domain_id, engine_name)`
+  and `valid_engines_for_domain(domain_id)`.
+- "Valid" = at least one credential row exists AND every credential
+  row for the engine has `last_verify_status='ok'`. Partial enrolment
+  (cluster has 2 nodes but only 1 enrolled) can't be detected from
+  the DB alone — accepted trade-off, the bulk-enroll workflow always
+  covers every node.
+
+**Where the gate fires:**
+
+| Surface | Behaviour |
+| --- | --- |
+| `/dhcp/scopes` | Filters out scopes whose engine isn't valid; shows a `+N hidden` info banner with **Show all** escape hatch (`?show_all=1`) for cleanup. Empty state explains the situation when every scope is hidden. |
+| `/dhcp/scopes/<id>` and every operation behind it (leases viewer, subnet scan, Phase-4 deploy/preview/resync, reservation new/edit/bulk-delete, leases-→-reservation promote) | Redirect to `/dhcp/scopes` with a flash. New helper `_scope_with_creds_or_redirect()`; pure-FlexEdge ops (`enable` / `disable` / `delete` / `sync`) keep the lenient `_scope_or_404()` so admins can still clean up stale rows. |
+| `/engines/tools/scan` GET | Cluster inventory filtered to valid engines. Banner reports the hidden count and points at `/dhcp/credentials`. Empty-state copy when zero engines pass. |
+| `/engines/tools/scan` POST | Server-side gate refuses if `engine_name` isn't valid. Defence in depth — a direct curl can't bypass the GET filter. |
+| Terminal | Already correctly per-node gated (template button disabled, HTTP route guard, WebSocket handshake). No change. |
+| sgInfo collection (cluster_detail "Collect" button) | **Exempt.** Rides the SMC management channel, doesn't need SSH. |
+
 ### UI: top-center search bar, pinned bookmarks, evident sidebar sections (2026-05-08)
 
 Three quality-of-life improvements landing together in

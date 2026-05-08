@@ -128,6 +128,61 @@ def is_engine_cache_fresh(domain_id: int, engine_name: str) -> bool:
     return get_engine_freshness(domain_id, engine_name).is_fresh
 
 
+# ── Validity (operator-facing visibility gate) ───────────────────────────
+#
+# "Valid credentials" = at least one credential row exists for the engine
+# in the active Domain AND every credential row has
+# ``last_verify_status='ok'``. This is the rule used to decide whether
+# the engine's DHCP scopes / scope operations / Tools-Scan picker entries
+# should be visible to the operator (TODO item 1, 2026-05-08).
+#
+# The Terminal icon on cluster_detail is gated per-node, NOT per-engine
+# — Terminal targets a specific node, so per-node validity is the right
+# granularity there. Don't touch it.
+#
+# sgInfo collection is intentionally OUT of scope: it rides the SMC
+# management channel and works without any SSH credential.
+
+def is_engine_credentials_valid(domain_id: int, engine_name: str) -> bool:
+    """True iff every enrolled credential for ``engine_name`` in
+    ``domain_id`` is verified=ok and at least one row exists.
+
+    Caveat: cannot detect partial enrollment (engine has 2 nodes, only
+    node 0 enrolled) without an SMC fetch. Acceptable trade-off — the
+    bulk-enroll workflow always covers every node, so partial
+    enrollment is a transient state operators leave intentionally.
+    """
+    rows = (DhcpEngineCredential.query
+            .filter_by(domain_id=domain_id, engine_name=engine_name)
+            .all())
+    if not rows:
+        return False
+    return all((r.last_verify_status or "").lower() == "ok" for r in rows)
+
+
+def valid_engines_for_domain(domain_id: int) -> set[str]:
+    """One-pass set of engine names whose credentials all verify=ok.
+
+    Optimised for list-page rendering: a single grouped DB read instead
+    of N round-trips. Empty set when ``domain_id`` is None.
+    """
+    if domain_id is None:
+        return set()
+    rows = (DhcpEngineCredential.query
+            .filter_by(domain_id=domain_id)
+            .with_entities(DhcpEngineCredential.engine_name,
+                           DhcpEngineCredential.last_verify_status)
+            .all())
+    seen: dict[str, bool] = {}
+    for engine_name, status in rows:
+        ok = (status or "").lower() == "ok"
+        if engine_name not in seen:
+            seen[engine_name] = ok
+        else:
+            seen[engine_name] = seen[engine_name] and ok
+    return {name for name, ok in seen.items() if ok}
+
+
 # ── State-bump helpers (called from existing ops) ────────────────────────
 
 def mark_credential_refreshed(cred: DhcpEngineCredential,

@@ -469,15 +469,27 @@ def tools_scan():
     # the cascading dropdowns can render without a second round-trip.
     # Failures here are non-fatal: the page still loads, the operator
     # picks differently, the form POST validates again server-side.
+    #
+    # TODO-item-1 gate: filter the inventory to engines whose every node
+    # has a verified=ok credential in the active Domain. The scan tool
+    # runs `nc -z`/ICMP/arping FROM a cluster node, so it needs SSH —
+    # un-credentialed engines are useless here.
     inventory = []
     inventory_error = None
+    inventory_total = 0  # how many SMC clusters exist before the gate filtered
     if not scan_running and not scan_report:
         try:
             cfg = _user_cfg()
             with __import__("smc_client").smc_session(cfg):
                 clusters_summary = engine_inquiry.list_clusters(cfg)
-            inventory = [{"name": c.name, "node_count": c.node_count,
-                          "typeof": c.typeof} for c in clusters_summary]
+            from webapp.engine_credentials import valid_engines_for_domain
+            domain = _current_domain()
+            valid = valid_engines_for_domain(domain.id) if domain else set()
+            inventory_total = len(clusters_summary)
+            inventory = [
+                {"name": c.name, "node_count": c.node_count, "typeof": c.typeof}
+                for c in clusters_summary if c.name in valid
+            ]
         except Exception as exc:
             inventory_error = str(exc)
             log.warning("tools_scan: cluster list failed: %s", exc)
@@ -503,6 +515,8 @@ def tools_scan():
         sorted_ips=sorted_ips,
         inventory=inventory,
         inventory_error=inventory_error,
+        inventory_total=inventory_total,
+        inventory_hidden=max(0, inventory_total - len(inventory)),
         default_ports=",".join(str(p) for p in DEFAULT_PORTS),
     )
 
@@ -559,6 +573,18 @@ def tools_scan_start():
     domain = _current_domain()
     if domain is None:
         flash("No active Domain — pick one first.", "warning")
+        return redirect(url_for("engines.tools_scan"))
+
+    # TODO-item-1 gate (defence in depth — UI hides un-credentialed
+    # engines, but a direct curl would skip the GET filter).
+    from webapp.engine_credentials import is_engine_credentials_valid
+    if not is_engine_credentials_valid(domain.id, engine_name):
+        flash(
+            f"Engine {engine_name!r} has no fully-verified SSH credentials "
+            f"in this Domain. Enroll every cluster node in Credentials "
+            f"before launching a scan.",
+            "warning",
+        )
         return redirect(url_for("engines.tools_scan"))
 
     creds_by_node = _credentials_for_engine(domain.id, engine_name)
