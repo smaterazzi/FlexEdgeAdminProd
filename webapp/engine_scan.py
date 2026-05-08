@@ -5,8 +5,14 @@ two additional phases that produce per-host port and hostname data:
 
   Phase 1 — ICMP        parallel ping + ip neighbor show for MAC
   Phase 2 — arping      fallback for ICMP-failed IPs (L2 visibility)
-  Phase 3 — port scan   nc -z -w1 per (IP, port) for L2-visible hosts
+  Phase 3 — port scan   nc -z -w1 per (IP, port) for EVERY target
   Phase 4 — RDNS        nslookup per L2-visible host
+
+Phase 3 deliberately ignores Phase 1/2 results — hosts that drop ICMP
+and aren't L2-adjacent (firewalled-but-TCP-open machines across a
+routed boundary) are exactly the ones the operator wants to find.
+Phase 4 stays gated on L2 visibility because reverse-DNS on dead IPs
+is just noise.
 
 Output is one event per line (same shape as the DHCP scanner) so the
 job runtime can stream progress live:
@@ -153,8 +159,11 @@ def parse_port_list(raw: str) -> list[int]:
 # its work list). Each phase emits one line per (IP) or (IP, port). The
 # Python parser drives the progress bar from these.
 #
-# Phase 3 only probes IPs that were reachable in Phase 1 OR 2 — no point
-# port-scanning a host that didn't answer either.
+# Phase 3 (port scan) probes EVERY target regardless of L1/L2 reply —
+# firewalled-but-TCP-open hosts are common (Windows desktops, web
+# servers behind firewalls that drop ICMP). Phase 4 (RDNS) only resolves
+# hostnames for hosts that did reply, since reverse-DNS on dead IPs is
+# noise.
 _SCAN_SCRIPT = r"""
 BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; shift 6
 TMP=$(mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
@@ -207,10 +216,12 @@ while IFS= read -r line; do
     fi
 done < "$TMP"
 
-# Phase 3 — port scan + Phase 4 RDNS, only for reachable hosts
-if [ -n "$PORTS" ] && [ -s "$REACHABLE" ]; then
-    while IFS= read -r ip; do
-        [ -z "$ip" ] && continue
+# Phase 3 — port scan over ALL targets (regardless of L1/L2 reply).
+# Hosts that drop ICMP and aren't L2-adjacent (e.g. firewalled servers
+# across a routed boundary) can still have open TCP ports — that's the
+# whole point of running Tools→Scan against a remote subnet.
+if [ -n "$PORTS" ]; then
+    for ip in "$@"; do
         for port in $(printf '%s' "$PORTS" | tr ',' ' '); do
             (
                 if nc -z -w "$CT" "$ip" "$port" >/dev/null 2>&1; then
@@ -222,10 +233,12 @@ if [ -n "$PORTS" ] && [ -s "$REACHABLE" ]; then
             n=$((n+1))
             if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
         done
-    done < "$REACHABLE"
+    done
     wait
 fi
 
+# Phase 4 — RDNS only for L2-visible hosts (reverse-DNS on dead IPs
+# is noise; we don't want hostname-result rows for silent targets).
 if [ -s "$REACHABLE" ]; then
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue

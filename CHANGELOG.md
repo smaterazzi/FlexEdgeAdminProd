@@ -6,6 +6,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: Phase 3 port scan now covers ALL targets (2026-05-08)
+
+Operator reported only seeing ICMP traffic from the firewall, no
+`nc -z` TCP probes, when scanning a remote subnet. Root cause:
+[webapp/engine_scan.py](webapp/engine_scan.py) Phase 3 was gated by
+`[ -s "$REACHABLE" ]` — the script only port-scanned hosts that had
+replied to ICMP (Phase 1) or arping (Phase 2). When the engine
+scanned across a routed boundary, ICMP-dropping hosts (Windows
+desktops, web servers behind host firewalls) never made it into
+REACHABLE, Phase 3 silently skipped, and the only traffic that ever
+left the engine was the Phase 1 ICMP echo requests. Exactly what the
+operator observed.
+
+Fix: Phase 3 now iterates over the full target list (`for ip in
+"$@"`), regardless of L1/L2 reply. Phase 4 (RDNS) keeps its
+REACHABLE gate because reverse-DNS on dead IPs is just noise. As a
+side benefit, the progress bar's `total` math
+(`len(ip_list) + len(ip_list)*len(ports)`) now matches the actual
+event count exactly — before the fix, progress only reached 100%
+when every host replied to ICMP.
+
+Worst-case wall time on a fully-silent /24 × 25 ports = 6,375 nc
+probes. With `batch=32` parallelism and `port_timeout_s=1`, that's
+~200 seconds — well within the 900s exec_timeout. The existing
+8000-op soft warn / 16384-op hard cap already gate larger fan-outs.
+
+Doc update: [docs/Engines-ScanTool.md](docs/Engines-ScanTool.md)
+phase listing rewritten + a paragraph on the design intent ("Phase 3
+deliberately ignores L1/L2 reachability — that's the point of
+running Tools→Scan against a remote subnet").
+
 ### Session summary — 2026-05-08
 
 Big day. Landed in this session, in roughly this order:
