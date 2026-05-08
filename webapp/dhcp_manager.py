@@ -3072,10 +3072,18 @@ def scope_leases(scope_id):
              .filter_by(domain_id=scope.domain_id,
                         engine_name=scope.engine_name)
              .order_by(DhcpEngineCredential.node_index).all())
-    if not creds:
-        flash(f"No SSH credentials enrolled for {scope.engine_name}. "
-              f"Go to Credentials to enroll each cluster node first.", "warning")
-        return redirect(url_for("dhcp.credentials_list"))
+    creds_missing = not creds
+    # Don't teleport the operator away when no credentials are enrolled
+    # yet — render the leases page with an empty state + a clear CTA so
+    # they keep the scope context (breadcrumb, scope metadata, refresh
+    # button). The template's `creds_missing` block surfaces an inline
+    # alert with a "Enroll credentials" button.
+    #
+    # Cross-Domain diagnostic: if the operator is sure they enrolled
+    # credentials for this engine, they may have been enrolled under a
+    # different Domain (legacy data from before the Multi-Domain
+    # Revamp). The empty-state alert mentions the active Domain so a
+    # mismatch becomes visible at a glance.
 
     reservations = (DhcpReservation.query.filter_by(scope_id=scope.id).all())
     res_by_mac = {r.mac_address: r for r in reservations}
@@ -3105,6 +3113,7 @@ def scope_leases(scope_id):
             scan_report=None, scan_running=scan_running,
             untracked_rows=[],
             subnet_size=subnet_size_running,
+            creds_missing=creds_missing,
         )
 
     per_node_results: dict[int, list] = {}
@@ -3291,6 +3300,7 @@ def scope_leases(scope_id):
         scan_report=scan_report, scan_running=None,
         untracked_rows=untracked_rows,
         subnet_size=subnet_size,
+        creds_missing=creds_missing,
     )
 
 
