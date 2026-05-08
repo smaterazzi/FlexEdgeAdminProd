@@ -6,6 +6,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: CRITICAL FIX — Phase 2 was clobbering the target list (2026-05-08)
+
+**Root cause of the "scan finds nothing" symptom.** Operator ran
+the standalone debug harness (`scripts/engine-scan-debug.sh`) and
+pasted the output. The smoking gun:
+
+```text
+→ 172.21.20.15:80  OPEN              ← real, port 80 actually open
+→ ICMP_OK:80  closed-refused  (nc: bad address 'ICMP_OK')
+                ^^^^^^^^^^^ that is not an IP
+```
+
+Phase 2's `set -- $line; ip=$1; state=$2` was **mutating the
+top-level `"$@"`** — the script's original target list — every
+iteration. After the read loop finished, `"$@"` was no longer
+`("172.21.20.10", "172.21.20.11", …)` but `("<last_ip>",
+"<last_state>")`. Phase 3 then did `for ip in "$@"` and dutifully
+attempted nc probes against a host literally named `"ICMP_FAIL"`
+(or `"ICMP_OK"`), getting `nc: bad address` for every "port".
+
+Real-world impact: the operator's scans of full /24s with many
+ICMP-failing hosts were probing **< 1% of intended targets** —
+last-failed IP plus the literal string `"ICMP_FAIL"` — which
+explains why the firewall logs showed barely any TCP SYN. The
+script was working for a single OK host (lab test) because
+Phase 2 still ran with `set -- "$ip ICMP_OK"`, so `"$@"` ended
+up `("$ip", "ICMP_OK")` — giving real probes for the host plus
+bogus ones for `ICMP_OK`. Functionality looked half-broken; the
+"closed-refused (nc: bad address)" lines in the harness output
+made the corruption visible.
+
+Fix in [webapp/engine_scan.py](webapp/engine_scan.py)
+`_SCAN_SCRIPT` Phase 2 (and mirrored in
+[scripts/engine-scan-debug.sh](scripts/engine-scan-debug.sh)):
+
+```sh
+# Was:
+while IFS= read -r line; do
+    set -- $line                # ← clobbers "$@" — DON'T
+    ip=$1; state=$2
+    ...
+
+# Now:
+while read -r ip state; do      # ← reads directly into named vars
+    ...
+```
+
+`read -r ip state` with default IFS splits each line into the two
+named variables without touching positional parameters. Phase 3
+now sees the full original target list intact.
+
+[webapp/dhcp_subnet_scan.py](webapp/dhcp_subnet_scan.py) has the
+same `set --` pattern but no Phase 3 that consumes `"$@"` after
+the loop, so the bug was harmless there — left untouched in this
+fix to keep the changeset tight (worth cleaning up later for
+consistency).
+
 ### Engines → Tools → Scan: verbose-log toggle for live troubleshooting (2026-05-08)
 
 When a scan looks empty (the "I see only ICMP, no SYN" symptom

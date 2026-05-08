@@ -207,9 +207,16 @@ done
 wait
 
 # Phase 2 — arping fallback for ICMP_FAIL
-while IFS= read -r line; do
-    set -- $line
-    ip=$1; state=$2
+# CRITICAL: do NOT use `set -- $line` here. That would clobber the
+# top-level "$@" (the original target IP list), and Phase 3 below
+# does `for ip in "$@"` to iterate every target × every port — if
+# Phase 2 ran even once, "$@" would become ("<last_ip>", "<state>")
+# and Phase 3 would silently scan only those two "IPs", with
+# `nc: bad address 'ICMP_FAIL'` on the second one. We hit exactly
+# this bug 2026-05-08 — operator's real-world scans were probing
+# < 1% of intended targets because most subnets have many
+# ICMP-failing hosts. Read directly into named vars instead.
+while read -r ip state; do
     if [ "$state" = "ICMP_FAIL" ]; then
         DEV=$(busybox ip route get "$ip" 2>/dev/null | busybox awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
         if [ -z "$DEV" ]; then
