@@ -48,7 +48,7 @@ from webapp.smc_dhcp_client import (
 from webapp.smc_tls_client import list_engines, smc_error_detail
 from webapp.dhcp_ssh import (
     SSHTarget, SSHCredential, FingerprintMismatch,
-    verify_credential, is_auth_failure,
+    tcp_probe, verify_credential, is_auth_failure,
     get_file as ssh_get_file,
 )
 from webapp.dhcp_bootstrap import (
