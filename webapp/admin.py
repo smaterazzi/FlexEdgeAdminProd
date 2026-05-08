@@ -1062,3 +1062,81 @@ def log_settings():
         bypass_features=bypass_state,
         active_domain=active_domain,
     )
+
+
+# ── Cache settings (Loose / Quick refresh levels) ──────────────────────
+#
+# Two named TTL levels that the codebase passes to `cache_get_or_fetch`:
+#   * Loose refresh — for inventory data FlexEdge doesn't write
+#                     (engine list, cluster detail, policy list, ...).
+#   * Quick refresh — for data FlexEdge writes via the queue
+#                     (hosts/networks/services, policy rules, ...).
+#
+# Defaults: Loose=24h, Quick=1h. Operator overrides are stored in
+# `platform_settings` keys `cache_ttl_loose_seconds` /
+# `cache_ttl_quick_seconds`. Reload is in-process via
+# `smc_cache.reload_ttl_settings()`.
+
+@admin_bp.route("/cache-settings", methods=["GET", "POST"])
+@admin_required
+def cache_settings():
+    from shared.logging import set_setting
+    from shared.smc_cache import (
+        LOOSE_REFRESH_TTL, QUICK_REFRESH_TTL, MAX_TTL,
+        get_loose_ttl, get_quick_ttl, reload_ttl_settings,
+        stats as cache_stats,
+    )
+
+    me_email = (session.get("user") or {}).get("email", "")
+
+    if request.method == "POST":
+        action = (request.form.get("action") or "save").strip()
+
+        if action == "reset":
+            # Wipe both overrides — defaults take effect again.
+            set_setting("cache_ttl_loose_seconds", "", by_email=me_email)
+            set_setting("cache_ttl_quick_seconds", "", by_email=me_email)
+            reload_ttl_settings()
+            flash("Cache TTLs reset to defaults "
+                  f"(Loose {LOOSE_REFRESH_TTL // 3600} h, "
+                  f"Quick {QUICK_REFRESH_TTL // 3600} h).", "success")
+            return redirect(url_for("admin.cache_settings"))
+
+        # action == 'save'
+        try:
+            loose_h = float(request.form.get("loose_hours", "").strip() or "24")
+        except ValueError:
+            loose_h = 24
+        try:
+            quick_h = float(request.form.get("quick_hours", "").strip() or "1")
+        except ValueError:
+            quick_h = 1
+
+        # Clamp into [1 min, 24 h] — same range smc_cache enforces.
+        loose_s = max(60, min(int(loose_h * 3600), MAX_TTL))
+        quick_s = max(60, min(int(quick_h * 3600), MAX_TTL))
+
+        set_setting("cache_ttl_loose_seconds", str(loose_s), by_email=me_email)
+        set_setting("cache_ttl_quick_seconds", str(quick_s), by_email=me_email)
+        reload_ttl_settings()
+
+        flash(
+            f"Saved. Loose refresh = {loose_s // 60} min "
+            f"({loose_s / 3600:.2f} h); "
+            f"Quick refresh = {quick_s // 60} min "
+            f"({quick_s / 3600:.2f} h). "
+            f"New values apply to NEWLY-created cache sections; restart "
+            f"the app for full effect on already-active sections.",
+            "success",
+        )
+        return redirect(url_for("admin.cache_settings"))
+
+    return render_template(
+        "admin/cache_settings.html",
+        loose_ttl=get_loose_ttl(),
+        quick_ttl=get_quick_ttl(),
+        loose_default=LOOSE_REFRESH_TTL,
+        quick_default=QUICK_REFRESH_TTL,
+        max_ttl=MAX_TTL,
+        stats=cache_stats(),
+    )

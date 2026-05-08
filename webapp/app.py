@@ -813,12 +813,13 @@ def browse(type_key):
     """List all elements of a given type.
 
     Cached read-through ([shared/smc_cache.py](shared/smc_cache.py),
-    section ``smc.explorer.<type_key>``, TTL 1 h per the operator's
-    TTL rule — operators DO write hosts/networks/services through the
-    queue, so the shorter TTL plus the queue runner's auto-invalidation
-    keeps the list fresh after each push). Cache key is
-    ``(domain_id, filter_text, fgt_only)`` so a filtered view doesn't
-    pollute the unfiltered cache (and vice versa).
+    section ``smc.explorer.<type_key>``, **Quick refresh** (1 h
+    default) per the operator's TTL rule — operators DO write
+    hosts/networks/services through the queue, so the shorter TTL
+    plus the queue runner's auto-invalidation keeps the list fresh
+    after each push. Cache key is ``(domain_id, filter_text,
+    fgt_only)`` so a filtered view doesn't pollute the unfiltered
+    cache (and vice versa).
 
     ``?refresh=1`` is family-wide: it also drops every cached
     per-element detail (``smc.element.<type_key>``) so a deeper page
@@ -837,7 +838,9 @@ def browse(type_key):
     fgt_only = request.args.get("fgt", "0") == "1"
     label = smc_client.ELEMENT_TYPES[type_key]["label"]
     try:
-        from shared.smc_cache import cache_get_or_fetch, invalidate
+        from shared.smc_cache import (
+            cache_get_or_fetch, invalidate, get_quick_ttl,
+        )
         cfg = get_user_cfg()
         domain_obj = getattr(g, "domain", None)
         domain_id = domain_obj.id if domain_obj else 0
@@ -857,7 +860,7 @@ def browse(type_key):
             section=f"smc.explorer.{type_key}",
             key_parts=(domain_id, filter_text, "fgt" if fgt_only else ""),
             fetcher=_fetch,
-            ttl=3600,            # 1 h — FlexEdge writes to these via queue (Q1.B)
+            ttl=get_quick_ttl(),       # Quick refresh — writeable via queue
             refresh=refresh_requested,
         )
         elements = cv.data
@@ -878,12 +881,13 @@ def detail(type_key, element_name):
     """Show full detail for a single element.
 
     Cached read-through (section ``smc.element.<type_key>``, key
-    ``(domain_id, element_name)``, TTL 1 h). Auto-invalidated by the
-    queue runner after any create/update of the same element type, and
-    by the parent ``/browse/<type_key>?refresh=1`` (family-wide).
+    ``(domain_id, element_name)``, **Quick refresh** — 1 h default).
+    Auto-invalidated by the queue runner after any create/update of
+    the same element type, and by the parent
+    ``/browse/<type_key>?refresh=1`` (family-wide).
     """
     try:
-        from shared.smc_cache import cache_get_or_fetch
+        from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
         cfg = get_user_cfg()
         domain_obj = getattr(g, "domain", None)
         domain_id = domain_obj.id if domain_obj else 0
@@ -896,7 +900,7 @@ def detail(type_key, element_name):
             section=f"smc.element.{type_key}",
             key_parts=(domain_id, element_name),
             fetcher=_fetch,
-            ttl=3600,                     # 1 h — writeable via queue
+            ttl=get_quick_ttl(),         # Quick refresh — writeable via queue
             refresh=(request.args.get("refresh") == "1"),
         )
         data = cv.data
@@ -913,13 +917,13 @@ def policies():
     """List all firewall policies.
 
     Cached read-through (section ``smc.policy.list``, key
-    ``(domain_id,)``, TTL 24 h — FlexEdge doesn't create / delete
-    policies; the queue runner can mutate rules within them but the
-    list itself is stable, so 24 h is the read-only side of the rule).
-    Refresh button on the page.
+    ``(domain_id,)``, **Loose refresh** — 24 h default. FlexEdge
+    doesn't create or delete policies; the queue runner can mutate
+    rules within them but the list itself is stable). Refresh button
+    on the page.
     """
     try:
-        from shared.smc_cache import cache_get_or_fetch
+        from shared.smc_cache import cache_get_or_fetch, get_loose_ttl
         cfg = get_user_cfg()
         domain_obj = getattr(g, "domain", None)
         domain_id = domain_obj.id if domain_obj else 0
@@ -932,7 +936,7 @@ def policies():
             section="smc.policy.list",
             key_parts=(domain_id,),
             fetcher=_fetch,
-            ttl=86400,                # 24 h — read-only inventory
+            ttl=get_loose_ttl(),      # Loose refresh — read-only inventory
             refresh=(request.args.get("refresh") == "1"),
         )
         policy_list = cv.data
@@ -1026,6 +1030,7 @@ def api_quick_search():
         ("Admin / Users",             "/admin/users",               "bi-people"),
         ("Admin / Backup",            "/admin/backup",              "bi-archive"),
         ("Admin / Log settings",      "/admin/log-settings",        "bi-funnel"),
+        ("Admin / Cache settings",    "/admin/cache-settings",      "bi-database-gear"),
     ]
     for label, href, icon in features:
         if q in label.lower():

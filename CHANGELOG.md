@@ -6,6 +6,58 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Session summary — 2026-05-08
+
+Big day. Landed in this session, in roughly this order:
+
+1. Bug: `InvalidRequestError: Instance ... is not persistent within this Session` on `/dhcp/credentials/rule/install` and siblings — bypass-queue cleanup detached `change` before the route refreshed it.
+2. Bug: `/dhcp/scopes/<id>/leases` cross-Domain diagnostic — empty-state alert now lists OTHER Domains (operator-accessible) that have credentials for the engine, with one-click "Switch to X" buttons.
+3. Feature: **sgInfo on-demand collection** — per-node "Collect" button on the cluster_detail page, background daemon-thread, in-browser archive viewer with file tree + text reader + raw `.gz` download, history list. Works for node-initiated-contact engines because the SMC management channel is bidirectional once established.
+4. UX: engine name in `/dhcp/credentials` Card 3 is now a link to `/engines/clusters/<engine>`.
+5. Standing rule: **TODO-item-1 credential-gated visibility** — `/dhcp/scopes` + scope ops + Tools/Scan picker hide engines without fully-verified SSH credentials. `?show_all=1` escape hatch for cleanup. sgInfo intentionally exempt.
+6. Bug: **stale-form detector** for 11 `/dhcp/credentials/*` + `/dhcp/scopes/discover` routes — refuses with clear "page is out of sync, reload" instead of cryptic "no enrollment record" downstream.
+7. Bug: `BuildError: dhcp.credentials` → fixed to `dhcp.credentials_list` at 6 call sites (4 added today, 2 pre-existing).
+8. **Caching rollout phase 1**: `engines.detail` cached, `engines.list` shared with Tools/Scan, family-wide refresh, `cluster_forget` invalidation extended.
+9. **Caching rollout phase 2**: `smc.explorer.<type>`, `smc.element.<type>`, `smc.policy.list` cached. Queue runner invalidation map aligned with the single-section + multi-key shape.
+10. **Cache TTL tiers reified**: `LOOSE_REFRESH_TTL` (24 h) and `QUICK_REFRESH_TTL` (1 h) with operator overrides via `/admin/cache-settings`. All call sites switched off raw seconds. Going forward, talk about Loose/Quick by name.
+
+End-of-session state: roadmap pinned at the top of [TODO.md](TODO.md) — TCP scan bug → TCP scan service-name UX → Policies dedupe + NAT → Caching phase 3 → TLS Let's Encrypt CRUD design round.
+
+### Cache TTL levels: Loose / Quick + admin settings page (2026-05-08)
+
+Reified the TTL rule established during the phase 1+2 rollout into
+two named tiers operators talk about by name, not by raw seconds:
+
+- **Loose refresh** — `LOOSE_REFRESH_TTL` = 24 h. For inventory data
+  FlexEdge doesn't write to (engine list, cluster detail, policy
+  list, TLS engine settings, scope discovery).
+- **Quick refresh** — `QUICK_REFRESH_TTL` = 1 h. For data FlexEdge
+  writes via the queue (host/network/service elements, policy rules,
+  reservation Hosts).
+
+Constants + getters (`get_loose_ttl()`, `get_quick_ttl()`) live in
+[shared/smc_cache.py](shared/smc_cache.py). Both tiers are operator-
+overridable through `platform_settings` keys
+`cache_ttl_loose_seconds` / `cache_ttl_quick_seconds`. The getters
+memoise the override per process; `reload_ttl_settings()` clears the
+memo after a save so the next read picks up the new value without a
+restart.
+
+All existing call sites switched from raw `ttl=86400` / `ttl=3600`
+literals to the named getters: `clusters`, `cluster_detail`,
+`tools_scan` GET (Loose); `browse`, `detail` (Quick); `policies`
+(Loose). Going forward, every new cache call site picks one of the
+two — no more raw seconds.
+
+**Admin UI**: `/admin/cache-settings` ([webapp/admin.py:cache_settings](webapp/admin.py))
+with editable hour fields for both tiers, a Reset-to-defaults button,
+and a live cache snapshot (hits / misses / hit-ratio / per-section
+entry counts via `smc_cache.stats()`). Sidebar entry under Admin.
+Hard cap: 24 h per tier. Floor: 1 minute. Documented caveat — TTL
+changes only affect newly-CREATED sections, since `_get_section_cache`
+sets TTL at section creation; restart for full effect on long-lived
+sections.
+
 ### Caching rollout phase 2: SMC Explorer + policies list (2026-05-08)
 
 TODO-item-2 phase 2 — biggest user-visible cache win across the SMC

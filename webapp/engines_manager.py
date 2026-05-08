@@ -157,7 +157,9 @@ def clusters():
     the "Refresh from SMC" button on the page).
     """
     import hashlib
-    from shared.smc_cache import cache_get_or_fetch, invalidate
+    from shared.smc_cache import (
+        cache_get_or_fetch, invalidate, get_loose_ttl,
+    )
     from webapp.models import DhcpEngineSshAccess
 
     try:
@@ -180,6 +182,7 @@ def clusters():
             # — replaces the legacy (tenant_id, domain_name, api_key_hash) tuple.
             key_parts=(domain_id,),
             fetcher=lambda: engine_inquiry.list_clusters(cfg),
+            ttl=get_loose_ttl(),       # Loose refresh — read-only inventory
             refresh=refresh_requested,
         )
         # Surface which engines have FlexEdge state (creds and/or SSH
@@ -363,18 +366,18 @@ def cluster_detail(engine_name):
     """Render a single cluster's full detail page.
 
     Cached read-through ([shared/smc_cache.py](shared/smc_cache.py),
-    section ``engines.detail``, TTL 24 h per the operator's TTL rule —
-    this is read-only inventory FlexEdge doesn't mutate). The ``?refresh=1``
-    query param drives the in-page Refresh-from-SMC button. Cache key is
-    ``(domain_id, engine_name)`` so two Domains pointing at the same SMC
-    don't share entries.
+    section ``engines.detail``, **Loose refresh** (24 h default) per
+    the operator's TTL rule — this is read-only inventory FlexEdge
+    doesn't mutate. The ``?refresh=1`` query param drives the in-page
+    Refresh-from-SMC button. Cache key is ``(domain_id, engine_name)``
+    so two Domains pointing at the same SMC don't share entries.
 
     All work — SMC fetch, DB credential lookup, template render — is wrapped
     in a single try/except. Any exception bubbles up to a friendly
     ``error.html`` page instead of Flask's bare 500 default, *and* gets
     logged with stack trace so we can diagnose without operator screenshots.
     """
-    from shared.smc_cache import cache_get_or_fetch
+    from shared.smc_cache import cache_get_or_fetch, get_loose_ttl
 
     try:
         cfg = _user_cfg()
@@ -385,7 +388,7 @@ def cluster_detail(engine_name):
             section="engines.detail",
             key_parts=(domain_id, engine_name),
             fetcher=lambda: engine_inquiry.cluster_detail(cfg, engine_name),
-            ttl=86400,                          # 24 h — read-only inventory
+            ttl=get_loose_ttl(),               # Loose refresh — read-only inventory
             refresh=(request.args.get("refresh") == "1"),
         )
 
@@ -512,7 +515,9 @@ def tools_scan():
     inventory_cache_meta = None
     if not scan_running and not scan_report:
         try:
-            from shared.smc_cache import cache_get_or_fetch, invalidate
+            from shared.smc_cache import (
+                cache_get_or_fetch, invalidate, get_loose_ttl,
+            )
             cfg = _user_cfg()
             domain = _current_domain()
             domain_id = domain.id if domain else 0
@@ -527,7 +532,7 @@ def tools_scan():
                 section="engines.list",
                 key_parts=(domain_id,),
                 fetcher=lambda: engine_inquiry.list_clusters(cfg),
-                ttl=86400,                  # 24 h — read-only inventory (Q1.B)
+                ttl=get_loose_ttl(),        # Loose refresh — read-only inventory
                 refresh=refresh_requested,
             )
             clusters_summary = cv.data

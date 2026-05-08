@@ -61,6 +61,119 @@ MAX_TTL     = 86400         # 24 hours (cap; callers asking for more are clamped
 MAX_ENTRIES = 1024          # per section
 
 
+# ── Named TTL levels (operator-facing labels) ────────────────────────────
+#
+# Two cache "speeds" the codebase picks at every call site. Naming is
+# operator-facing: when discussing caching with Simone, talk about
+# "Loose" vs "Quick" — not raw seconds.
+#
+#   LOOSE_REFRESH_TTL  ("Loose refresh", 24 h default)
+#       For inventory data FlexEdge does NOT mutate (engine lists,
+#       cluster details, policy lists, TLS settings on engines, scope
+#       discovery results). The push runner auto-invalidates on writes
+#       anyway, and the drift detector hook (Q11, planned) will drop
+#       sections when out-of-band changes are detected — so even 24h
+#       is rarely actually stale.
+#
+#   QUICK_REFRESH_TTL  ("Quick refresh", 1 h default)
+#       For data FlexEdge DOES mutate through the queue (host /
+#       network / service / group / fqdn elements, policy rules,
+#       reservation Hosts). Short enough that operator edits feel
+#       current even on the unlikely path where queue-runner
+#       invalidation didn't fire.
+#
+# Both are operator-overridable through `platform_settings` keys
+# `cache_ttl_loose_seconds` and `cache_ttl_quick_seconds`. The admin
+# page at `/admin/cache-settings` exposes the form. Read once per
+# process and memoised — call `reload_ttl_settings()` after a change
+# to pick up the new values without a process restart.
+#
+# **TTL changes only affect newly-CREATED sections** (per the
+# `_get_section_cache` semantics: TTL is set-and-stuck at section
+# creation). Sections created before a setting change keep their
+# original TTL until the process is restarted. The admin page
+# documents this.
+
+LOOSE_REFRESH_TTL = 24 * 3600   # 24 hours
+QUICK_REFRESH_TTL = 1 * 3600    # 1 hour
+
+# Memoised overrides — populated lazily on first access, cleared by
+# `reload_ttl_settings()` after the operator saves a new value.
+_loose_ttl_override: int | None = None
+_quick_ttl_override: int | None = None
+_overrides_loaded = False
+_overrides_lock = threading.Lock()
+
+
+def _read_platform_setting_int(key: str) -> int | None:
+    """Read an integer from `platform_settings`. Returns None on any
+    failure (DB not ready, row missing, value not an int) — caller
+    falls back to the hard-coded default."""
+    try:
+        from webapp.models import PlatformSetting
+        row = PlatformSetting.query.filter_by(key=key).first()
+        if row and row.value:
+            return int(row.value)
+    except Exception:
+        pass
+    return None
+
+
+def _ensure_overrides_loaded():
+    global _loose_ttl_override, _quick_ttl_override, _overrides_loaded
+    if _overrides_loaded:
+        return
+    with _overrides_lock:
+        if _overrides_loaded:
+            return
+        _loose_ttl_override = _read_platform_setting_int(
+            "cache_ttl_loose_seconds")
+        _quick_ttl_override = _read_platform_setting_int(
+            "cache_ttl_quick_seconds")
+        _overrides_loaded = True
+
+
+def _clamp_ttl(seconds: int) -> int:
+    """Clamp a TTL into [60, MAX_TTL]. Anything below 60 s is treated
+    as a typo / config bug and bumped up; anything above 24 h hits the
+    hard cap."""
+    return max(60, min(int(seconds), MAX_TTL))
+
+
+def get_loose_ttl() -> int:
+    """Effective Loose-refresh TTL, in seconds.
+
+    Reads `platform_settings.cache_ttl_loose_seconds` once per process
+    (cached). Falls back to ``LOOSE_REFRESH_TTL`` (24 h) when the
+    setting is absent or the DB isn't available."""
+    _ensure_overrides_loaded()
+    base = _loose_ttl_override if _loose_ttl_override is not None else LOOSE_REFRESH_TTL
+    return _clamp_ttl(base)
+
+
+def get_quick_ttl() -> int:
+    """Effective Quick-refresh TTL, in seconds.
+
+    Reads `platform_settings.cache_ttl_quick_seconds` once per process
+    (cached). Falls back to ``QUICK_REFRESH_TTL`` (1 h) when the
+    setting is absent or the DB isn't available."""
+    _ensure_overrides_loaded()
+    base = _quick_ttl_override if _quick_ttl_override is not None else QUICK_REFRESH_TTL
+    return _clamp_ttl(base)
+
+
+def reload_ttl_settings():
+    """Re-read the TTL overrides from `platform_settings` on the next
+    `get_loose_ttl()` / `get_quick_ttl()` call. Existing cache sections
+    keep their original TTLs (set-and-stuck per `_get_section_cache`);
+    a process restart is needed for full effect on long-lived sections.
+    Safe to call from a request handler after the operator saves a
+    new value on `/admin/cache-settings`."""
+    global _overrides_loaded
+    with _overrides_lock:
+        _overrides_loaded = False
+
+
 # ── Result wrapper ───────────────────────────────────────────────────────
 
 @dataclass
