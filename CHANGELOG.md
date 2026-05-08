@@ -6,6 +6,44 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Caching rollout phase 1: engines.detail + tools_scan inventory share (2026-05-08)
+
+TODO-item-2 phase 1 — first slice of the engine-objects caching plan.
+Operator-confirmed picks (TODO.md Round 2): TTL rule = "by FlexEdge
+write-or-not" (B); Refresh button placement = per-page; Refresh
+scope = family-wide.
+
+- **`engines.detail` section** — `/engines/clusters/<engine>` now goes
+  through `cache_get_or_fetch` ([webapp/engines_manager.py:cluster_detail](webapp/engines_manager.py)).
+  Cache key `(domain_id, engine_name)`, TTL 24 h (read-only inventory
+  per Q1.B). Refresh button + freshness footer added to
+  [webapp/templates/engines/cluster_detail.html](webapp/templates/engines/cluster_detail.html).
+- **`engines.list` shared by Tools/Scan** — the GET handler at
+  `/engines/tools/scan` previously opened its own SMC session and
+  re-fetched the cluster list. Now reads from the same `engines.list`
+  cache as `/engines/clusters` (key `(domain_id,)`, TTL 24 h). Refresh
+  button added to the Tools/Scan picker. Eliminates a redundant SMC
+  fetch when the operator navigates Clusters → Tools/Scan.
+- **Family-wide refresh** — `engines.list?refresh=1` (from either
+  Clusters or Tools/Scan) now also invalidates the entire
+  `engines.detail` section. Operator's mental model is "give me
+  current data on the whole engines feature" — no surprise stale
+  per-engine page after a top-level refresh.
+- **Forget extended** — `cluster_forget` now drops both `engines.list`
+  AND the engine's `engines.detail` entry, since Forget is the
+  "I'm done with this engine" signal.
+
+Scoping note: the TLS deploy form's "engine cascade" calls a
+different function (`smc_tls_client.list_engines` — multi-stage
+discovery, dict shape) than `engine_inquiry.list_clusters`. It will
+get its own `tls.engines` section in the TLS rollout step (step 6
+in TODO.md), not consolidated with `engines.list`.
+
+Remaining caching work (separate commits): `smc.explorer.<type>`,
+`smc.policy.<name>`, `dhcp.scopes.<engine>`, `dhcp.host.<name>`,
+TLS sections; plus background warming on login (Q6) and drift-
+detector → cache invalidation hook (Q11).
+
 ### Fix: BuildError on Tools/Scan + 5 other broken `dhcp.credentials` refs (2026-05-08)
 
 The credentials route is `dhcp.credentials_list`, not `dhcp.credentials`.

@@ -18,7 +18,33 @@
                 · {{ detail.nodes|length }} node(s)
             </div>
         </div>
-        <div class="d-flex gap-2">
+        <div class="d-flex gap-2 align-items-center">
+            {% if cache_meta %}
+            {# Cache-freshness badge + Refresh button — same pattern as
+               clusters.html. ?refresh=1 bypasses the cache, hits SMC
+               live, and repopulates. #}
+            <div class="d-flex align-items-center gap-2 small me-2">
+              {% if cache_meta.served_from_cache %}
+                {% set mins = (cache_meta.age_minutes)|round(0)|int %}
+                <span class="text-muted"
+                      title="Served from process cache. Click Refresh to force a live SMC fetch.">
+                  <i class="bi bi-database-check"></i>
+                  cached · {{ mins if mins else '<1' }} min ago
+                </span>
+              {% else %}
+                <span class="text-success"
+                      title="Just fetched from SMC; cached for the next 24 hours.">
+                  <i class="bi bi-cloud-download"></i>
+                  fresh from SMC
+                </span>
+              {% endif %}
+              <a href="{{ url_for('engines.cluster_detail', engine_name=detail.name, refresh=1) }}"
+                 class="btn btn-sm btn-outline-secondary"
+                 title="Force a live SMC fetch and repopulate the cache for this cluster.">
+                <i class="bi bi-arrow-clockwise"></i> Refresh from SMC
+              </a>
+            </div>
+            {% endif %}
             <a href="{{ url_for('engines.sginfo_history', engine=detail.name) }}"
                class="btn btn-sm btn-outline-info"
                title="Past sginfo collections for this engine">

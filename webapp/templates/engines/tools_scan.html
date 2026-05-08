@@ -13,9 +13,38 @@
 
 <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
   <h2 class="mb-0"><i class="bi bi-radar"></i> Network scan</h2>
-  <a href="{{ url_for('scan_history.history') }}" class="btn btn-sm btn-outline-secondary">
-    <i class="bi bi-clock-history"></i> Scan history
-  </a>
+  <div class="d-flex align-items-center gap-2">
+    {% if inventory_cache_meta %}
+    {# Cluster inventory shares the engines.list cache. Refresh hits SMC
+       live and repopulates that section (which also benefits the
+       /engines/clusters page). Per Q5 family-wide, refreshing here
+       also drops every cached cluster_detail entry for this Domain. #}
+    <div class="d-flex align-items-center gap-2 small">
+      {% if inventory_cache_meta.served_from_cache %}
+        {% set mins = (inventory_cache_meta.age_minutes)|round(0)|int %}
+        <span class="text-muted"
+              title="Cluster inventory served from process cache. Click Refresh to force a live SMC fetch.">
+          <i class="bi bi-database-check"></i>
+          cached · {{ mins if mins else '<1' }} min ago
+        </span>
+      {% else %}
+        <span class="text-success"
+              title="Just fetched from SMC; cached for the next 24 hours.">
+          <i class="bi bi-cloud-download"></i>
+          fresh from SMC
+        </span>
+      {% endif %}
+      <a href="{{ url_for('engines.tools_scan', refresh=1) }}"
+         class="btn btn-sm btn-outline-secondary"
+         title="Force a live SMC fetch and repopulate the engines.list cache.">
+        <i class="bi bi-arrow-clockwise"></i> Refresh from SMC
+      </a>
+    </div>
+    {% endif %}
+    <a href="{{ url_for('scan_history.history') }}" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-clock-history"></i> Scan history
+    </a>
+  </div>
 </div>
 
 {% with messages = get_flashed_messages(with_categories=true) %}

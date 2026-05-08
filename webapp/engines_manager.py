@@ -157,20 +157,30 @@ def clusters():
     the "Refresh from SMC" button on the page).
     """
     import hashlib
-    from shared.smc_cache import cache_get_or_fetch
+    from shared.smc_cache import cache_get_or_fetch, invalidate
     from webapp.models import DhcpEngineSshAccess
 
     try:
         cfg = _user_cfg()
         domain_obj = _current_domain()
         domain_id = domain_obj.id if domain_obj else 0
+        refresh_requested = (request.args.get("refresh") == "1")
+
+        # Q5 family-wide refresh: refreshing the engines list also clears
+        # every cached cluster_detail entry for THIS Domain. Operator's
+        # mental model is "give me current data on the whole engines
+        # feature" — narrow per-section refresh would force them to also
+        # click Refresh on every cluster_detail page they later visit.
+        if refresh_requested:
+            invalidate("engines.detail")
+
         cv = cache_get_or_fetch(
             section="engines.list",
             # Phase B.2: domain_id alone identifies (server, smc-domain, key)
             # — replaces the legacy (tenant_id, domain_name, api_key_hash) tuple.
             key_parts=(domain_id,),
             fetcher=lambda: engine_inquiry.list_clusters(cfg),
-            refresh=(request.args.get("refresh") == "1"),
+            refresh=refresh_requested,
         )
         # Surface which engines have FlexEdge state (creds and/or SSH
         # rule) so the template can show a "Forget" button only when
@@ -308,7 +318,11 @@ def cluster_forget(engine_name):
     db.session.commit()
 
     # Step 3: cache invalidation so the next page load is fresh.
+    # Drop both the engines list AND this engine's detail entry — the
+    # Forget button is the canonical "I'm done with this engine" signal,
+    # so any cached deeper view of it is stale.
     invalidate("engines.list")
+    invalidate("engines.detail", (domain_obj.id, engine_name))
 
     detail = (f"creds_deleted={cred_count} "
               f"access_deleted={'yes' if access else 'no'} "
@@ -348,23 +362,41 @@ def _log_activity_engines(category, action, status, target="", detail=""):
 def cluster_detail(engine_name):
     """Render a single cluster's full detail page.
 
+    Cached read-through ([shared/smc_cache.py](shared/smc_cache.py),
+    section ``engines.detail``, TTL 24 h per the operator's TTL rule —
+    this is read-only inventory FlexEdge doesn't mutate). The ``?refresh=1``
+    query param drives the in-page Refresh-from-SMC button. Cache key is
+    ``(domain_id, engine_name)`` so two Domains pointing at the same SMC
+    don't share entries.
+
     All work — SMC fetch, DB credential lookup, template render — is wrapped
     in a single try/except. Any exception bubbles up to a friendly
     ``error.html`` page instead of Flask's bare 500 default, *and* gets
     logged with stack trace so we can diagnose without operator screenshots.
     """
+    from shared.smc_cache import cache_get_or_fetch
+
     try:
         cfg = _user_cfg()
-        detail = engine_inquiry.cluster_detail(cfg, engine_name)
+        domain_obj = _current_domain()
+        domain_id = domain_obj.id if domain_obj else 0
+
+        cv = cache_get_or_fetch(
+            section="engines.detail",
+            key_parts=(domain_id, engine_name),
+            fetcher=lambda: engine_inquiry.cluster_detail(cfg, engine_name),
+            ttl=86400,                          # 24 h — read-only inventory
+            refresh=(request.args.get("refresh") == "1"),
+        )
 
         creds_by_node = {}
-        domain_obj = _current_domain()
         if domain_obj:
             creds_by_node = _credentials_for_engine(domain_obj.id, engine_name)
 
         return render_template(
             "engines/cluster_detail.html",
-            detail=detail,
+            detail=cv.data,
+            cache_meta=cv,
             creds_by_node=creds_by_node,
         )
     except Exception as exc:
@@ -477,13 +509,31 @@ def tools_scan():
     inventory = []
     inventory_error = None
     inventory_total = 0  # how many SMC clusters exist before the gate filtered
+    inventory_cache_meta = None
     if not scan_running and not scan_report:
         try:
+            from shared.smc_cache import cache_get_or_fetch, invalidate
             cfg = _user_cfg()
-            with __import__("smc_client").smc_session(cfg):
-                clusters_summary = engine_inquiry.list_clusters(cfg)
-            from webapp.engine_credentials import valid_engines_for_domain
             domain = _current_domain()
+            domain_id = domain.id if domain else 0
+
+            # Q3 + Q5: share the `engines.list` cache section with
+            # /engines/clusters (same data, same key shape) so fetches
+            # are deduped. ?refresh=1 here also fans out per Q5 family-wide.
+            refresh_requested = (request.args.get("refresh") == "1")
+            if refresh_requested:
+                invalidate("engines.detail")
+            cv = cache_get_or_fetch(
+                section="engines.list",
+                key_parts=(domain_id,),
+                fetcher=lambda: engine_inquiry.list_clusters(cfg),
+                ttl=86400,                  # 24 h — read-only inventory (Q1.B)
+                refresh=refresh_requested,
+            )
+            clusters_summary = cv.data
+            inventory_cache_meta = cv
+
+            from webapp.engine_credentials import valid_engines_for_domain
             valid = valid_engines_for_domain(domain.id) if domain else set()
             inventory_total = len(clusters_summary)
             inventory = [
@@ -517,6 +567,7 @@ def tools_scan():
         inventory_error=inventory_error,
         inventory_total=inventory_total,
         inventory_hidden=max(0, inventory_total - len(inventory)),
+        inventory_cache_meta=inventory_cache_meta,
         default_ports=",".join(str(p) for p in DEFAULT_PORTS),
     )
 
