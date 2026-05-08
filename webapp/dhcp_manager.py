@@ -2037,11 +2037,13 @@ def credentials_rule_install():
             level="danger", http=500,
         )
 
+    # Capture id up-front: when bypass_queue is enabled, try_auto_push
+    # deletes the change row on success and `change` becomes detached.
+    change_id = change.id
+
     outcome = try_auto_push(change)
 
     if outcome == "pushed":
-        # Refresh from DB to get the policy/rule names the handler set.
-        db.session.refresh(change)
         access = (DhcpEngineSshAccess.query
                   .filter_by(domain_id=domain_id, engine_name=engine_name)
                   .first())
@@ -2055,24 +2057,25 @@ def credentials_rule_install():
         return _rule_action_response(
             True,
             f"Installed rule {rule_name} in policy {policy_name} "
-            f"and uploaded to engine (queue change #{change.id}).",
+            f"and uploaded to engine (queue change #{change_id}).",
         )
 
     if outcome == "push_failed":
+        # Safe to refresh: bypass cleanup only fires on success.
         db.session.refresh(change)
         err = change.push_error_text or "Unknown error"
         _log_activity("ssh", "install_rule", "failed", target_label, err)
         return _rule_action_response(
-            False, f"Install rule failed (queue change #{change.id}): {err}",
+            False, f"Install rule failed (queue change #{change_id}): {err}",
             level="danger", http=500,
         )
 
     # outcome == 'queued' — non-admin path.
     _log_activity("ssh", "install_rule.queued", "ok", target_label,
-                  f"change_id={change.id} awaiting admin push")
+                  f"change_id={change_id} awaiting admin push")
     return _rule_action_response(
         True,
-        f"Rule install queued (change #{change.id}). A Domain Admin "
+        f"Rule install queued (change #{change_id}). A Domain Admin "
         f"or higher must push it from the Change Queue.",
     )
 
@@ -2146,36 +2149,41 @@ def credentials_policy_install():
             level="danger", http=500,
         )
 
+    # Capture id up-front: when bypass_queue is enabled, try_auto_push
+    # deletes the change row on success and `change` becomes detached.
+    change_id = change.id
+
     outcome = try_auto_push(change)
 
     if outcome == "pushed":
         _bump_access_refreshed(tenant_id, engine_name, domain_id=access.domain_id)
         db.session.commit()
         _log_activity("ssh", "policy_install", "ok", target_label,
-                      f"via_queue=True change_id={change.id}")
+                      f"via_queue=True change_id={change_id}")
         return _rule_action_response(
             True,
             f"Policy {access.policy_name} pushed to engine {engine_name} "
-            f"(queue change #{change.id}). Rules on the engine now match SMC.",
+            f"(queue change #{change_id}). Rules on the engine now match SMC.",
         )
 
     if outcome == "push_failed":
+        # Safe to refresh: bypass cleanup only fires on success.
         db.session.refresh(change)
         err = change.push_error_text or "Unknown error"
         _log_activity("ssh", "policy_install", "failed", target_label, err)
         return _rule_action_response(
             False,
-            f"Policy install failed (queue change #{change.id}): {err}. "
+            f"Policy install failed (queue change #{change_id}): {err}. "
             f"The engine is still running its previous policy.",
             level="danger", http=500,
         )
 
     # Defensive — admin-only route normally, so 'queued' is unexpected.
     _log_activity("ssh", "policy_install.queued", "ok", target_label,
-                  f"change_id={change.id} awaiting admin push")
+                  f"change_id={change_id} awaiting admin push")
     return _rule_action_response(
         True,
-        f"Policy install queued (change #{change.id}). "
+        f"Policy install queued (change #{change_id}). "
         f"Push from the Change Queue.",
     )
 
@@ -2414,6 +2422,12 @@ def _do_rule_teardown(access: DhcpEngineSshAccess) -> None:
         flash(f"Could not queue rule removal: {exc}", "danger")
         return
 
+    # Capture id + rule_name up-front: when bypass_queue is enabled,
+    # try_auto_push deletes the change row on success and `change`
+    # becomes detached; deleting `access` below also detaches it.
+    change_id = change.id
+    rule_name_for_msg = access.rule_name
+
     outcome = try_auto_push(change)
 
     if outcome == "pushed":
@@ -2421,24 +2435,25 @@ def _do_rule_teardown(access: DhcpEngineSshAccess) -> None:
         db.session.delete(access)
         db.session.commit()
         _log_activity("ssh", "remove_rule", "ok", target,
-                      f"via_queue=True change_id={change.id}")
-        flash(f"Removed rule {access.rule_name} and uploaded policy "
-              f"(queue change #{change.id}).", "success")
+                      f"via_queue=True change_id={change_id}")
+        flash(f"Removed rule {rule_name_for_msg} and uploaded policy "
+              f"(queue change #{change_id}).", "success")
         return
 
     if outcome == "push_failed":
+        # Safe to refresh: bypass cleanup only fires on success.
         db.session.refresh(change)
         err = change.push_error_text or "Unknown error"
         _log_activity("ssh", "remove_rule", "failed", target, err)
-        flash(f"Rule removal failed (queue change #{change.id}): {err}. "
+        flash(f"Rule removal failed (queue change #{change_id}): {err}. "
               f"The local SSH-access record is kept so retry can re-attempt.",
               "danger")
         return
 
     # outcome == 'queued' — defensive (this path is admin-only normally).
     _log_activity("ssh", "remove_rule.queued", "ok", target,
-                  f"change_id={change.id} awaiting admin push")
-    flash(f"Rule removal queued (change #{change.id}). "
+                  f"change_id={change_id} awaiting admin push")
+    flash(f"Rule removal queued (change #{change_id}). "
           f"Push from the Change Queue to complete.", "info")
 
 
