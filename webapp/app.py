@@ -885,6 +885,137 @@ def policy_rules(policy_name):
 
 # ── JSON API (read-only) ────────────────────────────────────────────────
 
+@app.route("/api/quick-search")
+@profile_required
+def api_quick_search():
+    """Top-center search bar feed.
+
+    Two sources, ranked features-first:
+
+    1. **Menu features** — every sidebar destination (label + URL),
+       filtered by case-insensitive substring on the visible label.
+       Fast, always-on, no SMC traffic.
+
+    2. **Cached SMC elements** — best-effort walk of the
+       ``shared.smc_cache`` section caches. We inspect each cached
+       value and pick out items with a `name` key (the standard SMC
+       element shape). For each match we synthesise a navigable href:
+       SMC explorer types deep-link to ``/browse/<type>``; engines and
+       policies deep-link to their dedicated pages. Items that we
+       can't translate to a real FEA URL are still returned with the
+       raw href so power users can copy it.
+
+    Returns at most 30 results to keep the dropdown readable.
+    Substring match is case-insensitive; queries shorter than 2 chars
+    return no results.
+    """
+    q = (request.args.get("q") or "").strip().lower()
+    if len(q) < 2:
+        return jsonify(results=[])
+
+    out: list[dict] = []
+
+    # 1. Menu features. Built from a static map so the list is the
+    # canonical source of truth — anyone adding a new menu entry must
+    # add it here too. Order = sidebar order so the dropdown is
+    # predictable.
+    features = [
+        ("Engines / Clusters",        "/engines/clusters",          "bi-bricks"),
+        ("Engines / Credentials",     "/dhcp/credentials",          "bi-key"),
+        ("Engines / Tools",           "/engines/tools",             "bi-tools"),
+        ("Engines / Scan history",    "/engines/scans",             "bi-clock-history"),
+        ("Engines / Scan time graph", "/engines/scans/graph",       "bi-graph-up"),
+        ("DHCP / Dashboard",          "/dhcp/",                     "bi-router"),
+        ("DHCP / Scopes",             "/dhcp/scopes",               "bi-diagram-3"),
+        ("DHCP / Activity",           "/dhcp/activity",             "bi-list-ul"),
+        ("DHCP / History",            "/dhcp/history",              "bi-clock"),
+        ("TLS / Dashboard",           "/tls/",                      "bi-shield-lock"),
+        ("TLS / Certificates",        "/tls/certificates",          "bi-file-earmark-lock"),
+        ("TLS / Deploy",              "/tls/deploy",                "bi-cloud-upload"),
+        ("TLS / Renewal hook",        "/tls/hook",                  "bi-arrow-repeat"),
+        ("TLS / History",             "/tls/history",               "bi-clock"),
+        ("Migration / Projects",      "/migration/",                "bi-arrow-left-right"),
+        ("Optimizer",                 "/optimize",                  "bi-lightning-charge"),
+        ("Optimizer / Submissions",   "/optimize/submissions",      "bi-inbox"),
+        ("Change Queue",              "/changes/",                  "bi-list-check"),
+        ("Change Queue / Drift",      "/changes/drift",             "bi-exclamation-triangle"),
+        ("Logs",                      "/logs",                      "bi-journal-text"),
+        ("Admin / Dashboard",         "/admin/",                    "bi-shield-check"),
+        ("Admin / Tenants",           "/admin/tenants",             "bi-building"),
+        ("Admin / Domains",           "/admin/domains",             "bi-diagram-3"),
+        ("Admin / API keys",          "/admin/api-keys",            "bi-key-fill"),
+        ("Admin / Users",             "/admin/users",               "bi-people"),
+        ("Admin / Backup",            "/admin/backup",              "bi-archive"),
+        ("Admin / Log settings",      "/admin/log-settings",        "bi-funnel"),
+    ]
+    for label, href, icon in features:
+        if q in label.lower():
+            out.append({
+                "label": label, "href": href, "icon": icon,
+                "type": "feature", "source": "menu",
+            })
+
+    # 2. Cached SMC elements — best-effort walk. The cache is
+    # process-local so we hit no network. Each section's cached
+    # values are typed differently; we look for `name`-bearing items.
+    # Translation rules:
+    #   smc.explorer.<type_key> → /browse/<type_key>
+    #   engines.list           → /engines/clusters
+    #   smc.policy.<name>      → /policy/<name>
+    try:
+        from shared.smc_cache import _section_caches
+        # Iterate snapshot — concurrent eviction is fine, we just skip.
+        for section, tcache in list(_section_caches.items()):
+            try:
+                for _, val in list(tcache.items()):
+                    data = getattr(val, "data", val)
+                    items = data if isinstance(data, list) else []
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        name = item.get("name") or item.get("display_name") or ""
+                        if not name or q not in str(name).lower():
+                            continue
+                        href = ""
+                        kind = "smc"
+                        if section.startswith("smc.explorer."):
+                            type_key = section.split(".", 2)[-1]
+                            href = f"/browse/{type_key}"
+                            kind = type_key
+                        elif section == "engines.list":
+                            href = url_for("engines.clusters")
+                            kind = "engine"
+                        out.append({
+                            "label": name,
+                            "href": href,
+                            "icon": "bi-box",
+                            "type": kind,
+                            "source": "cache",
+                        })
+                        if len(out) >= 60:
+                            break
+                    if len(out) >= 60:
+                        break
+            except Exception:
+                continue
+            if len(out) >= 60:
+                break
+    except Exception as exc:
+        log.debug("quick-search cache walk failed: %s", exc)
+
+    # De-dup by (label, href) — caches and features can overlap.
+    seen = set()
+    unique = []
+    for r in out:
+        k = (r["label"], r["href"])
+        if k in seen:
+            continue
+        seen.add(k)
+        unique.append(r)
+
+    return jsonify(results=unique[:30])
+
+
 @app.route("/api/elements/<type_key>")
 @profile_required
 def api_elements(type_key):
