@@ -182,6 +182,7 @@ REACHABLE=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 : > "$REACHABLE"
 
 # Phase 1 — ICMP
+printf 'EXEC === Phase 1 (ICMP) starting: %s targets ===\n' "$#"
 n=0
 for ip in "$@"; do
     (
@@ -206,6 +207,13 @@ for ip in "$@"; do
 done
 wait
 
+# Quick post-Phase-1 summary so the watcher's 10-line log_tail
+# always shows operators where the script is, even on big scans
+# where Phase 3 takes minutes before producing visible output.
+P1_OK=$(busybox grep -c ' ICMP_OK$' "$TMP" 2>/dev/null || echo 0)
+P1_FAIL=$(busybox grep -c ' ICMP_FAIL$' "$TMP" 2>/dev/null || echo 0)
+printf 'EXEC === Phase 1 done: %s OK / %s FAIL ===\n' "$P1_OK" "$P1_FAIL"
+
 # Phase 2 — arping fallback for ICMP_FAIL
 # CRITICAL: do NOT use `set -- $line` here. That would clobber the
 # top-level "$@" (the original target IP list), and Phase 3 below
@@ -216,6 +224,7 @@ wait
 # this bug 2026-05-08 — operator's real-world scans were probing
 # < 1% of intended targets because most subnets have many
 # ICMP-failing hosts. Read directly into named vars instead.
+printf 'EXEC === Phase 2 (arping fallback) starting ===\n'
 while read -r ip state; do
     if [ "$state" = "ICMP_FAIL" ]; then
         DEV=$(busybox ip route get "$ip" 2>/dev/null | busybox awk '{for(i=1;i<NF;i++) if($i=="dev") print $(i+1); exit}')
@@ -257,6 +266,8 @@ done < "$TMP"
 # rate on real-world ports is acceptable; if it becomes a problem
 # we'd need a Python-side paramiko TCP probe instead of nc.
 if [ -n "$PORTS" ]; then
+    NPORTS=$(printf '%s' "$PORTS" | busybox tr ',' '\n' | busybox wc -l)
+    printf 'EXEC === Phase 3 (TCP port probe) starting: %s targets x %s ports ===\n' "$#" "$NPORTS"
     for ip in "$@"; do
         for port in $(printf '%s' "$PORTS" | busybox tr ',' ' '); do
             (
@@ -272,11 +283,16 @@ if [ -n "$PORTS" ]; then
         done
     done
     wait
+    printf 'EXEC === Phase 3 done ===\n'
+else
+    printf 'EXEC === Phase 3 skipped (empty port list) ===\n'
 fi
 
 # Phase 4 — RDNS only for L2-visible hosts (reverse-DNS on dead IPs
 # is noise; we don't want hostname-result rows for silent targets).
 if [ -s "$REACHABLE" ]; then
+    NREACH=$(busybox wc -l < "$REACHABLE")
+    printf 'EXEC === Phase 4 (RDNS) starting: %s reachable hosts ===\n' "$NREACH"
     while IFS= read -r ip; do
         [ -z "$ip" ] && continue
         (
@@ -290,9 +306,11 @@ if [ -s "$REACHABLE" ]; then
         if [ "$n" -ge "$BATCH" ]; then wait; n=0; fi
     done < "$REACHABLE"
     wait
+    printf 'EXEC === Phase 4 done ===\n'
 fi
 
 busybox rm -f "$TMP" "$REACHABLE"
+printf 'EXEC === Scan script finished ===\n'
 """
 
 
@@ -346,7 +364,17 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
     error_text = ""
 
     try:
-        _, stdout, stderr = client.exec_command(cmd, timeout=exec_timeout_s)
+        # get_pty=True allocates a pseudo-tty for the remote shell so
+        # stdout is line-buffered (not fully buffered like a pipe),
+        # which keeps the watcher's live log responsive on big scans —
+        # without a PTY, parallel subshells can hold lines in libc
+        # stdio buffers until they exit, making early-Phase-1 output
+        # appear in bursts and Phase 3 output appear chunky. The PTY
+        # also implicitly merges stderr into stdout so script-level
+        # errors (e.g. a bad shell construct) become visible in the
+        # parser instead of being swallowed until exit.
+        _, stdout, stderr = client.exec_command(
+            cmd, timeout=exec_timeout_s, get_pty=True)
         for raw in iter(stdout.readline, ''):
             parts = raw.strip().split()
             if not parts:
