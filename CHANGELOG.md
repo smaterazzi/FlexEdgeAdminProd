@@ -6,6 +6,142 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-08
 
+### Engines → Tools → Scan: per-scan debug log file (2026-05-09)
+
+Operator wanted ground-truth verification when the in-page
+watcher feels stuck or rolls over too fast — "i want a verbose
+logging somewhere that i can verify". Now every scan writes
+EVERY raw line received from the engine over SSH to a per-scan
+file the operator can `tail -f` from a separate shell.
+
+**Path discovery** ([webapp/engine_scan.py](webapp/engine_scan.py)
+`scan_log_dir()` / `scan_log_path()`): tries
+`$FEA_SCAN_LOG_DIR` first, then `/config/logs` (the standard
+mounted volume in Docker deployments), falls back to
+`/tmp/flexedge-scan-logs`. Directory is auto-created.
+
+**Path surfaced three ways**:
+
+1. **Watcher card** in
+   [webapp/templates/engines/tools_scan.html](webapp/templates/engines/tools_scan.html)
+   — small grey footer below the dark log block:
+
+   > Full debug log (every line received over SSH, including
+   > stderr) is being written to
+   > `/config/logs/engine-scan-abc123.log` — `tail -f` from a
+   > separate shell to verify progress when the watcher above
+   > feels stuck.
+
+2. **Python `log.info`** at scan start
+   ([webapp/engine_scan_jobs.py](webapp/engine_scan_jobs.py)):
+   `engine_scan_jobs: scan_id=abc123 debug_log=/config/logs/engine-scan-abc123.log`
+   — visible in the gunicorn / `make dev` console output.
+
+3. **`/scan/status` JSON** carries `debug_log_path` as an extra,
+   so the watcher's poll keeps the path even if the page reloads.
+
+**File contents** — written line-buffered so `tail -f` is
+responsive:
+
+```log
+# FlexEdgeAdmin engine-scan debug log
+# started_at  : 2026-05-09T08:42:13+00:00
+# target      : 172.21.20.99:22
+# ip_list_size: 254
+# ports_count : 25
+# verbose     : True
+# command     : sh -c '...' _ 32 1 1 2 2 20,21,22,... 1 172.21.20.1 ...
+# ──────────────────────────────────────────────
+EXEC === Phase 1 (ICMP) starting: 254 targets ===
+EXEC busybox ping -c 1 -W 1 -q 172.21.20.1
+172.21.20.1 ICMP_OK
+… every line verbatim …
+# ──────────────────────────────────────────────
+# finished_at: 2026-05-09T08:48:51+00:00
+# error      : (none)
+# counters   : {'icmp_replies': 50, 'arp_replies': 2, ...}
+# host_count : 52
+```
+
+The file captures **everything** the parser sees, before any
+tag-based routing — including stderr leaking through the PTY
+(missing applets, shell syntax errors), unknown lines, and the
+phase-boundary markers in their raw `EXEC === Phase X ===`
+form. So when the watcher's 10-line deque saturates and the
+operator can't tell which phase is running, the file has the
+full ground truth.
+
+Plumbed through:
+[`engine_scan._run_scan`](webapp/engine_scan.py)`(...,
+debug_log_path=...)` → file open with `buffering=1` (line-buffered)
+→ each `for raw in iter(stdout.readline, '')` writes raw line
+to disk before parsing → `finally` closes with footer summary
+even on exceptions. Best-effort: file open failure logs a
+warning and the scan runs anyway without the file.
+
+### Engines → Tools → Scan: phase-boundary markers + PTY mode for live visibility (2026-05-08)
+
+After the `$@`-clobber fix landed, operator reported the watcher
+showed only Phase 1 lines mid-scan ("the debug scan log is not
+showing up… only the following comes: $ busybox ping … / 172.x
+ICMP reply"). Two reinforcing causes:
+
+1. **Watcher's log_tail is a 10-line deque.** On a /24 scan, Phase 1
+   alone emits ~500 events; mid-Phase-1 the deque holds early
+   pings only and the operator sees no clear "what phase am I
+   on?" signal. Phase 3 takes minutes (6,350 probes / 32
+   parallel × 2s timeout = ~6 minutes wall-clock) before its
+   output starts replacing Phase 1 in the deque.
+
+2. **No PTY = full-buffered remote stdout.** Without
+   `get_pty=True`, each parallel subshell's stdout is a pipe
+   (full-buffered by libc, ~4 KB chunks). Subshells emit only
+   1-2 lines before exiting; output sits in the buffer until
+   subshell exit, making early-Phase-1 output appear bursty
+   and Phase 3 output appear chunky.
+
+**Fix 1 — phase-boundary markers** added to
+[webapp/engine_scan.py](webapp/engine_scan.py) `_SCAN_SCRIPT`.
+Always emitted (not gated by VERBOSE) — the watcher renders
+each as `$ === Phase X … ===` in the live log:
+
+```log
+=== Phase 1 (ICMP) starting: 254 targets ===
+=== Phase 1 done: 50 OK / 204 FAIL ===
+=== Phase 2 (arping fallback) starting ===
+=== Phase 3 (TCP port probe) starting: 254 targets x 25 ports ===
+=== Phase 3 done ===
+=== Phase 4 (RDNS) starting: 50 reachable hosts ===
+=== Phase 4 done ===
+=== Scan script finished ===
+```
+
+8 lines for the entire scan, so they survive the 10-line
+deque rollover and operators always see the current phase.
+
+**Fix 2 — PTY mode** for the SSH `exec_command`:
+
+```python
+_, stdout, stderr = client.exec_command(
+    cmd, timeout=exec_timeout_s, get_pty=True)
+```
+
+Allocates a pseudo-tty on the remote side, which:
+
+- Switches stdout from full-buffered (pipe) to line-buffered
+  (tty) — output flushes per line, not per ~4 KB chunk.
+- Implicitly merges stderr into stdout, so future script-level
+  errors (bad shell construct, busybox applet missing) become
+  visible in the watcher log instead of being swallowed until
+  the channel closes.
+
+Together these two changes mean the watcher log now reads as a
+clear narrative on every scan ("Phase 1 starting → Phase 1
+done → Phase 2 starting → Phase 3 starting → some `$ busybox
+nc` lines → Phase 3 done → complete: ICMP=N ARP=N open=N"),
+even on big subnets where the deque otherwise stays
+saturated with Phase 1 events for many seconds.
+
 ### Engines → Tools → Scan: CRITICAL FIX — Phase 2 was clobbering the target list (2026-05-08)
 
 **Root cause of the "scan finds nothing" symptom.** Operator ran

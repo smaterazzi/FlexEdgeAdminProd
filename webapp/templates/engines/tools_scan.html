@@ -89,6 +89,16 @@
          style="height: 12em; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;"
 >{% for line in scan_running.log_tail %}{{ line }}
 {% endfor %}</pre>
+    {% if scan_running.debug_log_path %}
+    <div class="small text-muted mt-2">
+      <i class="bi bi-file-earmark-text"></i>
+      Full debug log (every line received over SSH, including stderr)
+      is being written to
+      <code class="user-select-all">{{ scan_running.debug_log_path }}</code>
+      &mdash; <kbd>tail -f</kbd> from a separate shell to verify
+      progress when the watcher above feels stuck.
+    </div>
+    {% endif %}
   </div>
 </div>
 

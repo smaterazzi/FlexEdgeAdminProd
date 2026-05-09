@@ -33,6 +33,7 @@ BusyBox builds, confirmed on the lab cluster on 2026-05-07.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -320,6 +321,37 @@ printf 'EXEC === Scan script finished ===\n'
 EventCallback = Callable[[dict], None]
 
 
+def scan_log_dir() -> str:
+    """Where per-scan debug log files land.
+
+    Picks (in order): ``$FEA_SCAN_LOG_DIR`` if set, then
+    ``/config/logs`` if it exists or can be created, then
+    ``/tmp/flexedge-scan-logs``. The chosen dir is created with
+    `mkdir -p` semantics so callers don't need a guard. Falls back
+    to /tmp on any permission error.
+    """
+    candidates = [
+        os.environ.get("FEA_SCAN_LOG_DIR"),
+        "/config/logs",
+        "/tmp/flexedge-scan-logs",
+    ]
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except OSError:
+            continue
+    return "/tmp"
+
+
+def scan_log_path(scan_id: str) -> str:
+    """Full path of the per-scan debug log for a given scan_id."""
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", scan_id)[:64] or "anon"
+    return os.path.join(scan_log_dir(), f"engine-scan-{safe}.log")
+
+
 def _run_scan(target: SSHTarget, cred: SSHCredential, *,
               ip_list: list[str], ports: list[int],
               batch_size: int = 32,
@@ -329,6 +361,7 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
               dns_timeout_s: int = 2,
               exec_timeout_s: int = 900,
               verbose: bool = False,
+              debug_log_path: Optional[str] = None,
               on_event: Optional[EventCallback] = None,
               ) -> tuple[dict[str, HostResult], dict, str]:
     """Open SSH, run the scan script, parse stdout line-by-line.
@@ -352,9 +385,41 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
     cmd_parts.extend(ip_list)
     cmd = " ".join(shlex.quote(p) for p in cmd_parts)
 
+    # Per-scan debug log file. Records EVERY raw line we receive
+    # from the engine over SSH, plus a small header with cmd / target
+    # info / verbose flag — independent of the watcher's 10-line
+    # deque, so an operator can `tail -f` it from a separate window
+    # to verify the scan is actually progressing. Best-effort: if
+    # the file can't be opened, we log a warning and continue
+    # without crashing the scan.
+    debug_fh = None
+    if debug_log_path:
+        try:
+            debug_fh = open(debug_log_path, "w", buffering=1)  # line-buffered
+            debug_fh.write(f"# FlexEdgeAdmin engine-scan debug log\n")
+            debug_fh.write(f"# started_at  : {datetime.now(timezone.utc).isoformat()}\n")
+            debug_fh.write(f"# target      : {target.hostname}:{target.port}\n")
+            debug_fh.write(f"# ip_list_size: {len(ip_list)}\n")
+            debug_fh.write(f"# ports_count : {len(ports)}\n")
+            debug_fh.write(f"# verbose     : {verbose}\n")
+            debug_fh.write(f"# command     : {cmd[:500]}{'…' if len(cmd) > 500 else ''}\n")
+            debug_fh.write("# ──────────────────────────────────────────────\n")
+            debug_fh.flush()
+            log.info("engine_scan: debug log %s", debug_log_path)
+        except Exception as exc:
+            log.warning("engine_scan: could not open debug log %s: %s",
+                        debug_log_path, exc)
+            debug_fh = None
+
     try:
         client = ssh_connect(target, cred)
     except Exception as exc:
+        if debug_fh:
+            try:
+                debug_fh.write(f"# ssh_connect_failed: {exc}\n")
+                debug_fh.close()
+            except Exception:
+                pass
         return {}, {}, f"SSH connect failed: {exc}"
 
     results: dict[str, HostResult] = {}
@@ -376,6 +441,18 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
         _, stdout, stderr = client.exec_command(
             cmd, timeout=exec_timeout_s, get_pty=True)
         for raw in iter(stdout.readline, ''):
+            # Tee EVERY raw line to the per-scan debug file BEFORE
+            # any parsing — that way even malformed/unexpected output
+            # (e.g. busybox stderr leaking through the PTY) lands on
+            # disk and the operator can verify the engine is actually
+            # talking. The deque-driven watcher gets only what the
+            # parser routes; this file gets everything verbatim.
+            if debug_fh is not None:
+                try:
+                    debug_fh.write(raw if raw.endswith("\n") else raw + "\n")
+                except Exception:
+                    pass
+
             parts = raw.strip().split()
             if not parts:
                 continue
@@ -450,6 +527,16 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
             client.close()
         except Exception:
             pass
+        if debug_fh is not None:
+            try:
+                debug_fh.write("# ──────────────────────────────────────────────\n")
+                debug_fh.write(f"# finished_at: {datetime.now(timezone.utc).isoformat()}\n")
+                debug_fh.write(f"# error      : {error_text or '(none)'}\n")
+                debug_fh.write(f"# counters   : {counters}\n")
+                debug_fh.write(f"# host_count : {len(results)}\n")
+                debug_fh.close()
+            except Exception:
+                pass
 
     return results, counters, error_text
 
@@ -468,6 +555,7 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
          dns_timeout_s: int = 2,
          exec_timeout_s: int = 900,
          verbose: bool = False,
+         debug_log_path: Optional[str] = None,
          on_event: Optional[EventCallback] = None,
          ) -> EngineScanReport:
     """Synchronous engine-side scan. Returns an EngineScanReport.
@@ -516,6 +604,7 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
         dns_timeout_s=dns_timeout_s,
         exec_timeout_s=exec_timeout_s,
         verbose=verbose,
+        debug_log_path=debug_log_path,
         on_event=on_event,
     )
     report.results = results

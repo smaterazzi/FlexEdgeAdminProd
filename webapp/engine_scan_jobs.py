@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from webapp import scan_jobs
 from webapp.dhcp_ssh import SSHTarget, SSHCredential
 from webapp.engine_scan import (
-    EngineScanReport, HostResult, _run_scan,
+    EngineScanReport, HostResult, _run_scan, scan_log_path,
 )
 
 log = logging.getLogger(__name__)
@@ -61,6 +61,13 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
             "ports_scanned": list(ports),
         },
     )
+
+    # Per-scan debug log file. Surfaced on the watcher card so an
+    # operator can `tail -f <path>` from outside the web UI when the
+    # in-page log feels stuck or rolls over too fast on big scans.
+    debug_log = scan_log_path(scan_id)
+    scan_jobs.update_extra(scan_id, debug_log_path=debug_log)
+    log.info("engine_scan_jobs: scan_id=%s debug_log=%s", scan_id, debug_log)
 
     results: dict[str, HostResult] = {}
 
@@ -132,6 +139,7 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
             dns_timeout_s=dns_timeout_s,
             exec_timeout_s=exec_timeout_s,
             verbose=verbose,
+            debug_log_path=debug_log,
             on_event=_on_event,
         )
         started_at = scan_jobs.get_started_at(scan_id)
