@@ -4539,20 +4539,70 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
             engine = Engine(engine_name)
 
             # 1) Engine-level map (the SDK's `engine.contact_addresses`).
+            # Capture EVERY attribute on each ContactAddressNode so we can
+            # see what SMC actually serializes regardless of SDK version.
             try:
                 engine_level_raw = []
                 for ca in engine.contact_addresses:
-                    engine_level_raw.append({
-                        "interface_id": str(getattr(ca, "interface_id", "") or ""),
-                        "interface_ip": str(getattr(ca, "interface_ip", "") or ""),
-                        "addresses": [str(a) for a in (getattr(ca, "addresses", None) or [])],
-                        "location": str(getattr(ca, "location", "") or
-                                        getattr(ca, "location_ref", "") or ""),
-                        "dynamic": bool(getattr(ca, "dynamic", False)),
-                    })
+                    entry = {}
+                    # All public-ish attributes we recognize:
+                    for key in ("interface_id", "interface_ip", "location",
+                                "location_ref", "location_name", "dynamic",
+                                "addresses", "address"):
+                        try:
+                            v = getattr(ca, key, None)
+                            if v is None:
+                                continue
+                            if isinstance(v, (list, tuple, set)):
+                                entry[key] = [str(x) for x in v]
+                            else:
+                                entry[key] = str(v)
+                        except Exception as exc:
+                            entry[f"{key}__error"] = str(exc)
+                    # Fallback: the SDK's `.data` if exposed.
+                    try:
+                        raw = getattr(ca, "data", None)
+                        if raw is not None:
+                            entry["__raw_data"] = (
+                                raw if isinstance(raw, (dict, list, str, int, bool))
+                                else str(raw)
+                            )
+                    except Exception:
+                        pass
+                    entry["__class__"] = type(ca).__name__
+                    engine_level_raw.append(entry)
             except Exception as exc:
-                engine_level_raw = [{"error": str(exc)}]
+                engine_level_raw = [{"error": str(exc),
+                                     "exc_type": type(exc).__name__}]
             engine_level_parsed = _build_contact_address_map(engine)
+
+            # 1a) Raw engine payload — slice down to anything that might
+            # carry contact addresses, so we don't blast the operator
+            # with a 50 KB dump but still get a clear picture.
+            raw_engine_subset = {}
+            try:
+                eng_data = (engine.data.data if hasattr(engine.data, "data")
+                            else dict(engine.data))
+                # Look for any top-level key containing "contact" — that
+                # surfaces whatever SMC serialized regardless of how the
+                # SDK chose to expose it.
+                raw_engine_subset = {
+                    k: v for k, v in eng_data.items()
+                    if "contact" in k.lower()
+                }
+                # Also dump the link relations so we can see if there's
+                # a `contact_addresses` sub-resource the SDK should be
+                # fetching (and tell whether we're hitting it).
+                links = []
+                for ln in (eng_data.get("link") or []):
+                    rel = ln.get("rel") or ""
+                    if "contact" in rel.lower():
+                        links.append(ln)
+                if links:
+                    raw_engine_subset["__contact_links"] = links
+            except Exception as exc:
+                raw_engine_subset = {"error": str(exc),
+                                     "exc_type": type(exc).__name__}
 
             # 2) Inline-per-interface — walk each physical_interface
             # payload looking for inline `contact_addresses` blocks.
@@ -4594,6 +4644,7 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
                     for k, v in engine_level_parsed.items()
                 },
             },
+            "raw_engine_payload_contact_keys": raw_engine_subset,
             "inline_per_interface": inline_per_interface,
             "joined_nodes": joined_nodes,
         })

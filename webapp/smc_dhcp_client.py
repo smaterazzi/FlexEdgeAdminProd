@@ -904,8 +904,15 @@ def _build_contact_address_map(engine) -> dict:
     try:
         cas = list(engine.contact_addresses)
     except Exception as exc:
-        logger.info("_build_contact_address_map(%s): no contact_addresses: %s",
-                    getattr(engine, "name", "?"), exc)
+        # WARN, not INFO: an empty engine-level map is a real
+        # diagnostic signal for the credentials wizard's NAT picker —
+        # we want this visible in `make dev` console + production logs
+        # so the operator can correlate against the SMC GUI.
+        logger.warning("_build_contact_address_map(%s): SDK call raised "
+                       "%s: %s — contact-address NAT picker will see "
+                       "engine-level map as empty",
+                       getattr(engine, "name", "?"),
+                       type(exc).__name__, exc)
         return out
 
     for ca in cas:
