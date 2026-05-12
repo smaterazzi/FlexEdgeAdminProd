@@ -2079,6 +2079,22 @@ def credentials_discover_nodes():
         with smc_session(cfg):
             nodes = list_cluster_nodes(engine_name)
             node_initiated = is_node_initiated_contact(engine_name)
+            # P1 pre-flight — SMC-side SSH state per node, queried in
+            # the same session so it's free. Wizard renders it as a
+            # badge BEFORE the operator clicks Auto-enroll.
+            from webapp.smc_dhcp_client import get_node_ssh_state
+            ssh_state_by_index: dict[int, dict] = {}
+            for n in nodes:
+                try:
+                    ssh_state_by_index[n.node_index] = get_node_ssh_state(
+                        engine_name, n.node_index,
+                    )
+                except Exception as exc:
+                    ssh_state_by_index[n.node_index] = {
+                        "state": "unknown", "source": "",
+                        "raw_signals": {},
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
             try:
                 policy_name = find_active_policy(engine_name)
             except Exception as exc:
@@ -2216,6 +2232,12 @@ def credentials_discover_nodes():
                 "reachable_via_nat": reachable_via_nat,
                 "primary_public_contact": primary_public_contact,
                 "suggested_connect_ip": suggested_connect_ip,
+                # P1 — SMC-side SSH state (pre-flight). Wizard renders
+                # a badge so the operator can spot a disabled daemon
+                # BEFORE clicking Auto-enroll.
+                "ssh_state": ssh_state_by_index.get(n.node_index, {}).get("state", "unknown"),
+                "ssh_state_source": ssh_state_by_index.get(n.node_index, {}).get("source", ""),
+                "ssh_state_error": ssh_state_by_index.get(n.node_index, {}).get("error", ""),
                 # Echo the persisted override, if any. Phase 5 fills this
                 # when the operator confirms during enrollment; this read
                 # path lets the UI show the current override on a node
@@ -4635,13 +4657,18 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
                 _collect_inline_contacts(data, "", inline_per_interface,
                                         _parse_inline_contact_addresses)
 
-            # 3) Joined view — what the wizard ends up seeing.
+            # 3) Joined view — what the wizard ends up seeing. Also
+            # includes the per-node SSH-daemon state probe so we can
+            # see which field SMC actually carries the daemon state in
+            # for this engine + SDK version.
+            from webapp.smc_dhcp_client import get_node_ssh_state
             joined_nodes = []
             for n in list_cluster_nodes(engine_name):
                 joined_nodes.append({
                     "node_index": n.node_index,
                     "node_id": n.node_id,
                     "name": n.name,
+                    "ssh_state": get_node_ssh_state(engine_name, n.node_index),
                     "addresses": [
                         {
                             "interface_id": a.interface_id,

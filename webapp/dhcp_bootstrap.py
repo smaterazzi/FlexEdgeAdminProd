@@ -257,13 +257,63 @@ def enroll_node(engine_name: str, node_index: int,
     SMC call that turns it on. We probe AFTER enable_ssh, with brief
     retries to let the daemon come up.
     """
-    # Stage 3a: enable SSH daemon via SMC API
+    # P1 pre-flight (2026-05-12) — query SMC for the current SSH-daemon
+    # state before flipping anything. Three branches:
+    #   * `enabled`  → log + skip the toggle. SMC's `ssh(enable=True)` is
+    #                  idempotent but emits an audit row each time, so we
+    #                  avoid the noise.
+    #   * `disabled` → today's path: flip via SMC, then re-query to
+    #                  verify it actually took effect (some SMC versions
+    #                  return success on the API call without the engine
+    #                  actually starting the daemon).
+    #   * `unknown`  → fall through to today's behavior. The TCP probe
+    #                  retries below catch the "daemon never came up"
+    #                  case.
+    pre_state = {}
     try:
-        smc.set_node_ssh_enabled(engine_name, node_index, True,
-                                 comment=audit_comment)
+        pre_state = smc.get_node_ssh_state(engine_name, node_index)
     except Exception as exc:
-        return EnrollmentResult(ok=False, failed_at_stage="enable_ssh",
-                                error=f"enable SSH on node failed: {exc}")
+        logger.debug("enroll_node: pre-flight SSH state probe raised: %s", exc)
+
+    pre_label = pre_state.get("state", "unknown")
+    if pre_label == "enabled":
+        logger.info(
+            "enroll_node(%s/%d): SMC reports SSH already enabled "
+            "(source=%s) — skipping ssh_enable toggle.",
+            engine_name, node_index, pre_state.get("source", ""),
+        )
+    else:
+        # Stage 3a: enable SSH daemon via SMC API
+        try:
+            smc.set_node_ssh_enabled(engine_name, node_index, True,
+                                     comment=audit_comment)
+        except Exception as exc:
+            return EnrollmentResult(ok=False, failed_at_stage="enable_ssh",
+                                    error=f"enable SSH on node failed: {exc}")
+
+        # Post-flight — re-query state. If SMC STILL reports SSH as
+        # disabled after our toggle, abort with a clear error rather
+        # than charging into a TCP probe that's guaranteed to fail.
+        # We only refuse on a CONFIRMED disabled reading; "unknown"
+        # falls through to the existing TCP-probe retry loop.
+        try:
+            post_state = smc.get_node_ssh_state(engine_name, node_index)
+            if post_state.get("state") == "disabled":
+                return EnrollmentResult(
+                    ok=False, failed_at_stage="enable_ssh",
+                    error=(f"SMC accepted ssh_enable but the daemon "
+                           f"is STILL reported as disabled "
+                           f"(source={post_state.get('source')!r}). "
+                           f"Check the SMC Management Client: the "
+                           f"node's 'SSH Daemon' setting under "
+                           f"'Engine → General → SSH Daemon' should "
+                           f"be enabled. If a policy push reverts "
+                           f"it, the policy template is overriding "
+                           f"the engine-level setting."),
+                )
+        except Exception as exc:
+            logger.debug("enroll_node: post-flight SSH state probe raised: %s",
+                         exc)
 
     # Post-enable probe with retries — ssh daemon needs a moment to bind
     # after SMC flips the flag (typically <1s, occasionally up to ~5s).
