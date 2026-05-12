@@ -1737,6 +1737,22 @@ def credentials_list():
                    .filter_by(id=bound_tenant_id, is_active=True)
                    .all())
     tenants_by_id = {t.id: t for t in tenants}
+    # Operator-facing label override — the dropdown / source-IP table
+    # show the active *Domain* identity instead of the bound Tenant
+    # name. Reason: when the admin form's "find-or-create on smc_url"
+    # reuses an existing Tenant (i.e. when several Domains live on one
+    # Forcepoint SMC instance), the dropdown otherwise renders the
+    # reused Tenant's name and operators mistake it for the wrong
+    # Domain — they expect the value to match the topbar selector.
+    # The form's hidden tenant_id value stays unchanged, so the AJAX
+    # cascade keeps working.
+    domain_label = ""
+    domain_smc = ""
+    if domain_obj is not None:
+        domain_label = (domain_obj.display_name
+                        or domain_obj.slug
+                        or f"domain#{domain_obj.id}")
+        domain_smc = domain_obj.smc_domain_name or ""
     # Phase B.3: group credentials by (domain_id, engine) — the canonical
     # scope FK on every feature row.
     creds_by_engine: dict[tuple[int, str], list] = {}
@@ -1776,6 +1792,8 @@ def credentials_list():
         source_drift_by_engine=source_drift_by_engine,
         cache_ttl_hours=CACHE_TTL_HOURS,
         tenants=tenants,
+        domain_label=domain_label,
+        domain_smc=domain_smc,
     )
 
 
