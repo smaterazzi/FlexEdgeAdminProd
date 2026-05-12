@@ -1613,13 +1613,23 @@ def get_node_ssh_state(engine_name: str, node_index: int,
                 f"{type(exc).__name__}: {exc}"
             )
 
+        # P1 — *FETCH-PROBE-V2* sentinel so the operator can confirm
+        # via the 🐛 endpoint that this code path actually loaded.
+        # If you don't see this key in raw_signals after redeploying,
+        # the container didn't pick up the new code → hard-restart
+        # (gunicorn --preload doesn't auto-reload).
+        raw_signals["__fetch_probe_version"] = "v2-2026-05-12"
+
         for rel in ("diagnostic", "appliance_status"):
             href = links_by_rel.get(rel)
+            raw_signals[f"fetch[{rel}].__href"] = href or "(missing from link table)"
             if not href:
                 continue
+            result = None
             try:
-                # smc-python's HTTP helper. Returns the parsed JSON dict
-                # (or list) from the SMC API.
+                # smc-python's HTTP helper. Some SDK versions return
+                # a parsed dict, others return (json, etag) tuples or
+                # an Element wrapper. Handle each.
                 from smc.api.common import SMCRequest
                 result = SMCRequest(href=href).read()
             except Exception as exc:
@@ -1628,28 +1638,62 @@ def get_node_ssh_state(engine_name: str, node_index: int,
                 )
                 continue
 
+            # ALWAYS record what came back, regardless of shape. This
+            # closes the silent-skip hole: even if `result` is a tuple
+            # / Element / None, we surface enough to figure out what
+            # the SDK contract actually is on this build.
+            raw_signals[f"fetch[{rel}].__type"] = type(result).__name__
+            if result is None:
+                raw_signals[f"fetch[{rel}].__none"] = True
+                continue
+
+            # Unwrap common (json, etag) / (json, etag, headers) tuples.
+            if isinstance(result, tuple):
+                raw_signals[f"fetch[{rel}].__tuple_len"] = len(result)
+                if len(result) >= 1:
+                    result = result[0]
+                    raw_signals[f"fetch[{rel}].__unwrapped_type"] = (
+                        type(result).__name__
+                    )
+
+            # SMCResult wrapper — has .json / .data attribute on some SDK builds.
+            if not isinstance(result, (dict, list)):
+                for attr in ("json", "data", "payload"):
+                    candidate = getattr(result, attr, None)
+                    if isinstance(candidate, (dict, list)):
+                        result = candidate
+                        raw_signals[f"fetch[{rel}].__via_attr"] = attr
+                        break
+
+            # Last-resort dump for unrecognised shape — at least the
+            # operator can paste it back to me.
+            if not isinstance(result, (dict, list)):
+                raw_signals[f"fetch[{rel}].__repr"] = str(result)[:400]
+                continue
+
             # SMC returns diagnostic in a {"diagnostics": [{"diagnostic": {...}}, ...]}
             # shape on 7.1 (observed). The "name/value" pairs we want
             # are inside each inner object. Be defensive about both
             # dict-of-list and list-of-dict variants.
             if isinstance(result, dict):
+                raw_signals[f"fetch[{rel}].__dict_keys"] = sorted(result.keys())
                 if verbose:
                     _scan_dict(f"fetch[{rel}]", result)
                 # Walk anything that looks like a {name, value} list.
-                for v in result.values():
+                for k, v in result.items():
                     if isinstance(v, list):
+                        raw_signals[f"fetch[{rel}].{k}.__list_len"] = len(v)
                         for item in v:
                             if isinstance(item, dict):
                                 # Unwrap nested {"diagnostic": {...}} envelopes.
                                 inner = item.get("diagnostic", item)
                                 if isinstance(inner, dict):
                                     _scan_name_value_pair(
-                                        f"fetch[{rel}]", inner,
+                                        f"fetch[{rel}].{k}", inner,
                                         raw_signals, verbose,
                                     )
             elif isinstance(result, list):
-                if verbose:
-                    raw_signals[f"fetch[{rel}].__len"] = len(result)
+                raw_signals[f"fetch[{rel}].__len"] = len(result)
                 for i, item in enumerate(result):
                     if isinstance(item, dict):
                         inner = item.get("diagnostic", item)
@@ -1659,10 +1703,7 @@ def get_node_ssh_state(engine_name: str, node_index: int,
                                 raw_signals, verbose,
                             )
 
-            # Re-run classifier on the harvested fields. _scan_dict
-            # already updates state/source for SSH-named keys, but
-            # _scan_name_value_pair stamps a synthetic key like
-            # `fetch[diagnostic].ssh_daemon` — make sure that wins.
+            # Re-run classifier on the harvested fields.
             for sk, sv in list(raw_signals.items()):
                 if not sk.startswith(f"fetch[{rel}]"):
                     continue
