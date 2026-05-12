@@ -708,6 +708,48 @@ def _classify_public(addr: str) -> bool:
         return False
 
 
+def _parse_bool_loose(val) -> bool:
+    """Coerce SMC's JSON ``dynamic`` field to a real Python bool.
+
+    The Forcepoint API serializes this as the **string** ``"false"`` /
+    ``"true"`` (observed against SMC 7.1 on 2026-05-12), and bare
+    ``bool(some_string)`` returns True for any non-empty string. Recognise
+    the textual forms here; fall back to ``bool(val)`` for the few
+    legitimate non-string falsy / truthy values (None, 0, 1, real bool).
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return bool(val)
+
+
+def _prettify_location(raw) -> str:
+    """Turn a SMC ``location_ref`` href into a short, human-readable label.
+
+    Input shapes seen in the wild:
+      * ``"https://.../elements/location/-1"`` → ``"Default"`` (SMC's
+        sentinel ID for the implicit Default location).
+      * ``"https://.../elements/location/63"`` → ``"location#63"``
+        (named locations need a second API call to resolve; the ID is
+        enough for the operator to cross-reference in the SMC GUI).
+      * Plain string already (e.g. ``"Default"``) → returned as-is.
+      * Anything else → stringified verbatim.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if "://" not in s and "/" not in s:
+        # Already a plain label.
+        return s
+    tail = s.rsplit("/", 1)[-1] or s
+    if tail == "-1":
+        return "Default"
+    return f"location#{tail}" if tail else s
+
+
 def _parse_inline_contact_addresses(inner: dict) -> list[dict]:
     """Extract contact addresses defined inline on an IPv4/IPv6 interface.
 
@@ -744,19 +786,20 @@ def _parse_inline_contact_addresses(inner: dict) -> list[dict]:
             if not addr:
                 continue
             # SMC API can carry `location_ref` (an Element href) and/or
-            # `location` (a human name). Surface whichever's present
-            # so the UI label is readable.
-            location = ""
+            # `location` (a human name). Surface whichever's present;
+            # `_prettify_location` shortens hrefs to "Default" /
+            # "location#NN" so the UI dropdown is readable.
+            location_raw = ""
             for key in ("location", "location_name", "location_ref"):
                 v = item.get(key)
                 if v:
-                    location = str(v)
+                    location_raw = str(v)
                     break
             out.append({
                 "address": addr,
-                "location": location,
+                "location": _prettify_location(location_raw),
                 "is_public": _classify_public(addr),
-                "dynamic": bool(item.get("dynamic", False)),
+                "dynamic": _parse_bool_loose(item.get("dynamic")),
             })
         elif isinstance(item, str):
             addr = item.strip()
@@ -977,17 +1020,17 @@ def _build_contact_address_map(engine) -> dict:
                              entry.get("addr") or "").strip()
                 if not addr_s:
                     continue
-                location = ""
+                location_raw = ""
                 for key in ("location", "location_name", "location_ref"):
                     v = entry.get(key)
                     if v:
-                        location = str(v)
+                        location_raw = str(v)
                         break
                 bucket.append({
                     "address": addr_s,
-                    "location": location,
+                    "location": _prettify_location(location_raw),
                     "is_public": _classify_public(addr_s),
-                    "dynamic": bool(entry.get("dynamic", False)),
+                    "dynamic": _parse_bool_loose(entry.get("dynamic")),
                 })
             elif isinstance(entry, str):
                 addr_s = entry.strip()
