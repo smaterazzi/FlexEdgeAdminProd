@@ -166,6 +166,50 @@ def _smc_cfg(tenant_or_domain, api_key: ApiKey | None = None) -> SMCConfig:
     )
 
 
+def _smc_cfg_dict(tenant_or_domain, api_key: ApiKey | None = None) -> dict:
+    """Dict-shaped SMC config — matches `app.get_user_cfg()` shape.
+
+    Required by `engine_inquiry.list_clusters` and the rest of the
+    `webapp.smc_client.smc_session(cfg)` callers (top-level
+    `smc_client`, dict-keyed: `cfg["smc_url"]`, `cfg["api_key"]`, …).
+
+    `_smc_cfg(...)` above returns the `SMCConfig` dataclass used by
+    `webapp.smc_tls_client.smc_session(cfg)` (attribute-keyed:
+    `cfg.url`, `cfg.api_key`). The two are not interchangeable — passing
+    one where the other is expected raises
+    ``TypeError: 'SMCConfig' object is not subscriptable``, which is
+    what the user saw as "Error: 'SMCConfig' object" in the engines
+    cascade.
+
+    Returns the same dict shape every `domain_objects.*` cache fetcher
+    consumes (engines / cluster / scopes / policy / element / dhcp_host).
+    """
+    if isinstance(tenant_or_domain, Domain):
+        domain = tenant_or_domain
+        ak = domain.api_key
+        return {
+            "smc_url":      ak.smc_url,
+            "api_key":      ak.decrypted_key,
+            "verify_ssl":   bool(ak.verify_ssl),
+            "timeout":      ak.timeout or 120,
+            "domain":       domain.smc_domain_name or "",
+            "api_version":  ak.api_version or "",
+            "retry_on_busy": True,
+        }
+    tenant = tenant_or_domain
+    return {
+        "smc_url":      (api_key.smc_url or tenant.smc_url),
+        "api_key":      api_key.decrypted_key,
+        "verify_ssl":   bool(api_key.verify_ssl
+                             if api_key.verify_ssl is not None
+                             else tenant.verify_ssl),
+        "timeout":      api_key.timeout or tenant.timeout or 120,
+        "domain":       tenant.default_domain or "",
+        "api_version":  api_key.api_version or tenant.api_version or "",
+        "retry_on_busy": True,
+    }
+
+
 def _wants_json_response() -> bool:
     """True for AJAX-style requests — same check used inline by every
     route that branches on response shape."""
@@ -662,6 +706,9 @@ def scopes_discover():
         return redirect(url_for("dhcp.scopes_list"))
 
     cfg = _smc_cfg(tenant, api_key)
+    # `domain_objects.scopes` ultimately calls `smc_client.smc_session(cfg)`
+    # which expects a DICT-shaped cfg (not the SMCConfig dataclass).
+    cfg_dict = _smc_cfg_dict(tenant, api_key)
     target = f"{tenant.name}/{api_key.name}/{engine_name}"
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
     try:
@@ -672,7 +719,7 @@ def scopes_discover():
         domain_obj = getattr(g, "domain", None)
         from webapp import domain_objects
         scope_dicts, _cv = domain_objects.scopes(
-            domain_obj, cfg, engine_name, refresh=True)
+            domain_obj, cfg_dict, engine_name, refresh=True)
         # Project dicts back to the dataclass shape the upsert loop expects
         from webapp.smc_dhcp_client import DhcpScopeInfo
         found = [DhcpScopeInfo(**{
@@ -1086,6 +1133,8 @@ def reservation_edit(reservation_id):
         flash("Scope has no Domain or ApiKey on file. Re-enroll via Admin Portal.", "danger")
         return redirect(url_for("dhcp.scopes_list"))
     cfg = _smc_cfg(domain)
+    # `domain_objects.dhcp_host` needs the DICT-shaped cfg (smc_client backend).
+    cfg_dict = _smc_cfg_dict(domain)
 
     # Read the live SMC Host (if it exists yet) so the form pre-fills with
     # current values. For 'queued' reservations the Host doesn't exist —
@@ -1097,7 +1146,7 @@ def reservation_edit(reservation_id):
         try:
             from webapp import domain_objects
             host_view, _cv = domain_objects.dhcp_host(
-                domain, cfg, res.smc_host_name)
+                domain, cfg_dict, res.smc_host_name)
         except Exception as exc:
             flash(f"Could not read Host from SMC: {exc}", "warning")
 
@@ -4403,7 +4452,9 @@ def api_tenant_engines(tenant_id, key_id):
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
         return jsonify({"error": "Not found"}), 404
-    cfg = _smc_cfg(tenant, api_key)
+    # `domain_objects.engines` calls `smc_client.smc_session(cfg)` which
+    # expects a DICT-shaped cfg, not the SMCConfig dataclass.
+    cfg = _smc_cfg_dict(tenant, api_key)
     try:
         # Phase 0 cross-feature reuse: hit the same ``engines`` cache
         # section that /engines/clusters populates. Visiting Clusters
@@ -4447,6 +4498,145 @@ def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
         return jsonify({"error": smc_error_detail(exc)}), 500
 
 
+@dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/contact-addresses/debug")
+@admin_required
+def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
+    """P1 diagnostic — dump every contact address FEA sees for this engine.
+
+    Surfaces all three sources so the operator can pinpoint which one
+    SMC actually carries the public IP on:
+
+      * ``engine_level`` — what ``engine.contact_addresses`` returns,
+        keyed by ``(interface_id, interface_ip)``.
+      * ``inline_per_interface`` — what we extract from each
+        IPv4 / IPv6 interface's own ``contact_addresses`` block inside
+        the physical_interface payload.
+      * ``joined_nodes`` — the final per-node view after `list_cluster_nodes`
+        merges the two sources. This is what the credentials wizard
+        consumes.
+
+    Hit URL (substitute IDs):
+      ``/dhcp/api/tenants/<tid>/api-keys/<kid>/engines/<engine>/contact-addresses/debug``
+
+    Returns JSON only — paste it back so we can confirm SMC's payload
+    shape matches the parser without touching prod data.
+    """
+    guard = _assert_active_domain_match(tenant_id, key_id)
+    if guard is not None:
+        return guard
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, key_id)
+    if not tenant or not api_key:
+        return jsonify({"error": "Not found"}), 404
+    cfg = _smc_cfg(tenant, api_key)
+    try:
+        from smc.core.engine import Engine
+        from webapp.smc_dhcp_client import (
+            _build_contact_address_map, _parse_inline_contact_addresses,
+            list_cluster_nodes,
+        )
+        with smc_session(cfg):
+            engine = Engine(engine_name)
+
+            # 1) Engine-level map (the SDK's `engine.contact_addresses`).
+            try:
+                engine_level_raw = []
+                for ca in engine.contact_addresses:
+                    engine_level_raw.append({
+                        "interface_id": str(getattr(ca, "interface_id", "") or ""),
+                        "interface_ip": str(getattr(ca, "interface_ip", "") or ""),
+                        "addresses": [str(a) for a in (getattr(ca, "addresses", None) or [])],
+                        "location": str(getattr(ca, "location", "") or
+                                        getattr(ca, "location_ref", "") or ""),
+                        "dynamic": bool(getattr(ca, "dynamic", False)),
+                    })
+            except Exception as exc:
+                engine_level_raw = [{"error": str(exc)}]
+            engine_level_parsed = _build_contact_address_map(engine)
+
+            # 2) Inline-per-interface — walk each physical_interface
+            # payload looking for inline `contact_addresses` blocks.
+            inline_per_interface = []
+            for phys in engine.physical_interface:
+                try:
+                    data = (phys.data.data if hasattr(phys.data, "data")
+                            else dict(phys.data))
+                except Exception:
+                    continue
+                _collect_inline_contacts(data, "", inline_per_interface,
+                                        _parse_inline_contact_addresses)
+
+            # 3) Joined view — what the wizard ends up seeing.
+            joined_nodes = []
+            for n in list_cluster_nodes(engine_name):
+                joined_nodes.append({
+                    "node_index": n.node_index,
+                    "node_id": n.node_id,
+                    "name": n.name,
+                    "addresses": [
+                        {
+                            "interface_id": a.interface_id,
+                            "address": a.address,
+                            "is_primary_mgt": a.is_primary_mgt,
+                            "reverse_connection": a.reverse_connection,
+                            "contact_addresses": a.contact_addresses,
+                        }
+                        for a in n.addresses
+                    ],
+                })
+
+        return jsonify({
+            "engine_name": engine_name,
+            "engine_level": {
+                "raw_from_sdk": engine_level_raw,
+                "parsed_map": {
+                    f"{k[0]}@{k[1]}": v
+                    for k, v in engine_level_parsed.items()
+                },
+            },
+            "inline_per_interface": inline_per_interface,
+            "joined_nodes": joined_nodes,
+        })
+    except Exception as exc:
+        log.exception("contact-addresses debug failed")
+        return jsonify({"error": smc_error_detail(exc)}), 500
+
+
+def _collect_inline_contacts(level_payload: dict, parent_iface_id: str,
+                             out_list: list, parser) -> None:
+    """Recurse the physical_interface payload, append every inline-
+    contact-address occurrence with its interface_id path so the
+    diagnostic JSON shows exactly where SMC keeps the public IP.
+    """
+    iface_id = (parent_iface_id
+                or str(level_payload.get("interface_id") or ""))
+    for entry in level_payload.get("interfaces", []) or []:
+        for inner_kind, inner in entry.items():
+            if inner_kind not in ("single_node_interface", "node_interface"):
+                continue
+            if not isinstance(inner, dict):
+                continue
+            parsed = parser(inner)
+            if not parsed:
+                continue
+            out_list.append({
+                "interface_id": iface_id,
+                "inner_kind": inner_kind,
+                "real_ip": inner.get("address") or "",
+                "nodeid": inner.get("nodeid"),
+                "raw_inline": inner.get("contact_addresses")
+                              or inner.get("contact_address"),
+                "parsed": parsed,
+            })
+    vlans = (level_payload.get("vlanInterfaces")
+             or level_payload.get("vlan_interfaces") or [])
+    for vlan_wrap in vlans:
+        vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+        vlan_raw_id = vlan.get("interface_id", "")
+        combined = f"{iface_id}.{vlan_raw_id}" if vlan_raw_id else iface_id
+        _collect_inline_contacts(vlan, combined, out_list, parser)
+
+
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/scopes")
 @admin_required
 def api_engine_scopes(tenant_id, key_id, engine_name):
@@ -4463,11 +4653,14 @@ def api_engine_scopes(tenant_id, key_id, engine_name):
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
         return jsonify({"error": "Not found"}), 404
+    # Two cfg shapes: domain_objects.* takes a DICT (smc_client backend);
+    # smc_session below takes the SMCConfig DATACLASS (smc_tls_client backend).
     cfg = _smc_cfg(tenant, api_key)
+    cfg_dict = _smc_cfg_dict(tenant, api_key)
     try:
         from webapp import domain_objects
         domain = getattr(g, "domain", None)
-        scope_dicts, _cv = domain_objects.scopes(domain, cfg, engine_name)
+        scope_dicts, _cv = domain_objects.scopes(domain, cfg_dict, engine_name)
         # Cluster-node list isn't cache-shared yet (different shape than
         # cluster_detail's nodes — this one returns NDI primary addresses).
         # Keep live for now.

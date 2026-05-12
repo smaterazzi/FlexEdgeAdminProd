@@ -694,6 +694,85 @@ class DhcpClusterNode:
     primary_address: str = ""     # the SMC-managed primary mgmt IP (auto target)
 
 
+def _classify_public(addr: str) -> bool:
+    """True iff ``addr`` parses as a globally routable IP (IPv4 or IPv6).
+
+    Matches the engine-level classifier in `_build_contact_address_map`
+    so per-interface and engine-level contact addresses converge on the
+    same public/private rule.
+    """
+    try:
+        import ipaddress
+        return bool(ipaddress.ip_address((addr or "").strip()).is_global)
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_inline_contact_addresses(inner: dict) -> list[dict]:
+    """Extract contact addresses defined inline on an IPv4/IPv6 interface.
+
+    P1 (2026-05-12). Forcepoint NGFW SMC keeps contact addresses in two
+    places — the engine's General tab AND inside each IPv4/IPv6
+    interface's own properties. This helper handles only the inline
+    case; the engine-level case is merged in by
+    ``_build_contact_address_map`` after the walk.
+
+    Returns a list of normalized dicts compatible with what the
+    credentials wizard's per-node ``contact_addresses`` field expects::
+
+        [{"address": str, "location": str, "is_public": bool, "dynamic": bool}, ...]
+
+    Robust to shape drift: accepts ``list[dict]`` (the SDK's canonical
+    form), ``list[str]`` (older payloads), and bare ``str`` (very old
+    SMC payloads). Alien shapes are silently skipped — we log at
+    ``logger.debug`` so it shows up in `make dev` console without
+    spamming production.
+    """
+    raw = inner.get("contact_addresses")
+    # Some payloads pluralise differently or use ContactAddressNode
+    # as a singular field; try the alternates so we don't miss data.
+    if raw is None:
+        raw = inner.get("contact_address")
+    if not raw:
+        return []
+
+    out: list[dict] = []
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if isinstance(item, dict):
+            addr = str(item.get("address") or item.get("addr") or "").strip()
+            if not addr:
+                continue
+            # SMC API can carry `location_ref` (an Element href) and/or
+            # `location` (a human name). Surface whichever's present
+            # so the UI label is readable.
+            location = ""
+            for key in ("location", "location_name", "location_ref"):
+                v = item.get(key)
+                if v:
+                    location = str(v)
+                    break
+            out.append({
+                "address": addr,
+                "location": location,
+                "is_public": _classify_public(addr),
+                "dynamic": bool(item.get("dynamic", False)),
+            })
+        elif isinstance(item, str):
+            addr = item.strip()
+            if not addr:
+                continue
+            out.append({
+                "address": addr,
+                "location": "",
+                "is_public": _classify_public(addr),
+                "dynamic": False,
+            })
+        else:
+            logger.debug("inline contact_address: unknown shape %r", item)
+    return out
+
+
 def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                           ) -> list[NodeAddress]:
     """Recursively walk a physical_interface payload and collect every static
@@ -717,6 +796,26 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
             is_dynamic = bool(inner.get("dynamic"))
             if not address and not is_dynamic:
                 continue
+            # P1 — inline contact addresses (2026-05-12). SMC stores
+            # contact addresses in TWO places:
+            #   (a) engine-level via `engine.contact_addresses` — the
+            #       Engine → General tab. Joined onto NodeAddress
+            #       downstream by `_build_contact_address_map`.
+            #   (b) per-interface inline — under the IPv4/IPv6
+            #       interface's own properties, this lands directly
+            #       inside the NodeInterface JSON payload as a
+            #       `contact_addresses` array. The SDK's
+            #       `engine.contact_addresses` does NOT always
+            #       surface these (depending on SMC version + SDK
+            #       version), so we extract them here too.
+            #
+            # Observed shapes for the inline field:
+            #   list[dict]   — [{"address": "1.2.3.4", "dynamic": false,
+            #                    "location_ref": "https://..."}]   ← most common
+            #   list[str]    — ["1.2.3.4"]
+            #   str          — "1.2.3.4"  (very old SMC payloads)
+            # Defensive to all three; alien shapes are skipped.
+            inline_cas = _parse_inline_contact_addresses(inner)
             out.append(NodeAddress(
                 interface_id=iface_id,
                 address=address,
@@ -732,6 +831,7 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                 # can show "this specific NDI is the node-initiated
                 # channel" without re-walking.
                 reverse_connection=bool(inner.get("reverse_connection")),
+                contact_addresses=inline_cas,
             ))
 
     # VLAN children
@@ -800,18 +900,6 @@ def _build_contact_address_map(engine) -> dict:
 
     Empty / failure → empty dict so the caller never has to None-check.
     """
-    import ipaddress
-
-    def _classify(addr: str) -> bool:
-        try:
-            ip = ipaddress.ip_address((addr or "").strip())
-        except (ValueError, TypeError):
-            return False
-        # is_global is False for RFC1918, loopback, link-local, multicast,
-        # reserved, etc. Exactly what we want: True = routable on the
-        # public internet => probably a NAT exit.
-        return bool(ip.is_global)
-
     out: dict = {}
     try:
         cas = list(engine.contact_addresses)
@@ -843,7 +931,7 @@ def _build_contact_address_map(engine) -> dict:
             bucket.append({
                 "address": addr_s,
                 "location": location,
-                "is_public": _classify(addr_s),
+                "is_public": _classify_public(addr_s),
                 "dynamic": dynamic,
             })
     return out
@@ -879,13 +967,26 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
             continue
         all_addresses.extend(_walk_node_interfaces(data))
 
-    # Build the contact-address map ONCE, attach to each matching NDI.
+    # Build the engine-level contact-address map ONCE; MERGE (not
+    # replace) onto each matching NDI. The inline-per-interface
+    # contact addresses are already on `na.contact_addresses` from
+    # `_walk_node_interfaces`; this loop adds any engine-level
+    # entries SMC keeps on the General tab that weren't already
+    # surfaced inline. Deduped by `address` so the UI never shows
+    # the same IP twice.
     contact_map = _build_contact_address_map(engine)
     if contact_map:
         for na in all_addresses:
             key = (na.interface_id, na.address)
-            if key in contact_map:
-                na.contact_addresses = contact_map[key]
+            engine_level = contact_map.get(key) or []
+            if not engine_level:
+                continue
+            seen = {ca.get("address") for ca in na.contact_addresses
+                    if ca.get("address")}
+            for ca in engine_level:
+                if ca.get("address") and ca["address"] not in seen:
+                    na.contact_addresses.append(ca)
+                    seen.add(ca["address"])
 
     # Group by nodeid (1-based in SMC). Single-node engines may not assign
     # a nodeid; treat unset as 1.
