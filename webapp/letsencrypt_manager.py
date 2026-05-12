@@ -201,9 +201,19 @@ def list_certs():
     else:
         certs = qry.order_by(ManagedCertificate.created_at.desc()).all()
 
+    # Pattern-count signal for the empty-state CTA. Cheap (indexed by
+    # domain_id, no joins) — skip entirely for Super since they see
+    # certs across all Domains and the "configure your allowlist"
+    # prompt only makes sense in a single-Domain context.
+    patterns_count = 0
+    if domain is not None and not _is_super():
+        patterns_count = (DomainCertPattern.query
+                          .filter_by(domain_id=domain.id).count())
+
     return render_template(
         "tls/letsencrypt/list.html",
         certs=certs, account=account,
+        patterns_count=patterns_count,
     )
 
 
@@ -1105,6 +1115,48 @@ def patterns_view():
                     except Exception:
                         pass
                     flash(f"Pattern {raw!r} added.", "success")
+        elif action == "add_and_continue":
+            # Inline pattern-add from the /new page: same as `add` but
+            # redirects back to `/new` (or wherever `next` points) so the
+            # operator can keep filling out the cert request form.
+            raw = (request.form.get("pattern") or "").strip().lower()
+            next_url = (request.form.get("next") or "").strip()
+            from webapp.letsencrypt_allowlist import is_valid_pattern
+            ok, reason = is_valid_pattern(raw)
+            if not ok:
+                flash(f"Pattern refused: {reason}.", "danger")
+            else:
+                existing = (DomainCertPattern.query
+                            .filter_by(domain_id=domain.id, pattern=raw)
+                            .first())
+                if existing is not None:
+                    flash(f"Pattern {raw!r} is already on the list.", "info")
+                else:
+                    db.session.add(DomainCertPattern(
+                        domain_id=domain.id, pattern=raw,
+                        created_by_user_id=_current_user_id(),
+                    ))
+                    db.session.commit()
+                    try:
+                        from shared.logging import audit
+                        audit(
+                            feature="letsencrypt",
+                            action="pattern.add",
+                            target=raw,
+                            detail=(f"domain_id={domain.id} "
+                                    f"(inline from /new)"),
+                            domain_id=domain.id,
+                        )
+                    except Exception:
+                        pass
+                    flash(f"Pattern {raw!r} added — you can now request "
+                          f"a matching certificate.", "success")
+            # Same-origin redirect guard — only accept paths under
+            # /tls/letsencrypt/, never absolute or external URLs.
+            if (next_url and next_url.startswith("/tls/letsencrypt/")
+                    and "//" not in next_url[1:]):
+                return redirect(next_url)
+            return redirect(url_for("letsencrypt.cert_new"))
         elif action == "remove":
             try:
                 pid = int(request.form.get("pattern_id") or "0")

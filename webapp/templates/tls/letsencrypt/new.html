@@ -20,12 +20,71 @@
 {% endwith %}
 
 {% if not patterns %}
-<div class="alert alert-warning">
-  <i class="bi bi-exclamation-triangle"></i>
-  <strong>No allowlist patterns configured for this Domain.</strong>
-  Cert requests will be refused. Add at least one pattern via the
-  <a href="{{ url_for('letsencrypt.patterns_view') }}">Allowlist</a> page.
+<div class="card border-warning mb-3">
+  <div class="card-header bg-warning bg-opacity-25">
+    <strong><i class="bi bi-exclamation-triangle"></i>
+      No allowlist patterns configured for this Domain</strong>
+  </div>
+  <div class="card-body">
+    <p class="mb-2">
+      Cert requests are refused until at least one pattern is on the list.
+      Add one here to continue without leaving this page — or jump to the
+      full <a href="{{ url_for('letsencrypt.patterns_view') }}">Allowlist</a>
+      page if you want to set up several.
+    </p>
+    <form method="post" action="{{ url_for('letsencrypt.patterns_view') }}"
+          class="row g-2 align-items-end">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <input type="hidden" name="action" value="add_and_continue">
+      <input type="hidden" name="next" value="{{ url_for('letsencrypt.cert_new') }}">
+      <div class="col-md-8">
+        <label class="form-label small mb-1">Pattern (fnmatch glob)</label>
+        <input type="text" name="pattern" class="form-control form-control-sm"
+               id="inline-pattern" placeholder="*.example.com" required
+               pattern="^[a-z0-9.\-*]+$" autocomplete="off">
+        <div class="form-text small">
+          Examples: <code>admin.example.com</code> (exact),
+          <code>*.example.com</code> (one subdomain level),
+          <code>*.prod.example.com</code>. Refused:
+          standalone <code>*</code>, TLD-only globs like <code>*.com</code>,
+          patterns with no dot.
+        </div>
+      </div>
+      <div class="col-md-4 text-end">
+        <button class="btn btn-sm btn-warning">
+          <i class="bi bi-plus-circle"></i> Add pattern &amp; continue
+        </button>
+      </div>
+    </form>
+  </div>
 </div>
+<script>
+// Pre-fill the inline pattern with a sensible suggestion derived from
+// whatever the operator already typed in the FQDN field above (or what
+// they tried to submit on the previous failed attempt).
+(function() {
+  var fqdnInput = document.querySelector("input[name='fqdn']");
+  var patternInput = document.getElementById("inline-pattern");
+  if (!fqdnInput || !patternInput) return;
+  function suggest(fqdn) {
+    fqdn = (fqdn || "").trim().toLowerCase();
+    if (!fqdn || fqdn.indexOf(".") === -1) return "";
+    // Strip the leftmost label → `*.rest`. Falls back to exact match if
+    // the input is just `foo.com` (no subdomain to glob).
+    var parts = fqdn.split(".");
+    if (parts.length >= 3) return "*." + parts.slice(1).join(".");
+    return fqdn;
+  }
+  if (!patternInput.value && fqdnInput.value) {
+    patternInput.placeholder = suggest(fqdnInput.value) || patternInput.placeholder;
+  }
+  fqdnInput.addEventListener("input", function() {
+    if (!patternInput.value) {
+      patternInput.placeholder = suggest(fqdnInput.value) || "*.example.com";
+    }
+  });
+})();
+</script>
 {% else %}
 <div class="alert alert-info small">
   <i class="bi bi-info-circle"></i> The requested FQDN must match one of
@@ -33,6 +92,7 @@
   {% for p in patterns %}
   <code class="ms-1">{{ p.pattern }}</code>{% if not loop.last %},{% endif %}
   {% endfor %}
+  <a href="{{ url_for('letsencrypt.patterns_view') }}" class="ms-2">Manage</a>
 </div>
 {% endif %}
 

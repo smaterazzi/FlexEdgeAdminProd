@@ -44,10 +44,39 @@
 {% endwith %}
 
 {% if not certs %}
-<div class="alert alert-info">
-  <i class="bi bi-info-circle"></i>
-  No certificates tracked yet. Click <strong>New cert</strong> to issue one.
-  Configure your per-Domain allowlist first via the <strong>Allowlist</strong> button.
+<div class="card border-info mb-3">
+  <div class="card-body">
+    <h5 class="mb-2"><i class="bi bi-info-circle"></i> No certificates tracked yet</h5>
+    {% if patterns_count is defined and patterns_count == 0 %}
+    <p class="mb-2">
+      Before you can request a certificate, this Domain needs at least one
+      allowlist pattern (a glob that limits which FQDNs FEA will ask
+      Let's Encrypt to sign for). Set one up first, then come back to request.
+    </p>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('letsencrypt.patterns_view') }}" class="btn btn-warning">
+        <i class="bi bi-list-check"></i> Configure allowlist
+      </a>
+      <a href="{{ url_for('letsencrypt.cert_new') }}" class="btn btn-outline-primary">
+        <i class="bi bi-plus-circle"></i> Request anyway (will prompt for a pattern)
+      </a>
+    </div>
+    {% else %}
+    <p class="mb-2">
+      Click <strong>New cert</strong> to issue one — the FQDN must match
+      this Domain's allowlist
+      ({{ patterns_count if patterns_count is defined else '?' }} pattern{{ '' if (patterns_count is defined and patterns_count == 1) else 's' }} configured).
+    </p>
+    <div class="d-flex gap-2">
+      <a href="{{ url_for('letsencrypt.cert_new') }}" class="btn btn-primary">
+        <i class="bi bi-plus-circle"></i> New cert
+      </a>
+      <a href="{{ url_for('letsencrypt.patterns_view') }}" class="btn btn-outline-secondary">
+        <i class="bi bi-list-check"></i> Manage allowlist
+      </a>
+    </div>
+    {% endif %}
+  </div>
 </div>
 {% else %}
 <div class="table-responsive">
