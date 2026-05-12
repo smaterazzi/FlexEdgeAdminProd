@@ -1398,6 +1398,54 @@ def _matches_ssh_token(value, tokens: tuple) -> bool:
     return any(tok in s for tok in tokens)
 
 
+def _scan_name_value_pair(prefix: str, d: dict, raw_signals: dict,
+                          verbose: bool) -> None:
+    """Specialised scanner for SMC's ``{"name": "...", "value": "..."}``
+    diagnostic entries.
+
+    The Forcepoint 7.1 diagnostic endpoint returns ssh state as a list
+    of entries shaped like ``{"name": "SSH daemon", "value": "Running",
+    "status": "Ok"}`` (and sometimes nested under ``{"diagnostic": ...}``
+    — handled by the caller). Each entry's name/value pair is what we
+    want to classify, NOT the dict's own keys.
+
+    Also handles generic dicts where the ssh field is a top-level key.
+    """
+    name = d.get("name") or d.get("Name") or ""
+    val_keys = ("value", "current_value", "status", "state", "running")
+    value = None
+    for k in val_keys:
+        if k in d and d[k] is not None:
+            value = d[k]
+            break
+
+    name_l = str(name).strip().lower()
+    if name_l and value is not None:
+        # Synthetic flat key so the verbose dump groups cleanly.
+        key = f"{prefix}.{name_l.replace(' ', '_')}"
+        if verbose or "ssh" in name_l:
+            raw_signals[key] = (
+                value if isinstance(value, (str, int, bool, float))
+                else str(value)
+            )
+    # ALSO scan any straight key/value pairs (some endpoints don't use
+    # the name/value envelope).
+    for k, v in d.items():
+        if k in ("name", "Name", "value", "current_value", "status",
+                 "state", "running", "diagnostic"):
+            continue
+        if "ssh" in str(k).lower():
+            raw_signals[f"{prefix}.{k}"] = (
+                v if isinstance(v, (str, int, bool, float))
+                else str(v)[:160]
+            )
+        elif verbose:
+            raw_signals[f"{prefix}.{k}"] = (
+                v if isinstance(v, (str, int, bool, float))
+                else str(v)[:160]
+            )
+
+
 def get_node_ssh_state(engine_name: str, node_index: int,
                        *, verbose: bool = False) -> dict:
     """Query SMC for the current SSH-daemon state of a cluster node.
@@ -1543,18 +1591,91 @@ def get_node_ssh_state(engine_name: str, node_index: int,
         except Exception as exc:
             raw_signals["node.data.__error"] = f"{type(exc).__name__}: {exc}"
 
-        # 4) Last-resort fetch — Forcepoint 7.x exposes some daemon
-        # status under a `node_status` or `internal_endpoint` link. If
-        # the node has either, fetch them and grep for SSH.
-        if verbose:
-            for rel_name in ("node_status", "internal_endpoint",
-                             "appliance_info", "diagnostic_info"):
-                try:
-                    rel = node.get_relation(rel_name) if hasattr(node, "get_relation") else None
-                    if rel:
-                        raw_signals[f"relation[{rel_name}]"] = str(rel)[:300]
-                except Exception:
-                    pass
+        # 4) Direct sub-resource fetch — Forcepoint 7.1 keeps daemon
+        # state on separate URLs (`diagnostic`, `appliance_status`),
+        # NOT inside `node.status()`. We harvest the URLs from
+        # `node.data.link[*]` and fetch them via the SDK's HTTP layer.
+        # This is the only path that returns ssh_daemon state on the
+        # SDK version we've observed against SMC 7.1.
+        links_by_rel: dict[str, str] = {}
+        try:
+            nd = getattr(node, "data", None)
+            if hasattr(nd, "data"):
+                nd = nd.data
+            if isinstance(nd, dict):
+                for ln in (nd.get("link") or []):
+                    rel = str(ln.get("rel", "") or "")
+                    href = str(ln.get("href", "") or "")
+                    if rel and href:
+                        links_by_rel[rel] = href
+        except Exception as exc:
+            raw_signals["link_parse.__error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        for rel in ("diagnostic", "appliance_status"):
+            href = links_by_rel.get(rel)
+            if not href:
+                continue
+            try:
+                # smc-python's HTTP helper. Returns the parsed JSON dict
+                # (or list) from the SMC API.
+                from smc.api.common import SMCRequest
+                result = SMCRequest(href=href).read()
+            except Exception as exc:
+                raw_signals[f"fetch[{rel}].__error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            # SMC returns diagnostic in a {"diagnostics": [{"diagnostic": {...}}, ...]}
+            # shape on 7.1 (observed). The "name/value" pairs we want
+            # are inside each inner object. Be defensive about both
+            # dict-of-list and list-of-dict variants.
+            if isinstance(result, dict):
+                if verbose:
+                    _scan_dict(f"fetch[{rel}]", result)
+                # Walk anything that looks like a {name, value} list.
+                for v in result.values():
+                    if isinstance(v, list):
+                        for item in v:
+                            if isinstance(item, dict):
+                                # Unwrap nested {"diagnostic": {...}} envelopes.
+                                inner = item.get("diagnostic", item)
+                                if isinstance(inner, dict):
+                                    _scan_name_value_pair(
+                                        f"fetch[{rel}]", inner,
+                                        raw_signals, verbose,
+                                    )
+            elif isinstance(result, list):
+                if verbose:
+                    raw_signals[f"fetch[{rel}].__len"] = len(result)
+                for i, item in enumerate(result):
+                    if isinstance(item, dict):
+                        inner = item.get("diagnostic", item)
+                        if isinstance(inner, dict):
+                            _scan_name_value_pair(
+                                f"fetch[{rel}][{i}]", inner,
+                                raw_signals, verbose,
+                            )
+
+            # Re-run classifier on the harvested fields. _scan_dict
+            # already updates state/source for SSH-named keys, but
+            # _scan_name_value_pair stamps a synthetic key like
+            # `fetch[diagnostic].ssh_daemon` — make sure that wins.
+            for sk, sv in list(raw_signals.items()):
+                if not sk.startswith(f"fetch[{rel}]"):
+                    continue
+                if "ssh" not in sk.lower():
+                    continue
+                if state != "unknown":
+                    break
+                if _matches_ssh_token(sv, _SSH_ENABLED_TOKENS):
+                    state, source = "enabled", sk
+                    break
+                if _matches_ssh_token(sv, _SSH_DISABLED_TOKENS):
+                    state, source = "disabled", sk
+                    break
 
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"
