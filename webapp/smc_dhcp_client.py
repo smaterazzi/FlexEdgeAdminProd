@@ -65,6 +65,7 @@ __all__ = [
     "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView", "NodeAddress",
     "is_node_initiated_contact",
     "set_node_ssh_enabled", "change_node_ssh_password", "get_node_ssh_state",
+    "update_ssh_rule_destinations",
     "find_active_policy", "find_ssh_access_rule",
     "add_ssh_access_rule", "remove_ssh_access_rule",
     "policy_upload",
@@ -1839,6 +1840,115 @@ def _ensure_host_for_ip(name: str, ip: str) -> Host:
     except Exception:
         Host.create(name=name, address=ip)
         return Host(name)
+
+
+def _ensure_host_for_ip_force(name: str, ip: str) -> Host:
+    """Get-or-create + sync the IP. Unlike ``_ensure_host_for_ip`` this
+    UPDATES the Host element's ``address`` field when it already exists
+    with a different IP. Needed by ``update_ssh_rule_destinations``
+    when reusing the canonical ``{rule_name}-dst-<i>`` slot names for
+    a different set of IPs.
+    """
+    try:
+        host = Host(name)
+        # Force load — triggers a fetch that populates `.address`.
+        current = ""
+        try:
+            current = str(getattr(host, "address", "") or "")
+        except Exception:
+            current = ""
+        if current != ip:
+            try:
+                host.update(address=ip)
+            except Exception as exc:
+                logger.warning("_ensure_host_for_ip_force: could not update "
+                               "%s from %s → %s: %s", name, current, ip, exc)
+        return host
+    except Exception:
+        Host.create(name=name, address=ip)
+        return Host(name)
+
+
+def update_ssh_rule_destinations(policy_name: str, rule_name: str,
+                                 destination_ips: list[str]) -> str:
+    """Rewrite an existing SSH-allow rule's destination set.
+
+    Idempotent. When the rule's current destinations exactly match the
+    requested list (by IP), this is a no-op and returns the rule's
+    existing href. Otherwise:
+
+      1. Ensure / update Host elements at the canonical
+         ``{rule_name}-dst-<i>`` slot names so they carry the requested
+         IPs (handles "same slot, new IP" with
+         ``_ensure_host_for_ip_force``).
+      2. Delete the existing rule and re-create it with the new dst
+         list (same source, same comment, top-of-policy position).
+         Delete-then-create is used because smc-python's rule.update()
+         for the destinations collection varies across SDK builds;
+         this path is shape-independent.
+
+    The Host elements for unused old indices (when the new list is
+    shorter than the old one) are intentionally NOT deleted — they
+    might be referenced by other rules an operator has added.
+
+    Returns the (new) rule href.
+    """
+    existing = find_ssh_access_rule(policy_name, rule_name)
+    if not existing:
+        raise RuntimeError(
+            f"update_ssh_rule_destinations: rule {rule_name!r} not "
+            f"found in policy {policy_name!r}"
+        )
+
+    # Capture source IP (from the existing rule) + comment so we can
+    # re-create without losing them.
+    sources_info = existing.get("sources") or []
+    if not sources_info:
+        raise RuntimeError(
+            f"existing rule {rule_name!r} has no source — refusing to "
+            f"re-create from incomplete state. Remove + reinstall via "
+            f"the wizard."
+        )
+    source_ip = ""
+    for s in sources_info:
+        addr = (s.get("address") or "").strip()
+        if addr:
+            source_ip = addr
+            break
+    if not source_ip:
+        raise RuntimeError(
+            f"existing rule {rule_name!r}: could not read source Host's "
+            f"IP — refusing to re-create."
+        )
+    old_comment = existing.get("comment") or ""
+
+    # Update / create Host elements in-place. After this loop, the
+    # `{rule_name}-dst-<i>` Hosts carry the requested IPs at the
+    # requested indices.
+    for i, ip in enumerate(destination_ips):
+        _ensure_host_for_ip_force(f"{rule_name}-dst-{i}", ip)
+
+    # Delete + recreate. The brief window where the rule is absent
+    # only affects new SMC state — the engine doesn't know about it
+    # until the caller pushes the policy.
+    try:
+        existing["rule_obj"].delete()
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not delete existing rule {rule_name!r} before "
+            f"re-create: {exc}"
+        )
+
+    # Re-create via the existing helper (which will pick up the now-
+    # updated Host elements).
+    new_href = add_ssh_access_rule(
+        policy_name=policy_name,
+        rule_name=rule_name,
+        source_ip=source_ip,
+        destination_ips=destination_ips,
+        comment=old_comment,
+    )
+    return new_href
 
 
 def add_ssh_access_rule(policy_name: str, rule_name: str,

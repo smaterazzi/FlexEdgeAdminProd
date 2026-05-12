@@ -168,8 +168,57 @@ def install_ssh_rule(engine_name: str, source_ip: str,
     name = rule_name or rule_name_for(engine_name)
     existing = smc.find_ssh_access_rule(pre.policy_name, name)
     if existing:
-        # Already in place — caller may still want to push policy if the
-        # rule was added but never installed.
+        # 2026-05-13 — compare the requested destination set against
+        # the rule's current destination Host names. The names follow
+        # the canonical `{rule_name}-dst-<i>` pattern; the comparison
+        # is by INDEX COUNT, not by IP (because Host names don't
+        # carry the IP). If counts differ, we know destinations were
+        # added/removed and we re-create the rule via
+        # update_ssh_rule_destinations.
+        #
+        # For "same count, different IPs" we can't distinguish from
+        # Host names alone — but `update_ssh_rule_destinations`
+        # internally calls `_ensure_host_for_ip_force` which syncs
+        # the Host's address to the requested IP regardless. So in
+        # practice: count drift triggers rule re-create; same-count-
+        # different-IP is handled in-place via Host element update
+        # (and we re-create the rule anyway when count differs).
+        managed_count = sum(
+            1 for n in (existing.get("destination_names") or [])
+            if n.startswith(f"{name}-dst-")
+        )
+        requested_count = len(destination_ips)
+        if managed_count != requested_count:
+            try:
+                new_href = smc.update_ssh_rule_destinations(
+                    policy_name=pre.policy_name,
+                    rule_name=name,
+                    destination_ips=destination_ips,
+                )
+                return RuleInstallResult(
+                    ok=True, rule_href=new_href,
+                    rule_name=name, policy_name=pre.policy_name,
+                    already_present=False,  # rule was re-created with new dsts
+                )
+            except Exception as exc:
+                return RuleInstallResult(
+                    ok=False, policy_name=pre.policy_name, rule_name=name,
+                    error=(f"existing rule has {managed_count} destination(s) "
+                           f"but request has {requested_count}; tried to "
+                           f"rewrite and failed: {exc}"),
+                )
+        # Same count — sync Host addresses in case the operator
+        # changed an IP at an existing slot. Then leave the rule's
+        # destination collection alone (it already points at the
+        # same Host names, now updated to the right IPs).
+        try:
+            for i, ip in enumerate(destination_ips):
+                smc._ensure_host_for_ip_force(f"{name}-dst-{i}", ip)
+        except Exception as exc:
+            return RuleInstallResult(
+                ok=False, policy_name=pre.policy_name, rule_name=name,
+                error=f"could not sync destination Host IPs: {exc}",
+            )
         return RuleInstallResult(
             ok=True, rule_href=existing["href"],
             rule_name=name, policy_name=pre.policy_name,
