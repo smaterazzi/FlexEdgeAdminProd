@@ -334,6 +334,39 @@ def enroll_node(engine_name: str, node_index: int,
                   f"(the rule must list the node IP as a destination).",
         )
 
+    # Pre-flight auth-method probe (2026-05-13). Forcepoint engines
+    # can be hardened to refuse password auth — sshd_config sets
+    # `PasswordAuthentication no`. SMC's `change_ssh_pwd` still
+    # succeeds (the password IS set on the engine), but paramiko then
+    # fails with `BadAuthenticationType; allowed_types: ['publickey']`
+    # AFTER we've already burned the rotation. Probe BEFORE rotating
+    # and abort with a specific error so the operator can fix the
+    # engine config without churning the password.
+    from webapp.dhcp_ssh import probe_ssh_auth_methods
+    allowed, probe_err = probe_ssh_auth_methods(target,
+                                                 timeout=tcp_probe_timeout)
+    if not probe_err and allowed and "password" not in [
+            m.lower() for m in allowed]:
+        return EnrollmentResult(
+            ok=False, failed_at_stage="ssh_auth_methods",
+            error=(f"The engine's SSH daemon refuses password "
+                   f"authentication (advertised methods: "
+                   f"{', '.join(allowed)}). FEA uses password auth "
+                   f"only — `authorized_keys` is intentionally never "
+                   f"touched. Fix on the engine: open SMC Management "
+                   f"Client → Engine → General → SSH Daemon and "
+                   f"enable 'Allow Password Authentication' (or the "
+                   f"equivalent for your SMC version). If the engine "
+                   f"is template-hardened, the template needs "
+                   f"updating. Until that's fixed, no password "
+                   f"rotation will help — your previous enrollment's "
+                   f"password IS on the engine but unusable."),
+        )
+    # If the probe itself failed (TCP / banner error), don't block —
+    # fall through to today's behavior and let the existing failure
+    # path surface whatever's actually wrong. The probe is a useful
+    # signal when it works, not a hard gate.
+
     # Stage 3b: change password
     new_password = generate_password()
     try:
@@ -348,6 +381,28 @@ def enroll_node(engine_name: str, node_index: int,
     try:
         fingerprint = first_contact(target, new_password)
     except Exception as exc:
+        # Special-case "publickey-only daemon" — same engine-hardening
+        # cause as the pre-flight probe but surfaced post-rotation (e.g.
+        # the probe was inconclusive). Same actionable error so the
+        # operator doesn't bounce between two different messages for
+        # the same root cause.
+        exc_text = str(exc)
+        if ("Bad authentication type" in exc_text
+                and "publickey" in exc_text
+                and "password" not in exc_text.lower().split("allowed")[-1]):
+            return EnrollmentResult(
+                ok=False, failed_at_stage="ssh_auth_methods",
+                new_password=new_password,
+                error=(f"The engine's SSH daemon refused our password "
+                       f"({exc_text}). FEA uses password auth only. "
+                       f"Fix on the engine: SMC Management Client → "
+                       f"Engine → General → SSH Daemon → enable "
+                       f"'Allow Password Authentication'. The password "
+                       f"FEA just set IS on the engine but unusable "
+                       f"until that flag is on. Re-running this "
+                       f"enrollment will rotate the password again "
+                       f"once the daemon accepts password auth."),
+            )
         return EnrollmentResult(
             ok=False, failed_at_stage="connect",
             new_password=new_password,

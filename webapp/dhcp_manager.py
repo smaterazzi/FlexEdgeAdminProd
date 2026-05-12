@@ -2095,6 +2095,47 @@ def credentials_discover_nodes():
                         "raw_signals": {},
                         "error": f"{type(exc).__name__}: {exc}",
                     }
+            # Auth-method probe per node — tells the operator whether
+            # the engine accepts password auth BEFORE they click
+            # Auto-enroll. Dial host honors the NAT override; falls
+            # back to primary mgt IP otherwise. Probe is opportunistic
+            # (3s timeout) so a slow/offline node doesn't hang Discover.
+            from webapp.dhcp_ssh import (
+                SSHTarget as _SSHTarget, probe_ssh_auth_methods,
+            )
+            auth_methods_by_index: dict[int, dict] = {}
+            for n in nodes:
+                # Pick the most likely-reachable IP for the probe.
+                probe_ip = ""
+                for a in n.addresses:
+                    publics = [c["address"] for c in a.contact_addresses
+                               if c.get("is_public") and c.get("address")]
+                    if publics and a.is_primary_mgt:
+                        probe_ip = publics[0]
+                        break
+                if not probe_ip:
+                    probe_ip = n.primary_address or ""
+                if not probe_ip:
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": [], "error": "no candidate IP",
+                        "probe_host": "",
+                    }
+                    continue
+                try:
+                    methods, err = probe_ssh_auth_methods(
+                        _SSHTarget(hostname=probe_ip, port=22,
+                                   username="root"),
+                        timeout=3,
+                    )
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": methods, "error": err,
+                        "probe_host": probe_ip,
+                    }
+                except Exception as exc:
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": [], "error": f"{type(exc).__name__}: {exc}",
+                        "probe_host": probe_ip,
+                    }
             try:
                 policy_name = find_active_policy(engine_name)
             except Exception as exc:
@@ -2238,6 +2279,13 @@ def credentials_discover_nodes():
                 "ssh_state": ssh_state_by_index.get(n.node_index, {}).get("state", "unknown"),
                 "ssh_state_source": ssh_state_by_index.get(n.node_index, {}).get("source", ""),
                 "ssh_state_error": ssh_state_by_index.get(n.node_index, {}).get("error", ""),
+                # 2026-05-13 — auth-method probe. Catches engines
+                # hardened to publickey-only BEFORE we burn a password
+                # rotation. Empty list + non-empty error = probe couldn't
+                # talk to the daemon (TCP / banner failure).
+                "ssh_auth_methods": auth_methods_by_index.get(n.node_index, {}).get("methods", []),
+                "ssh_auth_methods_error": auth_methods_by_index.get(n.node_index, {}).get("error", ""),
+                "ssh_auth_methods_probe_host": auth_methods_by_index.get(n.node_index, {}).get("probe_host", ""),
                 # Echo the persisted override, if any. Phase 5 fills this
                 # when the operator confirms during enrollment; this read
                 # path lets the UI show the current override on a node
