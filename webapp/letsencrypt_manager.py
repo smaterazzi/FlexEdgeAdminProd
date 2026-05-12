@@ -201,12 +201,18 @@ def list_certs():
     else:
         certs = qry.order_by(ManagedCertificate.created_at.desc()).all()
 
-    # Pattern-count signal for the empty-state CTA. Cheap (indexed by
-    # domain_id, no joins) — skip entirely for Super since they see
-    # certs across all Domains and the "configure your allowlist"
-    # prompt only makes sense in a single-Domain context.
-    patterns_count = 0
-    if domain is not None and not _is_super():
+    # Pattern-count signal for the empty-state CTA. Counts patterns on
+    # the active Domain regardless of role — Super with an active
+    # Domain still sees their Domain's count (previously the gate was
+    # gated on `not _is_super()`, which incorrectly forced 0 for Super
+    # and made the "Configure allowlist" CTA appear even when the
+    # Domain already had patterns).
+    #
+    # `patterns_count` stays None when there is no active Domain — the
+    # template renders a different, traversable CTA in that case ("Pick
+    # a Domain in the topbar first").
+    patterns_count: Optional[int] = None
+    if domain is not None:
         patterns_count = (DomainCertPattern.query
                           .filter_by(domain_id=domain.id).count())
 
@@ -214,6 +220,8 @@ def list_certs():
         "tls/letsencrypt/list.html",
         certs=certs, account=account,
         patterns_count=patterns_count,
+        has_active_domain=(domain is not None),
+        active_domain=domain,
     )
 
 
