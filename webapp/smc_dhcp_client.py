@@ -1398,28 +1398,52 @@ def _matches_ssh_token(value, tokens: tuple) -> bool:
     return any(tok in s for tok in tokens)
 
 
-def get_node_ssh_state(engine_name: str, node_index: int) -> dict:
+def get_node_ssh_state(engine_name: str, node_index: int,
+                       *, verbose: bool = False) -> dict:
     """Query SMC for the current SSH-daemon state of a cluster node.
 
     Returns ``{"state": "enabled"|"disabled"|"unknown", "source": str,
-    "raw_signals": dict, "error": str}``. Best-effort — SMC doesn't
-    expose a single canonical "is SSH on" boolean across versions, so
-    this helper probes every field name we've observed:
-
-      * ``node.status()`` → ApplianceStatus attribute scan
-      * ``node.appliance_status`` (newer SDK) → same scan
-      * ``node.data.data`` raw dict — grep for keys containing "ssh"
-
-    The first probe that returns a recognisable value wins. ``state``
-    falls back to ``"unknown"`` rather than raising; ``raw_signals``
-    surfaces every probed value verbatim so the operator can inspect
-    via the 🐛 debug endpoint and tell us which field SMC actually
-    uses on their version.
+    "raw_signals": dict, "error": str}``. With ``verbose=True``
+    additionally populates ``raw_signals`` with a FULL dump of every
+    field SMC returned (status / appliance_status / node.data /
+    sub-resource links) — this is what the 🐛 debug endpoint uses to
+    surface fields we haven't yet recognised. Normal callers pass
+    ``verbose=False`` (default) so the discover-nodes payload stays
+    small.
     """
     raw_signals: dict = {}
     state = "unknown"
     source = ""
     error = ""
+
+    def _scan_dict(prefix: str, d: dict) -> None:
+        """Walk a dict and (a) record every key/value in `raw_signals`
+        when verbose, (b) classify any key containing "ssh" against
+        the token lists to set state/source. Stops at the first
+        recognisable enabled/disabled match."""
+        nonlocal state, source
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            kl = str(k).lower()
+            # In verbose mode, capture every top-level field so we can
+            # eyeball SMC's actual payload shape.
+            if verbose:
+                val_repr = (v if isinstance(v, (str, int, bool, float))
+                            else (str(v)[:160] + "…" if len(str(v)) > 160
+                                  else str(v)))
+                raw_signals[f"{prefix}.{k}"] = val_repr
+            elif "ssh" in kl:
+                raw_signals[f"{prefix}.{k}"] = (
+                    v if isinstance(v, (str, int, bool, float))
+                    else str(v)
+                )
+            # Classify by name + value.
+            if "ssh" in kl and state == "unknown":
+                if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
+                    state, source = "enabled", f"{prefix}.{k}"
+                elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
+                    state, source = "disabled", f"{prefix}.{k}"
 
     try:
         engine = Engine(engine_name)
@@ -1432,10 +1456,9 @@ def get_node_ssh_state(engine_name: str, node_index: int) -> dict:
             }
         node = nodes[node_index]
 
-        # 1) node.status() — the existing path used by engine_inquiry.
+        # 1) node.status() — ApplianceStatus.
         try:
             st = node.status()
-            # Probe every attribute name we've ever seen carry SSH state.
             for key in ("ssh_daemon", "ssh", "ssh_status",
                         "ssh_enabled", "sshd_running"):
                 v = getattr(st, key, None)
@@ -1443,46 +1466,41 @@ def get_node_ssh_state(engine_name: str, node_index: int) -> dict:
                     raw_signals[f"status.{key}"] = str(v)
                     if state == "unknown":
                         if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
-                            state = "enabled"
-                            source = f"status.{key}"
+                            state, source = "enabled", f"status.{key}"
                         elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
-                            state = "disabled"
-                            source = f"status.{key}"
-            # Some SDKs let us iterate ApplianceStatus as dict-like;
-            # capture every key whose name contains "ssh".
+                            state, source = "disabled", f"status.{key}"
+            if verbose:
+                # Dump ALL public attributes (not just SSH-keyed) so we
+                # can spot the right field on an unfamiliar SMC version.
+                for attr in dir(st):
+                    if attr.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(st, attr, None)
+                        if callable(val):
+                            continue
+                        raw_signals[f"status.@{attr}"] = (
+                            val if isinstance(val, (str, int, bool, float))
+                            else str(val)[:160]
+                        )
+                    except Exception:
+                        pass
             try:
-                if hasattr(st, "data"):
-                    sd = st.data
-                    if hasattr(sd, "data"):
-                        sd = sd.data
-                    if isinstance(sd, dict):
-                        for k, v in sd.items():
-                            if "ssh" in str(k).lower():
-                                raw_signals[f"status.data.{k}"] = (
-                                    v if isinstance(v, (str, int, bool))
-                                    else str(v)
-                                )
-                                if state == "unknown":
-                                    if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
-                                        state, source = "enabled", f"status.data.{k}"
-                                    elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
-                                        state, source = "disabled", f"status.data.{k}"
+                sd = getattr(st, "data", None)
+                if hasattr(sd, "data"):
+                    sd = sd.data
+                _scan_dict("status.data", sd if isinstance(sd, dict) else {})
             except Exception as exc:
-                raw_signals["status.data.__error"] = (
-                    f"{type(exc).__name__}: {exc}"
-                )
+                raw_signals["status.data.__error"] = f"{type(exc).__name__}: {exc}"
         except Exception as exc:
             raw_signals["status.__error"] = f"{type(exc).__name__}: {exc}"
 
-        # 2) node.appliance_status (newer SDK property — different from .status()).
+        # 2) node.appliance_status (newer SDK property).
         try:
             ast = getattr(node, "appliance_status", None)
-            # Could be a property returning ApplianceStatus, or a method,
-            # or a dict. Handle each.
             if callable(ast):
                 ast = ast()
             if ast is not None:
-                # Attribute scan
                 for key in ("ssh_daemon", "ssh", "ssh_status",
                             "ssh_enabled", "sshd_running"):
                     v = getattr(ast, key, None)
@@ -1493,23 +1511,12 @@ def get_node_ssh_state(engine_name: str, node_index: int) -> dict:
                                 state, source = "enabled", f"appliance_status.{key}"
                             elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
                                 state, source = "disabled", f"appliance_status.{key}"
-                # Raw dict scan
                 try:
                     sd = getattr(ast, "data", ast)
                     if hasattr(sd, "data"):
                         sd = sd.data
-                    if isinstance(sd, dict):
-                        for k, v in sd.items():
-                            if "ssh" in str(k).lower():
-                                raw_signals[f"appliance_status.data.{k}"] = (
-                                    v if isinstance(v, (str, int, bool))
-                                    else str(v)
-                                )
-                                if state == "unknown":
-                                    if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
-                                        state, source = "enabled", f"appliance_status.data.{k}"
-                                    elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
-                                        state, source = "disabled", f"appliance_status.data.{k}"
+                    _scan_dict("appliance_status.data",
+                               sd if isinstance(sd, dict) else {})
                 except Exception as exc:
                     raw_signals["appliance_status.data.__error"] = (
                         f"{type(exc).__name__}: {exc}"
@@ -1519,27 +1526,35 @@ def get_node_ssh_state(engine_name: str, node_index: int) -> dict:
                 f"{type(exc).__name__}: {exc}"
             )
 
-        # 3) node.data.data — the raw Node element JSON.
+        # 3) node.data.data — raw Node element JSON.
         try:
             nd = getattr(node, "data", None)
             if hasattr(nd, "data"):
                 nd = nd.data
             if isinstance(nd, dict):
-                for k, v in nd.items():
-                    if "ssh" in str(k).lower():
-                        raw_signals[f"node.data.{k}"] = (
-                            v if isinstance(v, (str, int, bool))
-                            else str(v)
-                        )
-                        if state == "unknown":
-                            if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
-                                state, source = "enabled", f"node.data.{k}"
-                            elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
-                                state, source = "disabled", f"node.data.{k}"
+                _scan_dict("node.data", nd)
+                # Sub-resource links — interesting on its own.
+                if verbose:
+                    for ln in (nd.get("link") or []):
+                        rel = str(ln.get("rel", "") or "")
+                        href = str(ln.get("href", "") or "")
+                        if rel:
+                            raw_signals[f"node.link[{rel}]"] = href
         except Exception as exc:
-            raw_signals["node.data.__error"] = (
-                f"{type(exc).__name__}: {exc}"
-            )
+            raw_signals["node.data.__error"] = f"{type(exc).__name__}: {exc}"
+
+        # 4) Last-resort fetch — Forcepoint 7.x exposes some daemon
+        # status under a `node_status` or `internal_endpoint` link. If
+        # the node has either, fetch them and grep for SSH.
+        if verbose:
+            for rel_name in ("node_status", "internal_endpoint",
+                             "appliance_info", "diagnostic_info"):
+                try:
+                    rel = node.get_relation(rel_name) if hasattr(node, "get_relation") else None
+                    if rel:
+                        raw_signals[f"relation[{rel_name}]"] = str(rel)[:300]
+                except Exception:
+                    pass
 
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

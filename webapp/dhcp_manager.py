@@ -4658,9 +4658,11 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
                                         _parse_inline_contact_addresses)
 
             # 3) Joined view — what the wizard ends up seeing. Also
-            # includes the per-node SSH-daemon state probe so we can
-            # see which field SMC actually carries the daemon state in
-            # for this engine + SDK version.
+            # includes the per-node SSH-daemon state probe with
+            # verbose=True so EVERY field SMC returns (not just those
+            # whose name contains "ssh") shows up in raw_signals. We
+            # need this dump to figure out which field SMC 7.1
+            # actually carries the daemon state in.
             from webapp.smc_dhcp_client import get_node_ssh_state
             joined_nodes = []
             for n in list_cluster_nodes(engine_name):
@@ -4668,7 +4670,9 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
                     "node_index": n.node_index,
                     "node_id": n.node_id,
                     "name": n.name,
-                    "ssh_state": get_node_ssh_state(engine_name, n.node_index),
+                    "ssh_state": get_node_ssh_state(
+                        engine_name, n.node_index, verbose=True,
+                    ),
                     "addresses": [
                         {
                             "interface_id": a.interface_id,
