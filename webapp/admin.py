@@ -21,6 +21,7 @@ from sqlalchemy.exc import IntegrityError
 from shared.db import db
 from shared.encryption import KEY_FILE, hash_value
 from webapp.models import Tenant, User, ApiKey, Domain, UserDomainAccess
+from webapp.auth_roles import super_admin_required
 
 
 def _friendly_db_error(exc: Exception, action: str) -> str:
@@ -82,14 +83,14 @@ def dashboard():
 # ── Tenants ─────────────────────────────────────────────────────────────
 
 @admin_bp.route("/tenants")
-@admin_required
+@super_admin_required
 def tenants():
     items = Tenant.query.order_by(Tenant.name).all()
     return render_template("admin/tenants.html", tenants=items)
 
 
 @admin_bp.route("/tenants/new", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def tenant_new():
     if request.method == "POST":
         tenant = Tenant(
@@ -113,7 +114,7 @@ def tenant_new():
 
 
 @admin_bp.route("/tenants/<int:id>/edit", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def tenant_edit(id):
     tenant = Tenant.query.get_or_404(id)
     if request.method == "POST":
@@ -135,7 +136,7 @@ def tenant_edit(id):
 
 
 @admin_bp.route("/tenants/<int:id>/delete", methods=["POST"])
-@admin_required
+@super_admin_required
 def tenant_delete(id):
     tenant = Tenant.query.get_or_404(id)
     tenant.is_active = False
@@ -172,7 +173,7 @@ def _ensure_unique_slug(base_slug: str) -> str:
 
 
 @admin_bp.route("/domains")
-@admin_required
+@super_admin_required
 def domains():
     items = (Domain.query
              .order_by(Domain.is_active.desc(), Domain.display_name)
@@ -181,7 +182,7 @@ def domains():
 
 
 @admin_bp.route("/domains/new", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def domain_new():
     if request.method == "POST":
         api_key_id = int(request.form["api_key_id"])
@@ -221,7 +222,7 @@ def domain_new():
 
 
 @admin_bp.route("/domains/<int:id>/edit", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def domain_edit(id):
     domain = Domain.query.get_or_404(id)
     if request.method == "POST":
@@ -249,7 +250,7 @@ def domain_edit(id):
 
 
 @admin_bp.route("/domains/<int:id>/delete", methods=["POST"])
-@admin_required
+@super_admin_required
 def domain_delete(id):
     """Soft-delete (deactivate) — actual rows stay because feature data
     references domain_id with ON DELETE CASCADE. Hard-delete via DB only
@@ -263,7 +264,7 @@ def domain_delete(id):
 
 
 @admin_bp.route("/domains/<int:id>/reactivate", methods=["POST"])
-@admin_required
+@super_admin_required
 def domain_reactivate(id):
     domain = Domain.query.get_or_404(id)
     domain.is_active = True
@@ -277,7 +278,19 @@ def domain_reactivate(id):
 @admin_bp.route("/users")
 @admin_required
 def users():
-    items = User.query.order_by(User.email).all()
+    # M7 (audit fix-up, 2026-05-09): eager-load Domain on each user's
+    # `domain_accesses`. `User.domain_accesses` is already `lazy="joined"`,
+    # but `access.domain` is the default lazy-select — the template's
+    # `{% for access in u.domain_accesses %}{{ access.domain.display_name }}`
+    # loop fires one SELECT per access. selectinload batches all Domain
+    # PKs into a single IN query.
+    from sqlalchemy.orm import selectinload
+    from webapp.models import UserDomainAccess
+    items = (User.query
+             .options(selectinload(User.domain_accesses)
+                      .joinedload(UserDomainAccess.domain))
+             .order_by(User.email)
+             .all())
     return render_template("admin/users.html", users=items)
 
 
@@ -612,14 +625,14 @@ def _update_user_domain_accesses(user, form):
 # ── API Keys ────────────────────────────────────────────────────────────
 
 @admin_bp.route("/api-keys")
-@admin_required
+@super_admin_required
 def api_keys():
     items = ApiKey.query.order_by(ApiKey.created_at.desc()).all()
     return render_template("admin/api_keys.html", api_keys=items)
 
 
 @admin_bp.route("/api-keys/new", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def api_key_new():
     """Create an ApiKey + auto-create the matching backing Tenant + Domain.
 
@@ -722,7 +735,7 @@ def api_key_new():
 
 
 @admin_bp.route("/api-keys/<int:id>/revoke", methods=["POST"])
-@admin_required
+@super_admin_required
 def api_key_revoke(id):
     key = ApiKey.query.get_or_404(id)
     key.is_active = False
@@ -732,7 +745,7 @@ def api_key_revoke(id):
 
 
 @admin_bp.route("/api-keys/<int:id>/reactivate", methods=["POST"])
-@admin_required
+@super_admin_required
 def api_key_reactivate(id):
     """Re-enable a previously revoked key.
 
@@ -750,7 +763,7 @@ def api_key_reactivate(id):
 
 
 @admin_bp.route("/api-keys/<int:id>/delete", methods=["POST"])
-@admin_required
+@super_admin_required
 def api_key_delete(id):
     """Hard-delete an API key — destructive.
 
@@ -803,7 +816,7 @@ def api_key_delete(id):
 # ── Backup ──────────────────────────────────────────────────────────────
 
 @admin_bp.route("/backup")
-@admin_required
+@super_admin_required
 def backup():
     """Download a ZIP containing the database and encryption key."""
     import os
@@ -831,7 +844,7 @@ def backup():
 # ── JSON Migration ──────────────────────────────────────────────────────
 
 @admin_bp.route("/migrate-json", methods=["POST"])
-@admin_required
+@super_admin_required
 def migrate_json():
     """One-time migration from JSON config files to database."""
     import json
@@ -947,7 +960,7 @@ def migrate_json():
 # manual sweep trigger.
 
 @admin_bp.route("/log-settings", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def log_settings():
     """Display + update the platform log configuration AND the per-Domain
     bypass-queue capability matrix (Phase E.2).
@@ -1078,7 +1091,7 @@ def log_settings():
 # `smc_cache.reload_ttl_settings()`.
 
 @admin_bp.route("/cache-settings", methods=["GET", "POST"])
-@admin_required
+@super_admin_required
 def cache_settings():
     from shared.logging import set_setting
     from shared.smc_cache import (

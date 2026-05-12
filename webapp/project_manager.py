@@ -68,16 +68,20 @@ def get_project(project_id):
     return _read_json(manifest)
 
 
-def create_project(name, config_file_path, config_filename):
+def create_project(name, config_file_path, config_filename,
+                   domain_slug: str = "", created_by_email: str = ""):
     """Create a new project from a FortiGate config file.
 
     Args:
-        name: Human-readable project name
-        config_file_path: Path to the uploaded .conf file (temporary)
-        config_filename: Original filename
-
-    Returns:
-        Project manifest dict
+        name: Human-readable project name.
+        config_file_path: Path to the uploaded .conf file (temporary).
+        config_filename: Original filename.
+        domain_slug: Slug of the Domain the project belongs to. Stamped at
+            creation; later loaded only by routes whose active Domain matches.
+            Empty string allowed for legacy / non-Domain-aware callers
+            (e.g. CLI). Routes that enforce Domain matching will treat empty
+            as "matches active" for backwards compatibility.
+        created_by_email: Operator who created the project (audit trail).
     """
     _ensure_projects_dir()
     project_id = str(uuid.uuid4())[:8]
@@ -97,11 +101,14 @@ def create_project(name, config_file_path, config_filename):
         "status": "created",
         "source_file": config_filename,
         "source_hostname": "",
+        "domain_slug": (domain_slug or "").strip(),
+        "created_by_email": (created_by_email or "").strip().lower(),
+        # C1 (audit fix-up, 2026-05-09): plaintext SMC credentials are
+        # NEVER persisted on the project file. The ``smc_url`` /
+        # ``api_key`` / ``domain`` / ``verify_ssl`` are resolved at run-
+        # time from the active Domain row (`g.api_key_obj`). The only
+        # fields persisted here are project-specific operator choices.
         "target": {
-            "smc_url": "",
-            "api_key": "",
-            "domain": "",
-            "verify_ssl": False,
             "policy_name": "",
             "object_prefix": "FGT-",
         },

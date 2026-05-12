@@ -38,7 +38,7 @@ import re
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from webapp.dhcp_ssh import SSHTarget, SSHCredential, ssh_connect
 
@@ -176,7 +176,7 @@ def parse_port_list(raw: str) -> list[int]:
 # Shell builtins (printf, echo, [, read, set, wait, for, :) do NOT
 # need the prefix — ash handles those directly.
 _SCAN_SCRIPT = r"""
-BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; VERBOSE=$7; shift 7
+BATCH=$1; PT=$2; AT=$3; CT=$4; DT=$5; PORTS=$6; VERBOSE=$7; LAZY=$8; shift 8
 TMP=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan.$$)
 REACHABLE=$(busybox mktemp 2>/dev/null || echo /tmp/.fea-escan-r.$$)
 : > "$TMP"
@@ -189,7 +189,20 @@ for ip in "$@"; do
     (
         [ "$VERBOSE" = "1" ] && printf 'EXEC busybox ping -c 1 -W %s -q %s\n' "$PT" "$ip"
         if busybox ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
-            NEIGH=$(busybox ip neighbor show "$ip" 2>/dev/null | busybox head -1)
+            # BusyBox's `ip` applet uses `neigh`, NOT `neighbor` — the
+            # long form is silently unrecognized and produces empty
+            # output (confirmed 2026-05-09 against BusyBox 1.35.0 on
+            # Forcepoint NGFW). Use the short verb. Also filter by IP
+            # ourselves in awk on field 1, preferring REACHABLE state
+            # over STALE/PROBE/etc., because the BusyBox `ip` doesn't
+            # reliably honor the IP filter argument either.
+            NEIGH=$(busybox ip neigh show 2>/dev/null | busybox awk -v IP="$ip" '
+                $1 == IP && /lladdr/ {
+                    if (/REACHABLE/) { print; have_reach = 1; exit }
+                    if (!fallback) fallback = $0
+                }
+                END { if (!have_reach && fallback) print fallback }
+            ')
             MAC=$(printf '%s\n' "$NEIGH" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
             if [ -n "$MAC" ]; then
                 printf '%s ICMP_OK %s\n' "$ip" "$MAC"
@@ -268,8 +281,17 @@ done < "$TMP"
 # we'd need a Python-side paramiko TCP probe instead of nc.
 if [ -n "$PORTS" ]; then
     NPORTS=$(printf '%s' "$PORTS" | busybox tr ',' '\n' | busybox wc -l)
-    printf 'EXEC === Phase 3 (TCP port probe) starting: %s targets x %s ports ===\n' "$#" "$NPORTS"
+    printf 'EXEC === Phase 3 (TCP port probe) starting: %s targets x %s ports%s ===\n' \
+        "$#" "$NPORTS" "$([ "$LAZY" = "1" ] && printf ' (LAZY: 1-3s pause/host)')"
     for ip in "$@"; do
+        if [ "$LAZY" = "1" ]; then
+            # Random 1-3s pause between hosts. busybox awk's rand() is
+            # seeded with the wall clock to avoid identical sleeps if
+            # the script runs multiple times in the same second.
+            DELAY=$(busybox awk 'BEGIN{srand(); print 1 + int(rand()*3)}')
+            printf 'EXEC === lazy delay: %ss before %s ===\n' "$DELAY" "$ip"
+            busybox sleep "$DELAY"
+        fi
         for port in $(printf '%s' "$PORTS" | busybox tr ',' ' '); do
             (
                 [ "$VERBOSE" = "1" ] && printf 'EXEC busybox timeout %s busybox nc %s %s\n' "$CT" "$ip" "$port"
@@ -361,7 +383,9 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
               dns_timeout_s: int = 2,
               exec_timeout_s: int = 900,
               verbose: bool = False,
+              lazy: bool = False,
               debug_log_path: Optional[str] = None,
+              on_channel_open: Optional[Callable[[Any], None]] = None,
               on_event: Optional[EventCallback] = None,
               ) -> tuple[dict[str, HostResult], dict, str]:
     """Open SSH, run the scan script, parse stdout line-by-line.
@@ -381,7 +405,8 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
                  str(ping_timeout_s), str(arping_timeout_s),
                  str(port_timeout_s), str(dns_timeout_s),
                  ",".join(str(p) for p in ports),
-                 "1" if verbose else "0"]
+                 "1" if verbose else "0",
+                 "1" if lazy else "0"]
     cmd_parts.extend(ip_list)
     cmd = " ".join(shlex.quote(p) for p in cmd_parts)
 
@@ -440,6 +465,16 @@ def _run_scan(target: SSHTarget, cred: SSHCredential, *,
         # parser instead of being swallowed until exit.
         _, stdout, stderr = client.exec_command(
             cmd, timeout=exec_timeout_s, get_pty=True)
+        # Hand the channel to the runner so it can register a cancel
+        # hook (close-from-another-thread). When the operator clicks
+        # STOP in the watcher, the hook closes this channel, which
+        # makes the readline() loop below return EOF and we exit
+        # cleanly with a "cancelled" error.
+        if on_channel_open is not None:
+            try:
+                on_channel_open(stdout.channel)
+            except Exception:
+                log.exception("on_channel_open callback raised — ignored")
         for raw in iter(stdout.readline, ''):
             # Tee EVERY raw line to the per-scan debug file BEFORE
             # any parsing — that way even malformed/unexpected output
@@ -555,7 +590,9 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
          dns_timeout_s: int = 2,
          exec_timeout_s: int = 900,
          verbose: bool = False,
+         lazy: bool = False,
          debug_log_path: Optional[str] = None,
+         on_channel_open: Optional[Callable[[Any], None]] = None,
          on_event: Optional[EventCallback] = None,
          ) -> EngineScanReport:
     """Synchronous engine-side scan. Returns an EngineScanReport.
@@ -604,7 +641,9 @@ def scan(target: SSHTarget, cred: SSHCredential, *,
         dns_timeout_s=dns_timeout_s,
         exec_timeout_s=exec_timeout_s,
         verbose=verbose,
+        lazy=lazy,
         debug_log_path=debug_log_path,
+        on_channel_open=on_channel_open,
         on_event=on_event,
     )
     report.results = results

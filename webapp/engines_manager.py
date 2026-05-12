@@ -80,14 +80,17 @@ def _user_cfg() -> dict:
     """Build the dict-shaped SMC config from the current session.
 
     Mirrors ``app.get_user_cfg()`` — duplicated here to avoid importing
-    from app.py (circular import on blueprint registration).
+    from app.py (circular import on blueprint registration). Plaintext
+    API key resolved via `user_manager.active_api_key_plaintext` (H2
+    audit fix-up — no plaintext in the session cookie).
     """
     profile = session.get("active_profile") or {}
     if not profile:
         raise ValueError("No SMC profile selected.")
+    import user_manager
     return {
         "smc_url":      profile["smc_url"],
-        "api_key":      profile["api_key"],
+        "api_key":      user_manager.active_api_key_plaintext(profile),
         "verify_ssl":   profile.get("verify_ssl", False),
         "timeout":      profile.get("timeout", 120),
         "domain":       session.get("active_domain"),
@@ -117,29 +120,24 @@ def list_tcp_services_for_picker(domain_id: int, cfg: dict) -> list[dict]:
     are skipped because expanding "TCP All" (1-65535) into the
     operator's port list would never be what they meant.
 
-    Uses the same ``smc.explorer.tcp_services`` cache section as
-    ``resolve_port_services`` (key ``(domain_id, "", "")``) so a
-    single cache miss serves both helpers. Empty list on any failure
-    — picker degrades gracefully to typing-only input.
+    Uses the shared ``element_list.tcp_services`` cache section via
+    ``domain_objects.elements`` (key ``(domain_id, "", "")``) so a visit
+    to ``/browse/tcp_services`` primes this picker for free, and vice
+    versa. Empty list on any failure — picker degrades gracefully to
+    typing-only input.
     """
-    from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
-    from webapp import smc_client
+    from webapp import domain_objects
+    from webapp.models import Domain
 
-    if not cfg:
+    if not cfg or not domain_id:
         return []
 
-    def _fetch():
-        with smc_client.smc_session(cfg):
-            return smc_client.list_elements("tcp_services")
-
+    # Use the shared element_list cache so a visit to /browse/tcp_services
+    # primes the picker for free, and vice versa.
     try:
-        cv = cache_get_or_fetch(
-            section="smc.explorer.tcp_services",
-            key_parts=(domain_id, "", ""),
-            fetcher=_fetch,
-            ttl=get_quick_ttl(),
-        )
-        elements = cv.data or []
+        domain = Domain.query.get(domain_id)
+        elements, _cv = domain_objects.elements(
+            domain, cfg, "tcp_services", "", False)
     except Exception as exc:
         log.warning("tcp_services picker fetch failed: %s", exc)
         return []
@@ -176,9 +174,9 @@ def list_tcp_services_for_picker(domain_id: int, cfg: dict) -> list[dict]:
 def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
     """Build a ``{port: service_name}`` map from cached SMC tcp/udp_services.
 
-    Reuses the SMC Explorer cache sections (``smc.explorer.tcp_services``
-    / ``smc.explorer.udp_services``, key ``(domain_id, "", "")``) so the
-    lookup is free if the operator has already visited
+    Reuses the shared SMC Explorer cache sections (``element_list.tcp_services``
+    / ``element_list.udp_services``) via ``domain_objects.elements`` so
+    the lookup is free if the operator has already visited
     ``/browse/tcp_services`` in the last hour, and lives off the queue
     runner's auto-invalidation otherwise. Empty dict on failure — caller
     falls back to bare port numbers in the result table.
@@ -194,28 +192,19 @@ def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
     callers in different blueprints (engines, scan_history) don't pull
     each other in.
     """
-    from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
-    from webapp import smc_client
+    from webapp import domain_objects
+    from webapp.models import Domain
 
-    if not cfg:
+    if not cfg or not domain_id:
         return {}
 
-    def _make_fetcher(tk: str):
-        def _f():
-            with smc_client.smc_session(cfg):
-                return smc_client.list_elements(tk)
-        return _f
-
+    domain = Domain.query.get(domain_id)
     elements: list[dict] = []
     for type_key in ("tcp_services", "udp_services"):
         try:
-            cv = cache_get_or_fetch(
-                section=f"smc.explorer.{type_key}",
-                key_parts=(domain_id, "", ""),
-                fetcher=_make_fetcher(type_key),
-                ttl=get_quick_ttl(),
-            )
-            elements.extend(cv.data or [])
+            data, _cv = domain_objects.elements(
+                domain, cfg, type_key, "", False)
+            elements.extend(data or [])
         except Exception as exc:
             log.warning("port_services lookup (%s) failed: %s",
                         type_key, exc)
@@ -292,10 +281,8 @@ def clusters():
     the operator forces a live SMC fetch via ``?refresh=1`` (wired to
     the "Refresh from SMC" button on the page).
     """
-    import hashlib
-    from shared.smc_cache import (
-        cache_get_or_fetch, invalidate, get_loose_ttl,
-    )
+    from shared.smc_cache import invalidate
+    from webapp import domain_objects
     from webapp.models import DhcpEngineSshAccess
 
     try:
@@ -305,22 +292,15 @@ def clusters():
         refresh_requested = (request.args.get("refresh") == "1")
 
         # Q5 family-wide refresh: refreshing the engines list also clears
-        # every cached cluster_detail entry for THIS Domain. Operator's
+        # every cached cluster detail entry for THIS Domain. Operator's
         # mental model is "give me current data on the whole engines
         # feature" — narrow per-section refresh would force them to also
-        # click Refresh on every cluster_detail page they later visit.
+        # click Refresh on every cluster detail page they later visit.
         if refresh_requested:
-            invalidate("engines.detail")
+            invalidate("cluster")
 
-        cv = cache_get_or_fetch(
-            section="engines.list",
-            # Phase B.2: domain_id alone identifies (server, smc-domain, key)
-            # — replaces the legacy (tenant_id, domain_name, api_key_hash) tuple.
-            key_parts=(domain_id,),
-            fetcher=lambda: engine_inquiry.list_clusters(cfg),
-            ttl=get_loose_ttl(),       # Loose refresh — read-only inventory
-            refresh=refresh_requested,
-        )
+        engines_list, cv = domain_objects.engines(
+            domain_obj, cfg, refresh=refresh_requested)
         # Surface which engines have FlexEdge state (creds and/or SSH
         # rule) so the template can show a "Forget" button only when
         # the operator has something to clean up.
@@ -337,7 +317,7 @@ def clusters():
         return render_template("error.html", message=str(exc))
     return render_template(
         "engines/clusters.html",
-        engines=cv.data,
+        engines=engines_list,
         cache_meta=cv,
         managed_engine_names=managed_engine_names,
         active_tenant=domain_obj,   # template renders .name — Domain has display_name; alias below
@@ -460,8 +440,9 @@ def cluster_forget(engine_name):
     # Drop both the engines list AND this engine's detail entry — the
     # Forget button is the canonical "I'm done with this engine" signal,
     # so any cached deeper view of it is stale.
-    invalidate("engines.list")
-    invalidate("engines.detail", (domain_obj.id, engine_name))
+    invalidate("engines")
+    invalidate("cluster", (domain_obj.id, engine_name))
+    invalidate("scopes", (domain_obj.id, engine_name))
 
     detail = (f"creds_deleted={cred_count} "
               f"access_deleted={'yes' if access else 'no'} "
@@ -501,30 +482,25 @@ def _log_activity_engines(category, action, status, target="", detail=""):
 def cluster_detail(engine_name):
     """Render a single cluster's full detail page.
 
-    Cached read-through ([shared/smc_cache.py](shared/smc_cache.py),
-    section ``engines.detail``, **Loose refresh** (24 h default) per
-    the operator's TTL rule — this is read-only inventory FlexEdge
-    doesn't mutate. The ``?refresh=1`` query param drives the in-page
-    Refresh-from-SMC button. Cache key is ``(domain_id, engine_name)``
-    so two Domains pointing at the same SMC don't share entries.
+    Cached read-through via [webapp/domain_objects.py](webapp/domain_objects.py)
+    ``cluster()`` — section ``cluster``, key ``(domain_id, engine_name)``,
+    **Loose TTL** (24h). The same cached entry serves the cascading-picker
+    JSON endpoint and the DHCP scope-discovery page (Phase 0 cross-feature
+    reuse), so visiting this page primes the cache for everything else.
 
     All work — SMC fetch, DB credential lookup, template render — is wrapped
     in a single try/except. Any exception bubbles up to a friendly
     ``error.html`` page instead of Flask's bare 500 default, *and* gets
     logged with stack trace so we can diagnose without operator screenshots.
     """
-    from shared.smc_cache import cache_get_or_fetch, get_loose_ttl
+    from webapp import domain_objects
 
     try:
         cfg = _user_cfg()
         domain_obj = _current_domain()
-        domain_id = domain_obj.id if domain_obj else 0
 
-        cv = cache_get_or_fetch(
-            section="engines.detail",
-            key_parts=(domain_id, engine_name),
-            fetcher=lambda: engine_inquiry.cluster_detail(cfg, engine_name),
-            ttl=get_loose_ttl(),               # Loose refresh — read-only inventory
+        detail, cv = domain_objects.cluster(
+            domain_obj, cfg, engine_name,
             refresh=(request.args.get("refresh") == "1"),
         )
 
@@ -534,7 +510,7 @@ def cluster_detail(engine_name):
 
         return render_template(
             "engines/cluster_detail.html",
-            detail=cv.data,
+            detail=detail,
             cache_meta=cv,
             creds_by_node=creds_by_node,
         )
@@ -651,27 +627,20 @@ def tools_scan():
     inventory_cache_meta = None
     if not scan_running and not scan_report:
         try:
-            from shared.smc_cache import (
-                cache_get_or_fetch, invalidate, get_loose_ttl,
-            )
+            from shared.smc_cache import invalidate
+            from webapp import domain_objects
             cfg = _user_cfg()
             domain = _current_domain()
-            domain_id = domain.id if domain else 0
 
-            # Q3 + Q5: share the `engines.list` cache section with
-            # /engines/clusters (same data, same key shape) so fetches
-            # are deduped. ?refresh=1 here also fans out per Q5 family-wide.
+            # Q3 + Q5: shares the ``engines`` cache section with
+            # /engines/clusters via domain_objects.engines() — same data,
+            # same key. ?refresh=1 here also fans out family-wide per Q5
+            # (drops every cluster.<engine_name> entry too).
             refresh_requested = (request.args.get("refresh") == "1")
             if refresh_requested:
-                invalidate("engines.detail")
-            cv = cache_get_or_fetch(
-                section="engines.list",
-                key_parts=(domain_id,),
-                fetcher=lambda: engine_inquiry.list_clusters(cfg),
-                ttl=get_loose_ttl(),        # Loose refresh — read-only inventory
-                refresh=refresh_requested,
-            )
-            clusters_summary = cv.data
+                invalidate("cluster")
+            clusters_summary, cv = domain_objects.engines(
+                domain, cfg, refresh=refresh_requested)
             inventory_cache_meta = cv
 
             from webapp.engine_credentials import valid_engines_for_domain
@@ -722,6 +691,15 @@ def tools_scan():
         except Exception as exc:
             log.warning("picker service lists failed: %s", exc)
 
+    # OUI vendor DB status for the picker header card.
+    oui_info = None
+    if not scan_running and not scan_report:
+        try:
+            from webapp import oui_db
+            oui_info = oui_db.info()
+        except Exception as exc:
+            log.warning("oui_db.info() failed: %s", exc)
+
     return render_template(
         "engines/tools_scan.html",
         scan_running=scan_running,
@@ -737,6 +715,7 @@ def tools_scan():
         default_ports_list=list(DEFAULT_PORTS),
         tcp_services_for_picker=tcp_services_for_picker,
         picker_port_services_map=picker_port_services_map,
+        oui_info=oui_info,
     )
 
 
@@ -779,6 +758,7 @@ def tools_scan_start():
     skip_port_scan = request.form.get("skip_port_scan") == "1"
     accept_warning = request.form.get("accept_warning") == "1"
     verbose = request.form.get("verbose") == "1"
+    lazy = request.form.get("lazy") == "1"
 
     if not engine_name or not node_index_raw or not iface_id:
         flash("Pick a cluster, node, and interface first.", "warning")
@@ -817,12 +797,16 @@ def tools_scan_start():
 
     # Resolve interface metadata (subnet + OS-level interface name) by
     # asking the SMC inventory for the cluster's interface walk.
+    # Phase 0 cross-feature reuse: read the cached cluster detail —
+    # operator just clicked through the cluster page or the picker, so
+    # this is a cache hit in the common path.
     iface_subnet_cidr = ""
     iface_label = iface_id + (f".{vlan_id}" if vlan_id else "")
     try:
         cfg = _user_cfg()
-        with __import__("smc_client").smc_session(cfg):
-            detail = engine_inquiry.cluster_detail(cfg, engine_name)
+        from webapp import domain_objects
+        domain = _current_domain()
+        detail, _cv = domain_objects.cluster(domain, cfg, engine_name)
         for iface in detail.interfaces:
             if iface.interface_id == iface_id and (iface.vlan_id or "") == vlan_id:
                 iface_label = (
@@ -921,11 +905,12 @@ def tools_scan_start():
         source_iface_name=iface_label,
         target_label=target_label,
         verbose=verbose,
+        lazy=lazy,
     )
     _log_activity_engines(
         "scan", "scan_started", "ok", target_label,
         f"mode={target_mode} ip_list_size={len(ip_list)} "
-        f"ports={len(ports)} verbose={int(verbose)} "
+        f"ports={len(ports)} verbose={int(verbose)} lazy={int(lazy)} "
         f"scan_id={scan_id[:8]}",
     )
     return redirect(url_for("engines.tools_scan", scan_id=scan_id))
@@ -944,6 +929,128 @@ def tools_scan_status():
     if status is None:
         return jsonify({"error": "not found"}), 404
     return jsonify(status)
+
+
+@engines_bp.route("/tools/scan/oui/info", methods=["GET"])
+@profile_required_admin
+def tools_scan_oui_info():
+    """Status of the local OUI vendor database (path, age, count)."""
+    from webapp import oui_db
+    return jsonify(oui_db.info())
+
+
+@engines_bp.route("/tools/scan/oui/refresh", methods=["POST"])
+@profile_required_admin
+def tools_scan_oui_refresh():
+    """Download the OUI DB from $FEA_OUI_DB_URL (defaults to maclookup.app)
+    and reload it into the in-memory lookup. Flash + redirect back.
+    """
+    from webapp import oui_db
+    result = oui_db.refresh()
+    if result.get("error"):
+        flash(f"OUI refresh failed: {result['error']}", "danger")
+        _log_activity_engines("scan", "oui.refresh", "error",
+                              target=oui_db.DEFAULT_OUI_URL,
+                              detail=result["error"])
+    else:
+        n = result.get("downloaded_records", 0)
+        flash(f"OUI database refreshed: {n:,} records.", "success")
+        _log_activity_engines("scan", "oui.refresh", "ok",
+                              target=oui_db.DEFAULT_OUI_URL,
+                              detail=f"records={n} size={result.get('size_bytes')}")
+    return redirect(url_for("engines.tools_scan"))
+
+
+@engines_bp.route("/tools/scan/cancel/<path:scan_id>", methods=["POST"])
+@profile_required_admin
+def tools_scan_cancel(scan_id):
+    """Operator-triggered STOP of a running scan.
+
+    Asks the in-process job runner to close its SSH channel, which
+    forces the readline loop to return EOF and the runner exits.
+    The job's final state will be ``failed`` with the message
+    ``cancelled by operator`` and the watcher poll redirects.
+    """
+    from webapp import scan_jobs
+    user_email = (session.get("user") or {}).get("email", "")
+    ok = scan_jobs.request_cancel(scan_id, user_email=user_email)
+    if not ok:
+        return jsonify({"ok": False, "error": "scan_not_found"}), 404
+    _log_activity_engines(
+        "scan", "scan_cancelled", "ok",
+        target=scan_id[:16], detail=f"cancelled_by={user_email}")
+    return jsonify({"ok": True})
+
+
+@engines_bp.route("/tools/scan/log/<path:scan_id>")
+@profile_required_admin
+def tools_scan_log(scan_id):
+    """Stream the per-scan debug log file as text/plain.
+
+    Supports incremental tailing via ``?offset=<bytes>``: the watcher
+    JS fetches from the byte where it stopped last time, the response
+    body contains everything from there to current EOF (capped at
+    512 KB per request), and the ``X-Log-Offset`` response header
+    reports the new file position so the next call resumes correctly.
+
+    Same content as ``tail -f`` outside the web UI — the file is
+    written line-buffered by ``_run_scan`` so reads are real-time.
+
+    Security: the path is read from the scan job's ``debug_log_path``
+    extra (set when the job was registered), and verified to live
+    inside ``scan_log_dir()`` before being opened. Rejects any path
+    that's been tampered with.
+    """
+    import os
+    from flask import Response, abort
+    from webapp import engine_scan_jobs
+    from webapp.engine_scan import scan_log_dir
+
+    user_email = (session.get("user") or {}).get("email", "")
+    status = engine_scan_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        abort(404)
+
+    log_path = status.get("debug_log_path") or ""
+    if not log_path:
+        return Response("", mimetype="text/plain; charset=utf-8")
+
+    # Path must canonicalize inside scan_log_dir(). Belt-and-suspenders
+    # since the path was generated by us and stored in the job record,
+    # but we never trust paths that come back round through the browser.
+    base = os.path.realpath(scan_log_dir())
+    real = os.path.realpath(log_path)
+    if real != base and not real.startswith(base + os.sep):
+        abort(403)
+
+    if not os.path.exists(real):
+        # File hasn't been created yet (scan just started, _run_scan
+        # opens it after register_job). Empty body, offset stays 0.
+        resp = Response("", mimetype="text/plain; charset=utf-8")
+        resp.headers["X-Log-Offset"] = "0"
+        return resp
+
+    try:
+        offset = max(0, int(request.args.get("offset") or 0))
+    except ValueError:
+        offset = 0
+
+    MAX_CHUNK = 512 * 1024  # 512 KB per request — plenty for ~5000 typical lines.
+
+    try:
+        with open(real, "rb") as f:
+            f.seek(offset)
+            data = f.read(MAX_CHUNK)
+            new_offset = f.tell()
+    except OSError as exc:
+        return Response(f"# (error reading debug log: {exc})\n",
+                        mimetype="text/plain; charset=utf-8")
+
+    resp = Response(data, mimetype="text/plain; charset=utf-8")
+    resp.headers["X-Log-Offset"] = str(new_offset)
+    # Keep this response uncacheable so the watcher always sees fresh content.
+    resp.headers["Cache-Control"] = "no-store, max-age=0"
+    return resp
 
 
 @engines_bp.route("/api/clusters/<path:engine_name>/interfaces")
@@ -968,8 +1075,11 @@ def api_cluster_interfaces(engine_name):
 
     try:
         cfg = _user_cfg()
-        with __import__("smc_client").smc_session(cfg):
-            detail = engine_inquiry.cluster_detail(cfg, engine_name)
+        # Phase 0 cross-feature reuse: read the cached cluster detail
+        # populated by /engines/clusters/<name>. Same Domain → instant
+        # cache hit when the operator visited the cluster page first.
+        from webapp import domain_objects
+        detail, _cv = domain_objects.cluster(domain, cfg, engine_name)
     except Exception as exc:
         log.warning("api_cluster_interfaces(%s): %s", engine_name, exc)
         return jsonify({"error": str(exc)}), 502
@@ -1092,6 +1202,7 @@ def tools_scan_csv(scan_id):
     from io import StringIO
     from flask import Response
     from webapp import engine_scan_jobs
+    from shared.csv_safe import csv_safe
 
     user_email = (session.get("user") or {}).get("email", "")
     report = engine_scan_jobs.consume_report(scan_id, user_email=user_email)
@@ -1112,15 +1223,16 @@ def tools_scan_csv(scan_id):
         opens = ",".join(str(p) for p in r.open_ports)
         closes = ",".join(str(p) for p, s in sorted(r.ports.items())
                           if s == "closed")
-        w.writerow([r.ip, int(r.icmp_reply), int(r.arp_reply),
-                    r.mac, r.hostname, opens, closes])
+        w.writerow([csv_safe(r.ip), int(r.icmp_reply), int(r.arp_reply),
+                    csv_safe(r.mac), csv_safe(r.hostname),
+                    csv_safe(opens), csv_safe(closes)])
+    from shared.csv_safe import safe_filename
+    fname = safe_filename(f"engine-scan-{scan_id[:8]}.csv",
+                          default="engine-scan.csv")
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={
-            "Content-Disposition":
-                f'attachment; filename="engine-scan-{scan_id[:8]}.csv"',
-        },
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
 
@@ -1153,10 +1265,25 @@ def _cred_to_payload_engines(cred):
 def node_terminal(cred_id):
     """Render the xterm.js terminal page. The WebSocket route lives on the
     Flask-Sock instance — see webapp/engine_terminal.py.
+
+    C4 (audit fix-up, 2026-05-09): cross-Domain check enforced both here
+    (HTTP launcher) and on the WebSocket handshake. Without this guard,
+    a Domain-A admin could open a terminal on a Domain-B engine simply by
+    crafting the cred_id URL. Super Admin bypasses the per-Domain check.
     """
     from webapp.models import DhcpEngineCredential
+    from webapp.auth_roles import is_super_admin
     cred = db.session.get(DhcpEngineCredential, cred_id)
     if cred is None:
+        flash("Credential not found.", "danger")
+        return redirect(url_for("engines.clusters"))
+    active_domain = _current_domain()
+    active_domain_id = getattr(active_domain, "id", None)
+    if (cred.domain_id is not None
+            and cred.domain_id != active_domain_id
+            and not is_super_admin()):
+        log.warning("Terminal launch refused: cred %s belongs to domain %s, "
+                    "active domain is %s", cred_id, cred.domain_id, active_domain_id)
         flash("Credential not found.", "danger")
         return redirect(url_for("engines.clusters"))
     if cred.last_verify_status != "ok":
@@ -1356,8 +1483,11 @@ def sginfo_file_download(record_id):
                       rec.id, member_path)
         abort(500)
 
-    # Inline-safe filename (sanitise path separators).
-    fname = member_path.rsplit("/", 1)[-1] or "member.bin"
+    # M4 (audit fix-up, 2026-05-09): sanitise the SMC-archive-derived
+    # filename — strip CRLF / quote / backslash / tab / leading dot
+    # before interpolating into the Content-Disposition header.
+    from shared.csv_safe import safe_filename
+    fname = safe_filename(member_path.rsplit("/", 1)[-1], default="member.bin")
     return Response(
         data,
         mimetype="application/octet-stream",

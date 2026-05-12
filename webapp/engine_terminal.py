@@ -260,6 +260,23 @@ def register_routes(app):
             log.warning("[term-ws] cred %s not found — closing 4404", cred_id)
             ws.close(reason=4404, message="credential not found")
             return
+        # C4 (audit fix-up, 2026-05-09): cross-Domain check.
+        # `_is_admin(email)` resolves true for any Domain Admin in any
+        # Domain — without this guard, a Domain-A admin could SSH into a
+        # Domain-B engine simply by guessing/probing cred_id values.
+        from webapp.auth_roles import is_super_admin as _is_super_admin
+        from flask import g as _g
+        active_domain = getattr(_g, "domain", None)
+        active_domain_id = getattr(active_domain, "id", None)
+        if (cred.domain_id is not None
+                and cred.domain_id != active_domain_id
+                and not _is_super_admin()):
+            log.warning("[term-ws] %s tried to open terminal for cred %s "
+                        "(domain_id=%s) while active domain=%s — closing 4403",
+                        email, cred_id, cred.domain_id, active_domain_id)
+            ws.close(reason=4403,
+                     message="credential belongs to a different Domain")
+            return
         if cred.last_verify_status != "ok":
             log.warning("[term-ws] cred %s status=%s — closing 4424",
                         cred_id, cred.last_verify_status)

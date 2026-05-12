@@ -82,13 +82,33 @@ def admin_required(f):
 
 
 def require_api_token(f):
-    """Decorator for webhook endpoints: Bearer token auth."""
+    """Decorator for webhook endpoints: Bearer token auth.
+
+    C6 + M15 (audit fix-up, 2026-05-09):
+      * Use ``hmac.compare_digest`` to compare the presented token with
+        the configured one — constant-time comparison prevents byte-by-byte
+        timing-attack token recovery.
+      * Refuse with HTTP 503 when the configured token is empty / None.
+        Without this guard a misconfigured deploy (token-file write
+        failed, env var unset) would coerce ``None`` into the comparison
+        and reject everything as "Invalid token" — the failure mode is
+        indistinguishable from "wrong token from caller". 503 makes the
+        misconfiguration unambiguous in the logs.
+    """
+    import hmac
     @wraps(f)
     def decorated(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Missing Authorization header"}), 401
-        if auth[7:] != current_app.config.get("DHCP_API_TOKEN"):
+        configured = current_app.config.get("DHCP_API_TOKEN") or ""
+        if not configured:
+            log.error("DHCP_API_TOKEN is empty — refusing webhook auth. "
+                      "Re-create /config/.dhcp_api_token and restart.")
+            return jsonify({"error": "Webhook auth not configured"}), 503
+        presented = auth[7:]
+        if not hmac.compare_digest(presented.encode("utf-8"),
+                                   configured.encode("utf-8")):
             return jsonify({"error": "Invalid token"}), 403
         return f(*args, **kwargs)
     return decorated
@@ -645,8 +665,20 @@ def scopes_discover():
     target = f"{tenant.name}/{api_key.name}/{engine_name}"
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
     try:
-        with smc_session(cfg):
-            found = list_scopes_for_engine(engine_name)
+        # Force a fresh walk + repopulate the shared ``scopes`` cache —
+        # this is the operator's explicit "give me the truth from SMC"
+        # action. Subsequent cascade previews on the same engine read
+        # the warmed cache.
+        domain_obj = getattr(g, "domain", None)
+        from webapp import domain_objects
+        scope_dicts, _cv = domain_objects.scopes(
+            domain_obj, cfg, engine_name, refresh=True)
+        # Project dicts back to the dataclass shape the upsert loop expects
+        from webapp.smc_dhcp_client import DhcpScopeInfo
+        found = [DhcpScopeInfo(**{
+            k: d.get(k) for k in d.keys()
+            if k in DhcpScopeInfo.__dataclass_fields__
+        }) for d in scope_dicts]
 
         added, updated = 0, 0
         now = datetime.now(timezone.utc)
@@ -752,9 +784,80 @@ def scope_detail(scope_id):
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
-    reservations = (DhcpReservation.query
-                    .filter_by(scope_id=scope.id)
-                    .order_by(DhcpReservation.ip_address).all())
+    # H7 (audit fix-up, 2026-05-09): consume the post-deploy scan_jobs
+    # report when the page is reloaded after the watcher polls "done".
+    deploy_running = None
+    deploy_scan_id = (request.args.get("deploy_scan_id") or "").strip()
+    if deploy_scan_id:
+        from webapp import dhcp_deploy_jobs
+        user_email = (session.get("user") or {}).get("email", "")
+        status = dhcp_deploy_jobs.get_status(deploy_scan_id, user_email=user_email)
+        if status is None:
+            flash("Deploy job not found or expired.", "info")
+        elif status["state"] == "running":
+            deploy_running = status
+        elif status["state"] == "failed":
+            flash(f"Deploy worker failed: "
+                  f"{status.get('error') or 'unknown error'}", "danger")
+            dhcp_deploy_jobs.discard(deploy_scan_id, user_email=user_email)
+        else:  # done
+            result = dhcp_deploy_jobs.consume_report(
+                deploy_scan_id, user_email=user_email,
+            )
+            action = (status.get("action") or "push")
+            target = f"{scope.engine_name}/{scope.interface_id}"
+            if result is None:
+                flash("Deploy results expired.", "warning")
+            elif result.overall_status == "blocked":
+                flash(f"Deployment blocked: {result.blocked_reason}", "warning")
+                _log_activity("deploy", action, "blocked", target,
+                              f"Blocked: {result.blocked_reason}")
+            elif result.overall_status == "ok":
+                flash(f"Deploy succeeded on all {result.successful_nodes} "
+                      f"node(s). Pushed "
+                      f"{result.nodes[0].reservations_count if result.nodes else 0}"
+                      f" reservation(s).", "success")
+                _log_activity("deploy", action, "ok", target,
+                              f"OK on {result.successful_nodes}/"
+                              f"{len(result.nodes)} nodes.")
+            elif result.overall_status == "partial":
+                failed = ", ".join(f"node {n.node_index}: {n.error}"
+                                   for n in result.nodes if n.status != "ok")
+                flash(f"Partial success: {result.successful_nodes}/"
+                      f"{len(result.nodes)} nodes pushed. "
+                      f"Failures: {failed}", "warning")
+                _log_activity("deploy", action, "partial", target,
+                              f"Partial: {result.successful_nodes}/"
+                              f"{len(result.nodes)} OK. Failures: {failed}")
+            else:
+                failed = "; ".join(f"node {n.node_index}: {n.error}"
+                                   for n in result.nodes) or "no nodes attempted"
+                flash(f"Deploy failed on all nodes. {failed}", "danger")
+                _log_activity("deploy", action, "failed", target,
+                              f"Failed on all nodes: {failed}")
+            for n in (result.nodes if result else []):
+                if n.reload_warning:
+                    flash(f"Node {n.node_index}: dhcpd reload warning — "
+                          f"{n.reload_warning}", "warning")
+
+    # M13 (audit fix-up, 2026-05-09): paginate the reservation list.
+    # Big scopes can carry hundreds of reservations; the previous .all()
+    # rendered every row and a single template iteration on a 1000-row
+    # scope was a noticeable hang.
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    page_size = 50
+    res_qry = (DhcpReservation.query
+               .filter_by(scope_id=scope.id)
+               .order_by(DhcpReservation.ip_address))
+    total_reservations = res_qry.count()
+    reservations = (res_qry
+                    .limit(page_size)
+                    .offset((page - 1) * page_size)
+                    .all())
+    total_pages = max(1, (total_reservations + page_size - 1) // page_size)
     recent_deploys = (DhcpDeployment.query
                       .filter_by(scope_id=scope.id)
                       .order_by(DhcpDeployment.created_at.desc()).limit(10).all())
@@ -763,7 +866,27 @@ def scope_detail(scope_id):
         scope=scope,
         reservations=reservations,
         recent_deploys=recent_deploys,
+        deploy_running=deploy_running,
+        pagination={
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_reservations,
+            "total_pages": total_pages,
+        },
     )
+
+
+@dhcp_bp.route("/scopes/<int:scope_id>/deploy/status")
+@admin_required
+def scope_deploy_status(scope_id):
+    """JSON poll target for the deploy watcher card."""
+    from webapp import dhcp_deploy_jobs
+    scan_id = (request.args.get("id") or "").strip()
+    user_email = (session.get("user") or {}).get("email", "")
+    status = dhcp_deploy_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"state": "missing"}), 404
+    return jsonify(status)
 
 
 @dhcp_bp.route("/scopes/<int:scope_id>/sync", methods=["POST"])
@@ -967,12 +1090,14 @@ def reservation_edit(reservation_id):
     # Read the live SMC Host (if it exists yet) so the form pre-fills with
     # current values. For 'queued' reservations the Host doesn't exist —
     # we synthesize a host_view from the cached payload of the queued
-    # change so the form still pre-fills.
+    # change so the form still pre-fills. Cache-backed via the shared
+    # ``dhcp_host`` section (Quick 1h, queue-runner-invalidated on edit).
     host_view = None
     if res.smc_host_href:
         try:
-            with smc_session(cfg):
-                host_view = host_get(res.smc_host_name)
+            from webapp import domain_objects
+            host_view, _cv = domain_objects.dhcp_host(
+                domain, cfg, res.smc_host_name)
         except Exception as exc:
             flash(f"Could not read Host from SMC: {exc}", "warning")
 
@@ -1468,11 +1593,16 @@ def scope_preview(scope_id):
 
 
 def _run_push(scope_id: int, action: str):
-    """Shared deploy/resync handler — orchestrates the SSH push and
-    surfaces results as flash messages + activity-log rows.
-    """
-    from webapp.dhcp_pusher import push_scope_to_engine
+    """Shared deploy/resync handler — spawns a background scan_jobs runner.
 
+    H7 (audit fix-up, 2026-05-09): the synchronous version blocked the
+    request thread for 30-60s on a 5-node cluster, with worst-case
+    2x-multiplied latency from the SMC global lock contention. Now
+    spawns a daemon thread via `webapp.dhcp_deploy_jobs.start_deploy`
+    and redirects to `scope_detail?deploy_scan_id=X`. The detail page
+    renders a watcher card that polls /dhcp/scopes/<id>/deploy/status
+    and reloads when the job is done.
+    """
     scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
@@ -1480,43 +1610,37 @@ def _run_push(scope_id: int, action: str):
     target = f"{scope.engine_name}/{scope.interface_id}"
     operator = _operator_email()
 
+    creds = (DhcpEngineCredential.query
+             .filter_by(domain_id=scope.domain_id,
+                        engine_name=scope.engine_name)
+             .all())
+    if not creds:
+        flash("No SSH credentials enrolled — cannot deploy.", "warning")
+        _log_activity("deploy", action, "blocked", target,
+                      "No credentials enrolled")
+        return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+
     _log_activity("deploy", action, "info", target,
                   f"{action.capitalize()} starting for scope {scope.id}.")
 
-    result = push_scope_to_engine(scope.id, operator, action=action)
-
-    if result.overall_status == "blocked":
-        flash(f"Deployment blocked: {result.blocked_reason}", "warning")
-        _log_activity("deploy", action, "blocked", target,
-                      f"Blocked: {result.blocked_reason}")
-    elif result.overall_status == "ok":
-        flash(f"Deploy succeeded on all {result.successful_nodes} node(s). "
-              f"Pushed {result.nodes[0].reservations_count if result.nodes else 0} "
-              f"reservation(s).", "success")
-        _log_activity("deploy", action, "ok", target,
-                      f"OK on {result.successful_nodes}/{len(result.nodes)} nodes.")
-    elif result.overall_status == "partial":
-        failed = ", ".join(f"node {n.node_index}: {n.error}"
-                           for n in result.nodes if n.status != "ok")
-        flash(f"Partial success: {result.successful_nodes}/{len(result.nodes)} "
-              f"nodes pushed. Failures: {failed}", "warning")
-        _log_activity("deploy", action, "partial", target,
-                      f"Partial: {result.successful_nodes}/{len(result.nodes)} "
-                      f"OK. Failures: {failed}")
-    else:
-        failed = "; ".join(f"node {n.node_index}: {n.error}"
-                           for n in result.nodes) or "no nodes attempted"
-        flash(f"Deploy failed on all nodes. {failed}", "danger")
+    from webapp.dhcp_deploy_jobs import start_deploy
+    try:
+        scan_id = start_deploy(
+            scope_id=scope.id,
+            engine_name=scope.engine_name,
+            action=action,
+            operator_email=operator,
+            total_nodes=len(creds),
+        )
+    except Exception as exc:
+        log.exception("scope_deploy: failed to spawn job")
+        flash(f"Deploy failed to start: {exc}", "danger")
         _log_activity("deploy", action, "failed", target,
-                      f"Failed on all nodes: {failed}")
+                      f"Spawn failed: {exc}")
+        return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
 
-    # Surface any reload warnings as additional flashes.
-    for n in result.nodes:
-        if n.reload_warning:
-            flash(f"Node {n.node_index}: dhcpd reload warning — "
-                  f"{n.reload_warning}", "warning")
-
-    return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+    return redirect(url_for("dhcp.scope_detail",
+                            scope_id=scope.id, deploy_scan_id=scan_id))
 
 
 # ── SSH credentials (Phase 1c — auto-enrollment via SMC API) ────────────
@@ -1581,11 +1705,18 @@ def credentials_list():
     if domain_id is None:
         creds, accesses = [], []
     else:
+        # M7 (audit fix-up, 2026-05-09): eager-load Domain → ApiKey on
+        # accesses. Without this, the source-IP drift loop below does
+        # one lazy SELECT per access row for `access.domain.api_key` —
+        # N+1 on a multi-engine Domain.
+        from sqlalchemy.orm import joinedload
         creds = (DhcpEngineCredential.query
                  .filter_by(domain_id=domain_id)
                  .order_by(DhcpEngineCredential.engine_name,
                            DhcpEngineCredential.node_index).all())
         accesses = (DhcpEngineSshAccess.query
+                    .options(joinedload(DhcpEngineSshAccess.domain)
+                             .joinedload(Domain.api_key))
                     .filter_by(domain_id=domain_id)
                     .order_by(DhcpEngineSshAccess.engine_name).all())
     # Domain-Scoping fix: the credentials wizard only ever needs the ONE
@@ -3371,23 +3502,85 @@ def scope_leases(scope_id):
             subnet_size=subnet_size_running,
             creds_missing=creds_missing,
             other_domain_creds=other_domain_creds,
+            leases_cache_meta=None,
+        )
+
+    # H4 (audit fix-up, 2026-05-09): parallel + cached per-node fetch.
+    # Was: sequential SSH read per node × 2-4s = 10-15s on a 4-node cluster
+    # blocking the request thread. Now: fan out via ThreadPoolExecutor;
+    # each node's parsed leases cache for 120s in section `dhcp.leases`,
+    # key (domain_id, engine_name, node_index). Concurrent page loads
+    # across operators share the cache. ?refresh=1 forces re-fetch.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from shared.smc_cache import cache_get_or_fetch
+
+    refresh = (request.args.get("refresh") == "1")
+
+    def _fetch_node_leases_cached(cred):
+        """Fetch + parse one node's lease file, cached for 120s.
+
+        Cache TTL is intentionally tighter than the platform Quick (1h)
+        / Loose (24h) tiers — leases rotate as DHCP clients renew, and
+        operators visit this page WHILE diagnosing live network state.
+        Two minutes is enough to make rapid scope-pivot navigation feel
+        instant without serving genuinely stale data.
+        """
+        def _fetcher():
+            target = _cred_to_target(cred)
+            payload = _cred_to_payload(cred)
+            raw = ssh_get_file(target, payload, LEASE_FILE)
+            return parse_dhcpd_leases(raw.decode(errors="replace"))
+        return cache_get_or_fetch(
+            section="dhcp.leases",
+            key_parts=(cred.domain_id, cred.engine_name, cred.node_index),
+            fetcher=_fetcher,
+            ttl=120,
+            refresh=refresh,
         )
 
     per_node_results: dict[int, list] = {}
     fetch_errors: dict[int, str] = {}
-    for cred in creds:
-        target = _cred_to_target(cred)
-        payload = _cred_to_payload(cred)
-        try:
-            raw = ssh_get_file(target, payload, LEASE_FILE)
-            per_node_results[cred.node_index] = parse_dhcpd_leases(raw.decode(errors="replace"))
-            _log_activity("ssh", "read_leases", "ok",
-                          f"{cred.engine_name}/node{cred.node_index}",
-                          f"{len(per_node_results[cred.node_index])} lease blocks")
-        except Exception as exc:
-            fetch_errors[cred.node_index] = str(exc)
-            _log_activity("ssh", "read_leases", "failed",
-                          f"{cred.engine_name}/node{cred.node_index}", str(exc))
+    node_cache_meta: list = []  # CachedValue per successful node
+
+    if creds:
+        # max_workers=8 covers the largest cluster we've seen; on small
+        # clusters Python clamps to len(creds) automatically anyway.
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(creds))),
+                                thread_name_prefix="dhcp-leases") as pool:
+            futures = {pool.submit(_fetch_node_leases_cached, c): c
+                       for c in creds}
+            for fut in as_completed(futures):
+                cred = futures[fut]
+                try:
+                    cached = fut.result()
+                    per_node_results[cred.node_index] = cached.data
+                    node_cache_meta.append(cached)
+                    if not cached.served_from_cache:
+                        _log_activity(
+                            "ssh", "read_leases", "ok",
+                            f"{cred.engine_name}/node{cred.node_index}",
+                            f"{len(cached.data)} lease blocks"
+                            f"{' (refreshed)' if refresh else ''}",
+                        )
+                except Exception as exc:
+                    fetch_errors[cred.node_index] = str(exc)
+                    _log_activity(
+                        "ssh", "read_leases", "failed",
+                        f"{cred.engine_name}/node{cred.node_index}", str(exc),
+                    )
+
+    # Aggregate freshness for the badge — page is "fresh" only when EVERY
+    # node was just re-fetched; otherwise show the oldest cached_at so the
+    # operator sees the worst-case staleness.
+    if node_cache_meta:
+        oldest = min(node_cache_meta, key=lambda c: c.cached_at)
+        leases_cache_meta = {
+            "served_from_cache": all(m.served_from_cache for m in node_cache_meta),
+            "age_seconds": int(oldest.age_seconds),
+            "cached_at": oldest.cached_at,
+        }
+    else:
+        leases_cache_meta = None
 
     merged = merge_cluster_leases(per_node_results) if per_node_results else []
 
@@ -3559,6 +3752,7 @@ def scope_leases(scope_id):
         subnet_size=subnet_size,
         creds_missing=creds_missing,
         other_domain_creds=other_domain_creds,
+        leases_cache_meta=leases_cache_meta,
     )
 
 
@@ -4064,9 +4258,20 @@ def api_tenant_engines(tenant_id, key_id):
         return jsonify({"error": "Not found"}), 404
     cfg = _smc_cfg(tenant, api_key)
     try:
-        with smc_session(cfg):
-            engines = list_engines()
-        return jsonify(engines)
+        # Phase 0 cross-feature reuse: hit the same ``engines`` cache
+        # section that /engines/clusters populates. Visiting Clusters
+        # first → instant cascade load here, no second SMC roundtrip.
+        from webapp import domain_objects
+        domain = getattr(g, "domain", None)
+        engines_list, _cv = domain_objects.engines(domain, cfg)
+        # Keep the legacy cascade payload shape the JS consumer expects
+        # (name/type/href + a sources marker so debug paths stay happy).
+        engines_payload = [
+            {"name": e.name, "type": e.typeof, "href": e.href,
+             "sources": ["cache"]}
+            for e in engines_list
+        ]
+        return jsonify(engines_payload)
     except Exception as exc:
         return jsonify({"error": smc_error_detail(exc)}), 500
 
@@ -4098,6 +4303,12 @@ def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/scopes")
 @admin_required
 def api_engine_scopes(tenant_id, key_id, engine_name):
+    """AJAX preview cascade for the discover form.
+
+    Read-only SMC walk surfaced via the shared ``scopes`` cache section
+    (Loose 24h TTL). The discover-and-save POST below invalidates this
+    section so the next preview reflects what was just written.
+    """
     guard = _assert_active_domain_match(tenant_id, key_id)
     if guard is not None:
         return guard
@@ -4107,20 +4318,25 @@ def api_engine_scopes(tenant_id, key_id, engine_name):
         return jsonify({"error": "Not found"}), 404
     cfg = _smc_cfg(tenant, api_key)
     try:
+        from webapp import domain_objects
+        domain = getattr(g, "domain", None)
+        scope_dicts, _cv = domain_objects.scopes(domain, cfg, engine_name)
+        # Cluster-node list isn't cache-shared yet (different shape than
+        # cluster_detail's nodes — this one returns NDI primary addresses).
+        # Keep live for now.
         with smc_session(cfg):
-            scopes = list_scopes_for_engine(engine_name)
             nodes = list_cluster_nodes(engine_name)
         return jsonify({
             "scopes": [
                 {
-                    "interface_id": s.interface_id,
-                    "interface_label": s.interface_label,
-                    "subnet_cidr": s.subnet_cidr,
-                    "gateway": s.gateway,
-                    "dhcp_pool_start": s.dhcp_pool_start,
-                    "dhcp_pool_end": s.dhcp_pool_end,
-                    "default_lease_time": s.default_lease_time,
-                } for s in scopes
+                    "interface_id": s.get("interface_id", ""),
+                    "interface_label": s.get("interface_label", ""),
+                    "subnet_cidr": s.get("subnet_cidr", ""),
+                    "gateway": s.get("gateway", ""),
+                    "dhcp_pool_start": s.get("dhcp_pool_start", ""),
+                    "dhcp_pool_end": s.get("dhcp_pool_end", ""),
+                    "default_lease_time": s.get("default_lease_time", ""),
+                } for s in scope_dicts
             ],
             "nodes": [
                 {

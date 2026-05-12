@@ -110,10 +110,17 @@ for ip in "$@"; do
     (
         if busybox ping -c 1 -W "$PT" -q "$ip" >/dev/null 2>&1; then
             # Kernel populated the ARP cache during ping resolution —
-            # read the MAC from `ip neighbor show` so the upper UI can
-            # promote the host into the reservable list. May be empty if
-            # the cache evicted the entry by the time we look (rare).
-            NEIGH=$(busybox ip neighbor show "$ip" 2>/dev/null | busybox head -1)
+            # read the MAC from `ip neigh show`. BusyBox's `ip` applet
+            # uses the short verb `neigh` (the iproute2 long form
+            # `neighbor` is silently rejected and emits no output).
+            # Filter by IP ourselves and prefer REACHABLE entries.
+            NEIGH=$(busybox ip neigh show 2>/dev/null | busybox awk -v IP="$ip" '
+                $1 == IP && /lladdr/ {
+                    if (/REACHABLE/) { print; have_reach = 1; exit }
+                    if (!fallback) fallback = $0
+                }
+                END { if (!have_reach && fallback) print fallback }
+            ')
             MAC=$(printf '%s\n' "$NEIGH" | busybox grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' | busybox head -1)
             if [ -n "$MAC" ]; then
                 line="$ip ICMP_OK $MAC"

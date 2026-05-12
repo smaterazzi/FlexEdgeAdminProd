@@ -38,7 +38,7 @@ import logging
 import threading
 from collections import deque
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from uuid import uuid4
 
 log = logging.getLogger(__name__)
@@ -48,6 +48,11 @@ _TTL = timedelta(minutes=15)
 _LOG_TAIL_LINES = 10
 _LOCK = threading.Lock()
 _JOBS: dict[str, dict] = {}
+
+# Cancel hooks per scan_id. Stored OUT of _JOBS so they don't leak into
+# the JSON status payload (paramiko Channel objects aren't JSON-friendly,
+# and we never want to expose their identity to the browser anyway).
+_CANCEL_HOOKS: dict[str, "Callable[[], None]"] = {}
 
 
 def _now():
@@ -178,6 +183,7 @@ def mark_done(scan_id: str, report: Any) -> None:
         s["duration_ms"] = int(
             (s["finished_at"] - s["started_at"]).total_seconds() * 1000)
         s["expires_at"] = _now() + _TTL
+        _CANCEL_HOOKS.pop(scan_id, None)
 
 
 def mark_failed(scan_id: str, error: str) -> None:
@@ -192,6 +198,55 @@ def mark_failed(scan_id: str, error: str) -> None:
         s["duration_ms"] = int(
             (s["finished_at"] - s["started_at"]).total_seconds() * 1000)
         s["expires_at"] = _now() + _TTL
+        _CANCEL_HOOKS.pop(scan_id, None)
+
+
+# ── Cancel ──────────────────────────────────────────────────────────────
+
+
+def register_cancel_hook(scan_id: str, hook: Callable[[], None]) -> None:
+    """Register a callback the runner can invoke to interrupt itself.
+
+    The runner registers this when it has something cancellable in
+    flight (e.g. a paramiko channel whose ``readline()`` is blocked).
+    ``request_cancel(scan_id)`` calls the hook from another thread —
+    typically closing the channel forces ``readline()`` to return
+    EOF and the runner exits its read loop cleanly.
+
+    Idempotent: re-registering replaces the previous hook. Cleared
+    automatically when the job transitions to ``done`` / ``failed``.
+    """
+    with _LOCK:
+        _CANCEL_HOOKS[scan_id] = hook
+
+
+def request_cancel(scan_id: str, user_email: str = "") -> bool:
+    """Mark the scan as cancel-requested and fire its hook.
+
+    Returns True if the hook fired (or no hook was registered but the
+    job exists); False if the scan_id is unknown or owned by someone
+    else. The caller still has to wait for the runner to notice — by
+    the time this returns the runner may not have transitioned yet.
+    """
+    with _LOCK:
+        s = _JOBS.get(scan_id)
+        if s is None or not _check_owner(s, user_email):
+            return False
+        s["cancel_requested"] = True
+        hook = _CANCEL_HOOKS.pop(scan_id, None)
+    if hook is not None:
+        try:
+            hook()
+        except Exception:
+            log.exception("cancel hook for scan_id=%s raised — ignoring", scan_id)
+    return True
+
+
+def is_cancel_requested(scan_id: str) -> bool:
+    """Lightweight check the runner can poll between events."""
+    with _LOCK:
+        s = _JOBS.get(scan_id)
+        return bool(s and s.get("cancel_requested"))
 
 
 # ── Runner harness ───────────────────────────────────────────────────────

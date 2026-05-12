@@ -34,6 +34,11 @@
     </div>
   </div>
   <div class="d-flex gap-1">
+    <a href="{{ url_for('engines.tools_scan') }}"
+       class="btn btn-sm btn-outline-primary"
+       title="Go back to the scan picker to start a new scan">
+      <i class="bi bi-arrow-left"></i> Back to Scan tool
+    </a>
     <form method="post" action="{{ url_for('scan_history.toggle_star', scan_id=scan.id) }}">
       <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
       <button type="submit" class="btn btn-sm btn-outline-warning">
@@ -83,22 +88,62 @@
 </div>
 
 <div class="card">
-  <div class="card-header py-2 d-flex justify-content-between align-items-center">
-    <span><i class="bi bi-list-ul"></i> Hosts ({{ hosts|length }})</span>
-    <input type="text" id="filter" class="form-control form-control-sm"
-           placeholder="filter by IP / hostname / MAC / port / service…"
-           style="max-width:340px;">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center flex-wrap gap-2">
+    <div>
+      <span class="me-2"><i class="bi bi-list-ul"></i> Hosts</span>
+      <span id="hosts-counter" class="text-muted small">{{ hosts|length }} total</span>
+    </div>
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+      <input type="text" id="filter" class="form-control form-control-sm"
+             placeholder="filter by IP / hostname / MAC / port / service…"
+             style="min-width: 280px; max-width: 340px;">
+      <span id="filter-counter" class="text-muted small"
+            style="white-space: nowrap;"></span>
+    </div>
   </div>
+
+  {# ── Big click-to-filter context buttons, immediately above the table ── #}
+  <div class="card-body py-2 border-bottom">
+    <div class="btn-group flex-wrap" role="group" aria-label="Filter results by category">
+      <button type="button" class="btn btn-outline-secondary active" data-result-filter="all">
+        <i class="bi bi-grid"></i>
+        All
+        <span class="badge bg-secondary ms-1" data-count="all">0</span>
+      </button>
+      <button type="button" class="btn btn-outline-success" data-result-filter="icmp">
+        <i class="bi bi-broadcast"></i>
+        ICMP
+        <span class="badge bg-success ms-1" data-count="icmp">0</span>
+      </button>
+      <button type="button" class="btn btn-outline-warning" data-result-filter="arp">
+        <i class="bi bi-arrow-up-right-circle"></i>
+        ARP only
+        <span class="badge bg-warning text-dark ms-1" data-count="arp">0</span>
+      </button>
+      <button type="button" class="btn btn-outline-info" data-result-filter="open">
+        <i class="bi bi-door-open"></i>
+        With open ports
+        <span class="badge bg-info text-dark ms-1" data-count="open">0</span>
+      </button>
+      <button type="button" class="btn btn-outline-light" data-result-filter="dead">
+        <i class="bi bi-x-circle"></i>
+        Dead
+        <span class="badge bg-secondary ms-1" data-count="dead">0</span>
+      </button>
+    </div>
+  </div>
+
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0 align-middle">
+    <table class="table table-sm table-hover mb-0 align-middle" id="hosts-table">
       <thead>
         <tr class="small">
-          <th>IP</th>
-          <th>ICMP</th>
-          <th>ARP / MAC</th>
-          <th>Hostname</th>
-          <th>Open ports</th>
-          <th class="text-muted">Closed</th>
+          <th class="sortable" data-sort-key="ip"     data-sort-type="ip">IP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="icmp"   data-sort-type="number">ICMP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="mac"    data-sort-type="text">ARP / MAC <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="vendor" data-sort-type="text">Vendor <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="host"   data-sort-type="text">Hostname <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="open"   data-sort-type="number">Open ports <span class="sort-indicator"></span></th>
+          <th class="sortable text-muted" data-sort-key="closed" data-sort-type="number">Closed <span class="sort-indicator"></span></th>
         </tr>
       </thead>
       <tbody>
@@ -113,8 +158,22 @@
           {% set _name = port_services_map.get(_p|int) %}
           {% if _name %}{% set _ = _service_names.append(_name) %}{% endif %}
         {% endfor %}
+        {% set _has_open = _open_ports_list|length > 0 %}
+        {% set _is_silent = (not h.icmp_reply) and (not h.arp_reply) and (not _has_open) %}
+        {% set _closed_count = (h.closed_ports_csv.count(',') + 1) if h.closed_ports_csv else 0 %}
+        {% set _vendor = oui_vendor(h.mac) if h.mac else '' %}
         <tr class="host-row"
-            data-search="{{ (h.ip ~ ' ' ~ (h.hostname or '') ~ ' ' ~ (h.mac or '') ~ ' ' ~ (h.open_ports_csv or '') ~ ' ' ~ _service_names|join(' '))|lower }}">
+            data-search="{{ (h.ip ~ ' ' ~ (h.hostname or '') ~ ' ' ~ (h.mac or '') ~ ' ' ~ _vendor ~ ' ' ~ (h.open_ports_csv or '') ~ ' ' ~ _service_names|join(' '))|lower }}"
+            data-icmp="{{ '1' if h.icmp_reply else '0' }}"
+            data-arp="{{ '1' if h.arp_reply else '0' }}"
+            data-open="{{ '1' if _has_open else '0' }}"
+            data-dead="{{ '1' if _is_silent else '0' }}"
+            data-ip-sort="{{ h.ip }}"
+            data-mac-sort="{{ (h.mac or '')|lower }}"
+            data-vendor-sort="{{ _vendor|lower }}"
+            data-host-sort="{{ (h.hostname or '')|lower }}"
+            data-open-count="{{ _open_ports_list|length }}"
+            data-closed-count="{{ _closed_count }}">
           <td><code>{{ h.ip }}</code></td>
           <td>
             {% if h.icmp_reply %}
@@ -127,6 +186,15 @@
             {% if h.arp_reply %}
               <span class="badge bg-warning text-dark">ARP</span>
               <code class="ms-1">{{ h.mac or '—' }}</code>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
+          <td class="small">
+            {% if _vendor %}
+              <span title="Resolved from OUI database">{{ _vendor }}</span>
+            {% elif h.mac %}
+              <span class="text-muted" title="MAC prefix not in OUI database">unknown</span>
             {% else %}
               <span class="text-muted">—</span>
             {% endif %}
@@ -149,7 +217,6 @@
           <td class="text-muted small">
             {# Collapsed view — closed-port lists are typically 20+ entries
                and dominate the table. Hover the count for the full list. #}
-            {% set _closed_count = (h.closed_ports_csv.count(',') + 1) if h.closed_ports_csv else 0 %}
             {% if _closed_count > 0 %}
               <span title="{{ h.closed_ports_csv }}">{{ _closed_count }} closed</span>
             {% else %}
@@ -159,24 +226,166 @@
         </tr>
         {% endfor %}
         {% if not hosts %}
-        <tr><td colspan="6" class="text-center text-muted py-3">No host results stored.</td></tr>
+        <tr id="empty-row"><td colspan="7" class="text-center text-muted py-3">No host results stored.</td></tr>
         {% endif %}
       </tbody>
     </table>
   </div>
 </div>
 
+<style>
+  #hosts-table th.sortable { cursor: pointer; user-select: none; }
+  #hosts-table th.sortable:hover { background-color: rgba(255,255,255,0.05); }
+  #hosts-table .sort-indicator { color: var(--bs-info, #0dcaf0); font-weight: 600; }
+  [data-result-filter] .badge { min-width: 2em; }
+</style>
+
 <script>
-  (function() {
-    const f = document.getElementById("filter");
-    if (!f) return;
-    f.addEventListener("input", () => {
-      const q = f.value.trim().toLowerCase();
-      document.querySelectorAll(".host-row").forEach(tr => {
-        const hay = (tr.dataset.search || "").toLowerCase();
-        tr.style.display = (q === "" || hay.includes(q)) ? "" : "none";
-      });
+(function() {
+  const filterInput = document.getElementById("filter");
+  const counterEl   = document.getElementById("filter-counter");
+  const hostsCount  = document.getElementById("hosts-counter");
+  const allRows     = Array.from(document.querySelectorAll(".host-row"));
+  const buttons     = Array.from(document.querySelectorAll("[data-result-filter]"));
+  const table       = document.getElementById("hosts-table");
+  const tbody       = table ? table.querySelector("tbody") : null;
+  const totalRows   = allRows.length;
+
+  let activeFilter = "all";
+  let textQuery    = "";
+
+  // ── Combined predicate: button category AND text query ─────────────
+  function matchesCategory(tr, f) {
+    switch (f) {
+      case "all":  return true;
+      case "icmp": return tr.dataset.icmp === "1";
+      case "arp":  return tr.dataset.arp === "1" && tr.dataset.icmp === "0";
+      case "open": return tr.dataset.open === "1";
+      case "dead": return tr.dataset.dead === "1";
+      default:     return true;
+    }
+  }
+  function matchesText(tr, q) {
+    if (!q) return true;
+    return (tr.dataset.search || "").includes(q);
+  }
+
+  function apply() {
+    let visible = 0;
+    for (const tr of allRows) {
+      const ok = matchesCategory(tr, activeFilter) && matchesText(tr, textQuery);
+      tr.style.display = ok ? "" : "none";
+      if (ok) visible++;
+    }
+    if (counterEl) {
+      if (textQuery && visible !== totalRows) {
+        counterEl.textContent = `${visible} of ${totalRows} match`;
+      } else if (activeFilter !== "all" && visible !== totalRows) {
+        counterEl.textContent = `${visible} of ${totalRows} shown`;
+      } else {
+        counterEl.textContent = "";
+      }
+    }
+    if (hostsCount) {
+      hostsCount.textContent = (visible === totalRows)
+        ? `${totalRows} total`
+        : `${visible} of ${totalRows}`;
+    }
+  }
+
+  // ── Initial counts in each filter button's badge ───────────────────
+  function updateCounts() {
+    const counts = {all: totalRows, icmp: 0, arp: 0, open: 0, dead: 0};
+    for (const tr of allRows) {
+      if (tr.dataset.icmp === "1") counts.icmp++;
+      if (tr.dataset.arp  === "1" && tr.dataset.icmp === "0") counts.arp++;
+      if (tr.dataset.open === "1") counts.open++;
+      if (tr.dataset.dead === "1") counts.dead++;
+    }
+    document.querySelectorAll("[data-count]").forEach(span => {
+      const k = span.dataset.count;
+      span.textContent = counts[k] != null ? counts[k] : 0;
     });
-  })();
+  }
+
+  // ── Text filter input ──────────────────────────────────────────────
+  if (filterInput) {
+    filterInput.addEventListener("input", () => {
+      textQuery = filterInput.value.trim().toLowerCase();
+      apply();
+    });
+  }
+
+  // ── Big context-filter buttons ─────────────────────────────────────
+  for (const btn of buttons) {
+    btn.addEventListener("click", () => {
+      buttons.forEach(b => b.classList.remove("active"));
+      btn.classList.add("active");
+      activeFilter = btn.dataset.resultFilter;
+      apply();
+    });
+  }
+
+  // ── Click-to-sort columns ──────────────────────────────────────────
+  // Numeric IP comparator (octet-tuple) so 192.168.1.6 sorts before
+  // 192.168.1.69 — same trick the DHCP leases / engines scan tables
+  // already use elsewhere.
+  function ipTuple(s) { return (s || "").split(".").map(p => parseInt(p, 10) || 0); }
+  function cmpIp(a, b) {
+    const aa = ipTuple(a.dataset.ipSort);
+    const bb = ipTuple(b.dataset.ipSort);
+    for (let i = 0; i < 4; i++) {
+      if (aa[i] !== bb[i]) return aa[i] - bb[i];
+    }
+    return 0;
+  }
+  function cmpText(a, b, dataKey) {
+    return (a.dataset[dataKey] || "").localeCompare(b.dataset[dataKey] || "");
+  }
+  function cmpNumber(a, b, dataKey) {
+    return (parseFloat(a.dataset[dataKey]) || 0) - (parseFloat(b.dataset[dataKey]) || 0);
+  }
+
+  let lastKey = "ip", lastDir = "asc";
+  function sortBy(key, type) {
+    if (!tbody) return;
+    let dir = "asc";
+    if (lastKey === key) dir = (lastDir === "asc") ? "desc" : "asc";
+    lastKey = key; lastDir = dir;
+
+    const rows = allRows.slice();
+    let cmp;
+    if (type === "ip") {
+      cmp = cmpIp;
+    } else if (type === "number") {
+      const dk = key === "open"   ? "openCount"
+              :  key === "closed" ? "closedCount"
+              :  key === "icmp"   ? "icmp"
+              :  key;
+      cmp = (a, b) => cmpNumber(a, b, dk);
+    } else {
+      const dk = key === "mac"    ? "macSort"
+              :  key === "vendor" ? "vendorSort"
+              :  key === "host"   ? "hostSort"
+              :  key;
+      cmp = (a, b) => cmpText(a, b, dk);
+    }
+    rows.sort(cmp);
+    if (dir === "desc") rows.reverse();
+    rows.forEach(r => tbody.appendChild(r));
+    document.querySelectorAll(".sort-indicator").forEach(el => el.textContent = "");
+    const ind = table.querySelector(`th[data-sort-key="${key}"] .sort-indicator`);
+    if (ind) ind.textContent = (dir === "asc") ? " ▲" : " ▼";
+  }
+  if (table) {
+    table.querySelectorAll("th.sortable").forEach(th => {
+      th.addEventListener("click", () => sortBy(th.dataset.sortKey, th.dataset.sortType));
+    });
+    sortBy("ip", "ip");      // initial paint = IP ascending
+  }
+
+  updateCounts();
+  apply();
+})();
 </script>
 {% endblock %}

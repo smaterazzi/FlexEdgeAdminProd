@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}Let's Encrypt — Request Cert{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.dashboard') }}">TLS Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('letsencrypt.list_certs') }}">Let's Encrypt</a></li>
+    <li class="breadcrumb-item active">Request cert</li>
+  </ol>
+</nav>
+
+<h2 class="mb-3"><i class="bi bi-plus-circle"></i> Request a certificate</h2>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, msg in messages %}
+<div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+{% endfor %}
+{% endwith %}
+
+{% if not patterns %}
+<div class="alert alert-warning">
+  <i class="bi bi-exclamation-triangle"></i>
+  <strong>No allowlist patterns configured for this Domain.</strong>
+  Cert requests will be refused. Add at least one pattern via the
+  <a href="{{ url_for('letsencrypt.patterns_view') }}">Allowlist</a> page.
+</div>
+{% else %}
+<div class="alert alert-info small">
+  <i class="bi bi-info-circle"></i> The requested FQDN must match one of
+  this Domain's allowlist patterns:
+  {% for p in patterns %}
+  <code class="ms-1">{{ p.pattern }}</code>{% if not loop.last %},{% endif %}
+  {% endfor %}
+</div>
+{% endif %}
+
+<form method="post" class="card">
+  <div class="card-body">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+    <div class="mb-3">
+      <label class="form-label">Fully-qualified domain name</label>
+      <input type="text" name="fqdn" class="form-control" required
+             value="{{ form_fqdn }}" placeholder="admin.example.com"
+             pattern="^[a-z0-9.\-]+$" autocomplete="off">
+      <div class="form-text">
+        Lowercase ASCII, digits, dots, hyphens. Single FQDN only —
+        wildcards land in a later phase via the manual DNS-01 flow.
+      </div>
+    </div>
+
+    <div class="form-check mb-3">
+      <input type="checkbox" id="is_staging" name="is_staging" value="1"
+             class="form-check-input"
+             {% if form_is_staging or (account and account.is_staging) %}checked{% endif %}>
+      <label for="is_staging" class="form-check-label">
+        Use the <strong>staging</strong> ACME endpoint for this cert
+      </label>
+      <div class="form-text">
+        Staging certs are NOT trusted by browsers but don't count against
+        Let's Encrypt's rate limits. Recommended for the first issuance
+        against any new domain.
+        {% if account and account.is_staging %}
+        <br><strong>Note:</strong> the account is configured for staging — the
+        cert WILL be staging regardless of this checkbox.
+        {% endif %}
+      </div>
+    </div>
+
+    <div class="alert alert-secondary small mb-3">
+      <i class="bi bi-info-circle"></i>
+      Submission creates a queue row. If you have <strong>bypass</strong> enabled
+      for the <code>letsencrypt</code> feature on this Domain (or you're
+      a Domain Admin), certbot runs immediately and you'll see a watcher
+      card. Otherwise the request waits for /changes/ review.
+    </div>
+
+    <div class="d-flex gap-2">
+      <button class="btn btn-primary" {% if not patterns %}disabled{% endif %}>
+        <i class="bi bi-shield-lock"></i> Request certificate
+      </button>
+      <a href="{{ url_for('letsencrypt.list_certs') }}" class="btn btn-outline-secondary">Cancel</a>
+    </div>
+  </div>
+</form>
+</div>
+{% endblock %}

@@ -210,9 +210,21 @@ _section_caches: dict[str, TTLCache] = {}
 _section_locks: dict[str, threading.Lock] = {}
 _global_lock = threading.Lock()
 
+# H12 (audit fix-up, 2026-05-09): in-flight fetch coalescing.
+# When N requests miss the same (section, key) in close succession the
+# previous behaviour was to dispatch N independent fetchers — each
+# acquiring the SMC global lock in turn. On a cold cache after a
+# Domain switch this serialises gunicorn workers behind one fetch each,
+# eating thread capacity. Now: the first arrival creates a Future and
+# runs the fetcher; followers wait on the same Future. Only one SMC
+# round-trip per coalesced burst.
+_inflight: dict[str, "object"] = {}  # cache_key -> concurrent.futures.Future
+_inflight_lock = threading.Lock()
+
 # Diagnostic counters — read-only via stats().
 _hit_count = 0
 _miss_count = 0
+_coalesced_count = 0  # H12: followers that piggy-backed on an in-flight fetch
 
 
 def _get_section_cache(section: str, ttl: int) -> tuple[TTLCache, threading.Lock]:
@@ -268,16 +280,26 @@ def cache_get_or_fetch(section: str,
         api_key_hash)``. Use a HASH of the api key, never plaintext.
       fetcher: Zero-arg callable returning fresh data on miss/refresh.
         It runs OUTSIDE the section lock — long-running SMC calls do not
-        block other lookups in the same section. (Two concurrent misses
-        on the same key will both fetch; we accept that minor duplicate
-        work in exchange for not holding the lock across SMC I/O.)
+        block other lookups in the same section.
       ttl: Section TTL on first creation; ignored thereafter for that
         section. Default 1h, capped at 24h.
-      refresh: If True, bypass the cache, fetch fresh, repopulate, and
-        return ``served_from_cache=False``. Wire this to a query param
-        like ``?refresh=1`` driven by an operator button.
+      refresh: If True, bypass the cache and the in-flight coalescer,
+        fetch fresh, repopulate, and return ``served_from_cache=False``.
+        Wire this to a query param like ``?refresh=1`` driven by an
+        operator button.
+
+    H12 (audit fix-up, 2026-05-09): concurrent non-refresh misses on the
+    same key share one fetch. The first arrival claims an in-flight
+    Future; followers block on `Future.result()` and pick up the same
+    payload (or the same exception). Eliminates the cold-cache
+    fan-in stampede where N gunicorn workers each acquired the SMC
+    global lock for the same fetch. `refresh=True` always does its own
+    fetch — explicit invalidations should not piggy-back on a stale
+    leader's call.
     """
-    global _hit_count, _miss_count
+    from concurrent.futures import Future as _Future
+
+    global _hit_count, _miss_count, _coalesced_count
     cache, lock = _get_section_cache(section, ttl)
     cache_key = _build_key(section, key_parts)
 
@@ -295,12 +317,67 @@ def cache_get_or_fetch(section: str,
                 cache_key=cache_key,
             )
 
-    # Miss / refresh — fetch live (outside the lock so SMC I/O doesn't
-    # block other lookups in this section).
+    # H12 — claim or join the in-flight slot. `refresh=True` skips this
+    # entirely: an explicit invalidation should always do its own
+    # network round-trip, never wait on a stale leader.
+    leader_future = None
+    leader = False
+    if not refresh:
+        with _inflight_lock:
+            existing = _inflight.get(cache_key)
+            if existing is not None:
+                leader_future = existing
+            else:
+                leader_future = _Future()
+                _inflight[cache_key] = leader_future
+                leader = True
+
+        if not leader:
+            # Re-check the cache before blocking — the leader may have
+            # finished + cleared the inflight slot between our two
+            # lock acquisitions, in which case the value is now in
+            # the section cache and we should serve from there.
+            with lock:
+                cached = cache.get(cache_key)
+            if cached is not None:
+                data, cached_at = cached
+                _hit_count += 1
+                return CachedValue(
+                    data=data, cached_at=cached_at,
+                    served_from_cache=True,
+                    section=section, cache_key=cache_key,
+                )
+            _coalesced_count += 1
+            log.debug("smc_cache: COALESCED key=%s — joining in-flight fetch",
+                      cache_key)
+            data, cached_at = leader_future.result()  # raises on leader fail
+            return CachedValue(
+                data=data, cached_at=cached_at,
+                # The leader did the network round-trip; we still served
+                # this caller from a fresh fetch (not a cache hit), so
+                # served_from_cache=False is the honest answer.
+                served_from_cache=False,
+                section=section, cache_key=cache_key,
+            )
+
+    # Leader path (or refresh=True). Run the fetcher OUTSIDE both locks
+    # so SMC I/O doesn't block other lookups or other in-flight slots.
     _miss_count += 1
     log.debug("smc_cache: %s key=%s", "REFRESH" if refresh else "MISS", cache_key)
     started = time.monotonic()
-    fresh_data = fetcher()
+    try:
+        fresh_data = fetcher()
+    except BaseException as exc:
+        # Surface the failure to any followers waiting on the Future.
+        if leader and leader_future is not None:
+            try:
+                leader_future.set_exception(exc)
+            except Exception:
+                pass
+        if leader:
+            with _inflight_lock:
+                _inflight.pop(cache_key, None)
+        raise
     fetch_ms = int((time.monotonic() - started) * 1000)
     if fetch_ms > 1000:
         log.info("smc_cache: %s fetch took %dms (key=%s)",
@@ -309,6 +386,16 @@ def cache_get_or_fetch(section: str,
     cached_at = datetime.now(timezone.utc)
     with lock:
         cache[cache_key] = (fresh_data, cached_at)
+    if leader and leader_future is not None:
+        # Set result BEFORE releasing the inflight slot so any follower
+        # that grabbed the Future before we cleared the dict still sees
+        # the resolved future.
+        try:
+            leader_future.set_result((fresh_data, cached_at))
+        except Exception:
+            pass
+        with _inflight_lock:
+            _inflight.pop(cache_key, None)
     return CachedValue(
         data=fresh_data,
         cached_at=cached_at,
@@ -345,6 +432,37 @@ def invalidate(section: str, key_parts=None) -> int:
         return 0
 
 
+def peek(section: str, key_parts):
+    """Return the cached payload for ``(section, key_parts)`` without
+    triggering a fetch. Returns ``None`` on miss.
+
+    Used by code paths that want to consume the cache *only* if it's
+    already populated — e.g. quick-search needs to look up names
+    scoped to the active Domain WITHOUT pulling in cross-Domain entries.
+    Walking ``_section_caches`` directly is dangerous because cache
+    keys are SHA-256 prefixes — you can't tell which Domain owns an
+    entry without re-deriving its key.
+    """
+    if section not in _section_caches:
+        return None
+    cache = _section_caches[section]
+    lock = _section_locks[section]
+    cache_key = _build_key(section, key_parts)
+    with lock:
+        cached = cache.get(cache_key)
+    if cached is None:
+        return None
+    return cached[0]
+
+
+def list_sections() -> list[str]:
+    """Snapshot of the section names that currently exist. Used by
+    quick-search to enumerate ``element_list.<type_key>`` sections
+    without poking inside ``_section_caches``."""
+    with _global_lock:
+        return list(_section_caches.keys())
+
+
 def invalidate_all() -> int:
     """Drop every entry in every section.
 
@@ -368,11 +486,15 @@ def stats() -> dict:
     """Diagnostic snapshot for the future Admin → Logs / Settings page."""
     with _global_lock:
         sizes = {section: len(c) for section, c in _section_caches.items()}
+    with _inflight_lock:
+        inflight_count = len(_inflight)
     total_entries = sum(sizes.values())
     total_lookups = _hit_count + _miss_count
     return {
         "hits": _hit_count,
         "misses": _miss_count,
+        "coalesced": _coalesced_count,
+        "inflight_now": inflight_count,
         "hit_ratio": (_hit_count / total_lookups) if total_lookups else 0.0,
         "sections": sizes,
         "total_entries": total_entries,

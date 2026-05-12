@@ -36,7 +36,8 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
                port_timeout_s: int = 2,
                dns_timeout_s: int = 2,
                exec_timeout_s: int = 900,
-               verbose: bool = False) -> str:
+               verbose: bool = False,
+               lazy: bool = False) -> str:
     """Kick off an engine-scan job in a daemon thread. Returns the scan_id.
 
     Total ops budget: ICMP pass (= len(ip_list)) + arping fallback (a
@@ -130,6 +131,20 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
         results[ip] = r
 
     def _runner(_scan_id: str) -> None:
+        # Register a cancel hook the moment we have an SSH channel.
+        # `request_cancel` invokes this from the request thread when
+        # the operator clicks STOP — closing the channel forces the
+        # parser's readline loop to return EOF and the scan exits
+        # cleanly with a `cancelled` error.
+        def _on_chan(chan):
+            def _close():
+                try:
+                    chan.close()
+                except Exception:
+                    pass
+            scan_jobs.register_cancel_hook(_scan_id, _close)
+            scan_jobs.append_log(_scan_id, "(STOP available — channel registered for cancel)")
+
         live_results, counters, err = _run_scan(
             target, cred, ip_list=ip_list, ports=ports,
             batch_size=batch_size,
@@ -139,7 +154,9 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
             dns_timeout_s=dns_timeout_s,
             exec_timeout_s=exec_timeout_s,
             verbose=verbose,
+            lazy=lazy,
             debug_log_path=debug_log,
+            on_channel_open=_on_chan,
             on_event=_on_event,
         )
         started_at = scan_jobs.get_started_at(scan_id)
@@ -166,7 +183,15 @@ def start_scan(*, target: SSHTarget, cred: SSHCredential,
             error=err,
             results=merged,
         )
-        if err:
+        # Cancel-aware finalization. If the operator clicked STOP,
+        # the channel was closed mid-stream — readline saw EOF, the
+        # parser exited cleanly, and `err` may be empty even though
+        # the scan didn't truly finish. Recognize that and report it
+        # as a cancel rather than a successful run.
+        if scan_jobs.is_cancel_requested(scan_id):
+            scan_jobs.append_log(scan_id, "(scan stopped by operator)")
+            scan_jobs.mark_failed(scan_id, "cancelled by operator")
+        elif err:
             scan_jobs.mark_failed(scan_id, err)
         else:
             scan_jobs.append_log(scan_id, (

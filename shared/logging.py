@@ -172,14 +172,23 @@ def audit(feature: str, action: str, *,
           status: str = "ok",
           source_correlation_id: Optional[str] = None,
           user_email: Optional[str] = None,
-          domain_id: Optional[int] = None) -> None:
+          domain_id: Optional[int] = None,
+          commit: bool = True) -> None:
     """Write a level='audit' platform log entry. Always persisted (subject
     to the per-feature toggle).
+
+    H9 (audit fix-up, 2026-05-09): pass ``commit=False`` to add the audit
+    row to the caller's existing ``db.session`` without committing.
+    The caller is responsible for committing the surrounding transaction
+    so the state change + audit row land atomically. Used by the queue
+    runner so a process kill between state-commit and audit-emit can no
+    longer leave a PUSHED row without an audit trail.
     """
     _write(level="audit", feature=feature, action=action,
            target=target, detail=detail, status=status,
            source_correlation_id=source_correlation_id,
-           user_email=user_email, domain_id=domain_id)
+           user_email=user_email, domain_id=domain_id,
+           commit=commit)
 
 
 def op(feature: str, action: str, *,
@@ -187,28 +196,37 @@ def op(feature: str, action: str, *,
        status: str = "ok",
        source_correlation_id: Optional[str] = None,
        user_email: Optional[str] = None,
-       domain_id: Optional[int] = None) -> None:
+       domain_id: Optional[int] = None,
+       commit: bool = True) -> None:
     """Write a level='op' platform log entry. Persisted only when the
     platform log_mode is 'verbose' (and the feature toggle is ON).
+
+    Same ``commit`` semantics as ``audit()``.
     """
     if current_log_mode() != "verbose":
         return
     _write(level="op", feature=feature, action=action,
            target=target, detail=detail, status=status,
            source_correlation_id=source_correlation_id,
-           user_email=user_email, domain_id=domain_id)
+           user_email=user_email, domain_id=domain_id,
+           commit=commit)
 
 
 def _write(*, level: str, feature: str, action: str,
            target: str, detail: str, status: str,
            source_correlation_id: Optional[str],
            user_email: Optional[str],
-           domain_id: Optional[int]) -> None:
+           domain_id: Optional[int],
+           commit: bool = True) -> None:
     """Inner write — applies the feature toggle, never raises.
 
     Suppression order: feature toggle off → drop. Otherwise insert.
     Field truncation is defensive (DB columns have soft caps); a feature
     that emits an oversize detail blob still writes successfully.
+
+    When ``commit=False``, the row is added to the active session but
+    the commit is left to the caller (H9 — atomic state-transition +
+    audit emission).
     """
     feature = (feature or "").strip() or "unknown"
     if not is_feature_enabled(feature):
@@ -228,16 +246,23 @@ def _write(*, level: str, feature: str, action: str,
             source_correlation_id=((source_correlation_id or "")[:64] or None),
         )
         db.session.add(row)
-        db.session.commit()
+        if commit:
+            db.session.commit()
     except Exception as exc:
         # Log writes must never break the caller — fall back to stdlib.
         log.warning("platform log write failed (feature=%s action=%s): %s",
                     feature, action, exc)
-        try:
-            from shared.db import db
-            db.session.rollback()
-        except Exception:
-            pass
+        # Only roll back when WE owned the transaction. Under
+        # ``commit=False`` the caller is mid-transaction and rolling back
+        # here would silently destroy their pending state-transition
+        # write. Best-effort: surface the error but leave session intact
+        # for the caller to commit/rollback.
+        if commit:
+            try:
+                from shared.db import db
+                db.session.rollback()
+            except Exception:
+                pass
 
 
 # ── Retention sweep ──────────────────────────────────────────────────────

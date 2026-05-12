@@ -262,7 +262,18 @@ class UserDomainAccess(db.Model):
 
 
 class ManagedCertificate(db.Model):
-    """A certbot-managed certificate tracked for TLS deployment automation."""
+    """A certbot-managed certificate tracked for TLS deployment automation.
+
+    Roadmap item 5 / Phase LE.1+LE.2 (2026-05-11): extended with the
+    FEA-driven request lifecycle. The legacy rows (operator manually
+    pointed `domain` + `certbot_lineage` at existing certbot output)
+    keep working; new rows are created via `/tls/letsencrypt/new` and
+    track their full lifecycle in this same table.
+
+    Lifecycle: `pending` (queued) → `active` (certbot succeeded, cert
+    on disk) | `failed` (last_error populated; operator retries) |
+    `revoked` (cert revoked at LE).
+    """
     __tablename__ = "managed_certificates"
 
     id = db.Column(db.Integer, primary_key=True, autoincrement=True)
@@ -272,11 +283,115 @@ class ManagedCertificate(db.Model):
     last_checked_at = db.Column(db.DateTime, nullable=True)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
 
+    # LE additions — nullable so legacy rows survive the migration unchanged.
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="SET NULL"),
+                          nullable=True, index=True)
+    requested_by_user_id = db.Column(db.Integer,
+                                     db.ForeignKey("users.id", ondelete="SET NULL"),
+                                     nullable=True)
+    status = db.Column(db.String(16), default="active", nullable=False)
+    last_error = db.Column(db.Text, default="", nullable=False)
+    is_staging = db.Column(db.Boolean, default=False, nullable=False)
+    pending_change_id = db.Column(
+        db.Integer, db.ForeignKey("pending_changes.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    next_renewal_after = db.Column(db.DateTime, nullable=True, index=True)
+    account_id = db.Column(db.Integer,
+                           db.ForeignKey("acme_accounts.id", ondelete="SET NULL"),
+                           nullable=True)
+    # Phase LE.4 (manual DNS-01) preallocates these so the schema doesn't
+    # need a second migration when wildcards ship. Unused by LE.2.
+    challenge_type = db.Column(db.String(16), default="http01", nullable=False)
+    dns_challenge_state = db.Column(db.String(16), nullable=True)
+    dns_challenge_record_name = db.Column(db.String(512), nullable=True)
+    dns_challenge_record_value = db.Column(db.String(512), nullable=True)
+
     deployments = db.relationship("TLSDeployment", back_populates="certificate",
                                   lazy="dynamic", cascade="all, delete-orphan")
+    fea_domain = db.relationship("Domain")
+    requested_by = db.relationship("User", foreign_keys=[requested_by_user_id])
+    pending_change = db.relationship("PendingChange",
+                                     foreign_keys=[pending_change_id])
+    account = db.relationship("AcmeAccount")
 
     def __repr__(self):
-        return f"<ManagedCertificate {self.domain!r}>"
+        return f"<ManagedCertificate {self.domain!r} status={self.status}>"
+
+
+# ── Let's Encrypt CRUD (Roadmap item 5 / Phase LE, 2026-05-11) ───────────
+
+class AcmeAccount(db.Model):
+    """The deployment's single Let's Encrypt account.
+
+    Q3 locked: one account per deployment. The account key itself lives
+    at `<CERTBOT_CONFIG_DIR>/accounts/...` (Q4) — defaults to
+    `/config/letsencrypt/accounts/`, which IS the writable volume
+    inside the container (the literal `/etc/letsencrypt/` is read-only
+    in the Docker image, so we redirect certbot's config-dir; see
+    `webapp/letsencrypt_certbot.py`). This row only tracks the
+    metadata FEA needs to render the account-management UI and the
+    one-shot setup wizard. `is_staging=True` means this row points at
+    LE's staging environment (acme-staging-v02.api.letsencrypt.org)
+    instead of production; the next-issuance default depends on this
+    flag plus the per-cert Q7 toggle.
+    """
+    __tablename__ = "acme_accounts"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    email = db.Column(db.String(256), nullable=False)
+    account_url = db.Column(db.String(512), default="", nullable=False)
+    tos_accepted_at = db.Column(db.DateTime, nullable=False)
+    tos_accepted_by_email = db.Column(db.String(256), nullable=False)
+    is_staging = db.Column(db.Boolean, default=True, nullable=False)
+    key_file_path = db.Column(db.String(1024), default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow,
+                           nullable=False)
+
+    def __repr__(self):
+        return (f"<AcmeAccount {self.email!r} "
+                f"{'staging' if self.is_staging else 'production'}>")
+
+
+class DomainCertPattern(db.Model):
+    """Per-FEA-Domain glob allowlist for Let's Encrypt cert requests.
+
+    Q6 + Q6a + Q6b locked: Domain Admin (self-service) configures
+    which subject names their Domain can request certs for, using
+    glob patterns like `*.prod.example.com`. The cert_request queue
+    handler matches the requested FQDN against this Domain's allowed
+    patterns before invoking certbot — Domains with no patterns can
+    request nothing, which is the safe default.
+
+    Pattern matching is implemented by `webapp/letsencrypt_allowlist.py`
+    and uses `fnmatch.fnmatchcase` so the operator's mental model is
+    standard shell globbing.
+    """
+    __tablename__ = "domain_cert_patterns"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    pattern = db.Column(db.String(512), nullable=False)
+    created_by_user_id = db.Column(db.Integer,
+                                   db.ForeignKey("users.id", ondelete="SET NULL"),
+                                   nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    domain = db.relationship("Domain")
+    created_by = db.relationship("User", foreign_keys=[created_by_user_id])
+
+    __table_args__ = (
+        db.UniqueConstraint("domain_id", "pattern",
+                            name="uq_domain_cert_pattern"),
+    )
+
+    def __repr__(self):
+        return (f"<DomainCertPattern domain={self.domain_id} "
+                f"pattern={self.pattern!r}>")
 
 
 class TLSDeployment(db.Model):
@@ -862,8 +977,20 @@ class PlatformLog(db.Model):
     detail = db.Column(db.Text, default="", nullable=False)
     domain_id = db.Column(db.Integer,
                           db.ForeignKey("domains.id", ondelete="SET NULL"),
-                          nullable=True, index=True)
+                          nullable=True)
     source_correlation_id = db.Column(db.String(64), nullable=True, index=True)
+
+    # M8 (audit fix-up, 2026-05-09): the /logs viewer ALWAYS filters by
+    # domain + timestamp + ORDER BY timestamp DESC. The previous
+    # individually-indexed columns forced SQLite to choose one index
+    # (timestamp) and scan; with rows accumulating across all Domains
+    # the planner kept picking the wrong one. A composite index on
+    # (domain_id, timestamp) lets the planner satisfy both predicates
+    # AND the ORDER BY in one scan. Drops the standalone domain_id
+    # index — redundant once the composite covers it.
+    __table_args__ = (
+        db.Index("ix_platform_logs_domain_ts", "domain_id", "timestamp"),
+    )
 
     domain = db.relationship("Domain")
 

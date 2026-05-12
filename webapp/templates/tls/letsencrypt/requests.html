@@ -1,0 +1,260 @@
+{% extends "base.html" %}
+{% block title %}Let's Encrypt — Requests{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.dashboard') }}">TLS Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('letsencrypt.list_certs') }}">Let's Encrypt</a></li>
+    <li class="breadcrumb-item active">Requests</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2 class="mb-0">
+    <i class="bi bi-inbox"></i> Let's Encrypt requests
+  </h2>
+  <div class="d-flex gap-2">
+    <a href="{{ url_for('letsencrypt.log_tail_view') }}" class="btn btn-sm btn-outline-secondary"
+       title="Tail the certbot debug log">
+      <i class="bi bi-file-text"></i> View log
+    </a>
+    <a href="{{ url_for('letsencrypt.list_certs') }}" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-arrow-left"></i> Back to certs
+    </a>
+    <a href="{{ url_for('letsencrypt.cert_new') }}" class="btn btn-sm btn-primary">
+      <i class="bi bi-plus-circle"></i> New request
+    </a>
+  </div>
+</div>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, msg in messages %}
+<div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+{% endfor %}
+{% endwith %}
+
+<form method="get" class="card mb-3">
+  <div class="card-body">
+    <div class="row g-2 align-items-end">
+      <div class="col-md-4">
+        <label class="form-label small mb-1">State</label>
+        <input type="text" name="state" class="form-control form-control-sm"
+               value="{{ state_filter }}"
+               placeholder="queued,push_failed,conflict">
+        <div class="form-text small">
+          Comma-separated. Available:
+          <code>queued</code>, <code>push_failed</code>, <code>conflict</code>,
+          <code>pushed</code>, <code>applied</code>, <code>aborted</code>.
+        </div>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-1">Operation</label>
+        <select name="op" class="form-select form-select-sm">
+          <option value="">(any)</option>
+          {% for op in le_ops %}
+          <option value="{{ op }}" {% if op_filter == op %}selected{% endif %}>{{ op }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-md-3">
+        <label class="form-label small mb-1">FQDN contains</label>
+        <input type="text" name="fqdn" class="form-control form-control-sm"
+               value="{{ fqdn_filter }}" placeholder="example.com">
+      </div>
+      <div class="col-md-2 text-end">
+        <button class="btn btn-sm btn-outline-primary"><i class="bi bi-funnel"></i> Filter</button>
+        <a href="{{ url_for('letsencrypt.requests_index') }}" class="btn btn-sm btn-outline-secondary">
+          Reset
+        </a>
+      </div>
+    </div>
+  </div>
+</form>
+
+{% if not rows %}
+<div class="alert alert-info">
+  <i class="bi bi-info-circle"></i>
+  No requests match the current filter.
+  Default view shows <code>queued</code>, <code>push_failed</code>, and <code>conflict</code> rows —
+  clear the State filter to see the full audit trail.
+</div>
+{% else %}
+<form method="post" action="{{ url_for('letsencrypt.requests_bulk') }}" id="bulk-form">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <div class="d-flex justify-content-between align-items-center mb-2">
+    <div class="small text-muted">
+      Showing <strong>{{ rows|length }}</strong> requests
+      {% if rows|length == 500 %}<span class="badge bg-warning text-dark ms-1">capped at 500</span>{% endif %}
+    </div>
+    <div class="d-flex gap-2">
+      <button name="action" value="push" class="btn btn-sm btn-success"
+              onclick="return confirmBulk('push');">
+        <i class="bi bi-play-fill"></i> Push selected
+      </button>
+      <button name="action" value="abort" class="btn btn-sm btn-warning"
+              onclick="return confirmBulk('abort');">
+        <i class="bi bi-stop-fill"></i> Abort selected
+      </button>
+    </div>
+  </div>
+
+  <div class="table-responsive">
+    <table class="table table-sm table-hover align-middle">
+      <thead>
+        <tr>
+          <th style="width:32px;">
+            <input type="checkbox" id="sel-all" onclick="toggleAll(this)" title="Select all">
+          </th>
+          <th style="width:60px;">#</th>
+          <th>FQDN</th>
+          <th style="width:130px;">Operation</th>
+          <th style="width:110px;">State</th>
+          <th style="width:90px;">Mode</th>
+          <th>Created</th>
+          <th>Last error</th>
+          <th style="width:220px;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        {% set ch = row.change %}
+        {% set cert = row.cert %}
+        <tr>
+          <td>
+            {% if row.is_actionable %}
+            <input type="checkbox" name="change_ids" value="{{ ch.id }}" class="row-checkbox">
+            {% endif %}
+          </td>
+          <td class="text-muted small">{{ ch.id }}</td>
+          <td>
+            {% if cert %}
+            <a href="{{ url_for('letsencrypt.cert_detail', cert_id=cert.id) }}"
+               class="text-decoration-none"><code>{{ row.fqdn }}</code></a>
+            {% else %}
+            <code class="text-muted">{{ row.fqdn or '(unknown)' }}</code>
+            {% endif %}
+          </td>
+          <td><code>{{ ch.operation }}</code></td>
+          <td>
+            {% if ch.state == 'queued' %}
+            <span class="badge bg-warning text-dark">queued</span>
+            {% elif ch.state == 'pushing' %}
+            <span class="badge bg-info text-dark">pushing</span>
+            {% elif ch.state == 'pushed' %}
+            <span class="badge bg-primary">pushed</span>
+            {% elif ch.state == 'applied' %}
+            <span class="badge bg-success">applied</span>
+            {% elif ch.state == 'push_failed' %}
+            <span class="badge bg-danger">push_failed</span>
+            {% elif ch.state == 'conflict' %}
+            <span class="badge bg-danger">conflict</span>
+            {% elif ch.state == 'aborted' %}
+            <span class="badge bg-secondary">aborted</span>
+            {% else %}
+            <span class="badge bg-secondary">{{ ch.state }}</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if cert and cert.is_staging %}
+            <span class="badge bg-warning text-dark">staging</span>
+            {% elif cert %}
+            <span class="badge bg-primary">prod</span>
+            {% else %}—{% endif %}
+          </td>
+          <td class="small text-muted">
+            {{ ch.created_at.strftime("%Y-%m-%d %H:%M UTC") }}
+          </td>
+          <td class="small">
+            {% if ch.push_error_text %}
+            <span class="text-danger" title="{{ ch.push_error_text|e }}">
+              {{ ch.push_error_text.splitlines()[0][:120] }}
+              {% if ch.push_error_text|length > 120 %}…{% endif %}
+            </span>
+            {% else %}—{% endif %}
+          </td>
+          <td>
+            <div class="d-flex gap-1 flex-wrap">
+              {% if ch.state == 'queued' %}
+              <button form="form-push-{{ ch.id }}" class="btn btn-sm btn-success"
+                      title="Run the queue handler now">
+                <i class="bi bi-play-fill"></i> Push
+              </button>
+              {% elif ch.state == 'push_failed' or ch.state == 'conflict' %}
+              <button form="form-retry-{{ ch.id }}" class="btn btn-sm btn-info"
+                      title="Re-queue and push again">
+                <i class="bi bi-arrow-clockwise"></i> Retry
+              </button>
+              {% endif %}
+              {% if row.is_actionable or ch.state == 'conflict' %}
+              <button form="form-abort-{{ ch.id }}" class="btn btn-sm btn-outline-danger"
+                      title="Mark this request aborted; cert row stays for audit"
+                      onclick="return confirm('Abort change #{{ ch.id }}? The linked cert will be marked failed.');">
+                <i class="bi bi-stop-fill"></i> Abort
+              </button>
+              {% endif %}
+              {% if cert %}
+              <a href="{{ url_for('letsencrypt.cert_detail', cert_id=cert.id) }}"
+                 class="btn btn-sm btn-outline-secondary" title="View cert detail">
+                <i class="bi bi-eye"></i>
+              </a>
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</form>
+
+{# Per-row hidden forms so each action button can POST independently
+   without nesting (HTML5 forbids nested <form>). #}
+{% for row in rows %}
+{% set ch = row.change %}
+{% if ch.state == 'queued' %}
+<form id="form-push-{{ ch.id }}" method="post"
+      action="{{ url_for('letsencrypt.request_push', change_id=ch.id) }}"
+      style="display:none;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+</form>
+{% endif %}
+{% if ch.state == 'push_failed' or ch.state == 'conflict' %}
+<form id="form-retry-{{ ch.id }}" method="post"
+      action="{{ url_for('letsencrypt.request_retry', change_id=ch.id) }}"
+      style="display:none;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+</form>
+{% endif %}
+{% if row.is_actionable or ch.state == 'conflict' %}
+<form id="form-abort-{{ ch.id }}" method="post"
+      action="{{ url_for('letsencrypt.request_abort', change_id=ch.id) }}"
+      style="display:none;">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+  <input type="hidden" name="reason" value="aborted from requests view">
+</form>
+{% endif %}
+{% endfor %}
+{% endif %}
+
+<script>
+function toggleAll(box) {
+  document.querySelectorAll('.row-checkbox').forEach(function(cb) {
+    cb.checked = box.checked;
+  });
+}
+function confirmBulk(action) {
+  var n = document.querySelectorAll('.row-checkbox:checked').length;
+  if (n === 0) {
+    alert('Select at least one row.');
+    return false;
+  }
+  var msg = action === 'push'
+    ? 'Push ' + n + ' selected requests? (halt-on-failure — stops at the first failure)'
+    : 'Abort ' + n + ' selected requests? Linked certs will be marked failed.';
+  return confirm(msg);
+}
+</script>
+</div>
+{% endblock %}

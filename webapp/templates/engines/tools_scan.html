@@ -49,7 +49,7 @@
 
 {% with messages = get_flashed_messages(with_categories=true) %}
 {% for category, msg in messages %}
-<div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
+<div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
 {% endfor %}
 {% endwith %}
 
@@ -58,8 +58,10 @@
 <div id="scan-watcher" class="card mb-3"
      data-scan-id="{{ scan_running.scan_id }}"
      data-status-url="{{ url_for('engines.tools_scan_status') }}"
+     data-log-url="{{ url_for('engines.tools_scan_log', scan_id=scan_running.scan_id) }}"
+     data-cancel-url="{{ url_for('engines.tools_scan_cancel', scan_id=scan_running.scan_id) }}"
      data-leases-url="{{ url_for('engines.tools_scan') }}">
-  <div class="card-header py-2 d-flex justify-content-between align-items-center">
+  <div class="card-header py-2 d-flex justify-content-between align-items-center flex-wrap gap-2">
     <span>
       <i class="bi bi-radar"></i>
       Scanning <code>{{ scan_running.target_label or scan_running.subnet_cidr }}</code>
@@ -69,12 +71,18 @@
         iface <code>{{ scan_running.source_iface_name or scan_running.source_iface_id }}</code>
       </span>
     </span>
-    <span class="small text-muted" id="scan-counters">
-      ICMP <span class="badge bg-success" id="scan-icmp">{{ scan_running.counters.icmp_replies or 0 }}</span>
-      · ARP <span class="badge bg-warning text-dark" id="scan-arp">{{ scan_running.counters.arp_replies or 0 }}</span>
-      · open ports <span class="badge bg-info text-dark" id="scan-open">{{ scan_running.counters.ports_open or 0 }}</span>
-      · <span id="scan-progress-text">{{ scan_running.progress }} / {{ scan_running.total }}</span>
-    </span>
+    <div class="d-flex align-items-center gap-2 flex-wrap">
+      <span class="small text-muted" id="scan-counters">
+        ICMP <span class="badge bg-success" id="scan-icmp">{{ scan_running.counters.icmp_replies or 0 }}</span>
+        · ARP <span class="badge bg-warning text-dark" id="scan-arp">{{ scan_running.counters.arp_replies or 0 }}</span>
+        · open ports <span class="badge bg-info text-dark" id="scan-open">{{ scan_running.counters.ports_open or 0 }}</span>
+        · <span id="scan-progress-text">{{ scan_running.progress }} / {{ scan_running.total }}</span>
+      </span>
+      <button type="button" class="btn btn-sm btn-danger" id="scan-stop-btn"
+              title="Stop the running scan immediately">
+        <i class="bi bi-stop-circle"></i> STOP
+      </button>
+    </div>
   </div>
   <div class="card-body py-2">
     <div class="progress" style="height: 14px;">
@@ -86,17 +94,21 @@
            aria-valuemin="0" aria-valuemax="{{ scan_running.total }}"></div>
     </div>
     <pre id="scan-log" class="mt-2 mb-0 small bg-dark text-light p-2 rounded"
-         style="height: 12em; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;"
->{% for line in scan_running.log_tail %}{{ line }}
+         style="height: 22em; overflow-y: auto; font-family: ui-monospace, SFMono-Regular, monospace;"
+>Connecting to engine and tailing scan log&hellip;
+{% for line in scan_running.log_tail %}{{ line }}
 {% endfor %}</pre>
     {% if scan_running.debug_log_path %}
-    <div class="small text-muted mt-2">
-      <i class="bi bi-file-earmark-text"></i>
-      Full debug log (every line received over SSH, including stderr)
-      is being written to
-      <code class="user-select-all">{{ scan_running.debug_log_path }}</code>
-      &mdash; <kbd>tail -f</kbd> from a separate shell to verify
-      progress when the watcher above feels stuck.
+    <div class="small text-muted mt-2 d-flex flex-wrap gap-3 align-items-center">
+      <span>
+        <i class="bi bi-file-earmark-text"></i>
+        Live tail of
+        <code class="user-select-all">{{ scan_running.debug_log_path }}</code>
+        &mdash; same content also available via
+        <a href="{{ url_for('engines.tools_scan_log', scan_id=scan_running.scan_id) }}"
+           target="_blank" rel="noopener">raw download</a>
+        or <kbd>tail -f</kbd> on the host running FlexEdgeAdmin.
+      </span>
     </div>
     {% endif %}
   </div>
@@ -153,8 +165,8 @@
       <button type="button" class="btn btn-sm btn-outline-warning" data-filter="arp-only">
         ARP only <span class="rcounter badge bg-warning text-dark ms-1">0</span>
       </button>
-      <button type="button" class="btn btn-sm btn-outline-dark" data-filter="silent">
-        Silent <span class="rcounter badge bg-dark ms-1">0</span>
+      <button type="button" class="btn btn-sm btn-outline-light" data-filter="silent">
+        Silent <span class="rcounter badge bg-secondary ms-1">0</span>
       </button>
     </div>
   </div>
@@ -162,10 +174,11 @@
     <table class="table table-sm table-hover mb-0" id="scan-results-table">
       <thead>
         <tr>
-          <th class="sortable" data-sort-key="ip"   data-sort-type="ip">IP <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="icmp" data-sort-type="text">ICMP <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="mac"  data-sort-type="text">ARP / MAC <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="host" data-sort-type="text">Hostname <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="ip"     data-sort-type="ip">IP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="icmp"   data-sort-type="text">ICMP <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="mac"    data-sort-type="text">ARP / MAC <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="vendor" data-sort-type="text">Vendor <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="host"   data-sort-type="text">Hostname <span class="sort-indicator"></span></th>
           <th>Open ports</th>
         </tr>
       </thead>
@@ -178,6 +191,7 @@
         {% set r = scan_report.results[ip] %}
         {% set has_open = r.open_ports|length > 0 %}
         {% set reachable = r.icmp_reply or r.arp_reply %}
+        {% set _vendor = oui_vendor(r.mac) if r.mac else '' %}
         <tr class="result-row"
             data-ip="{{ r.ip }}"
             data-icmp="{{ '1' if r.icmp_reply else '0' }}"
@@ -185,6 +199,7 @@
             data-reachable="{{ '1' if reachable else '0' }}"
             data-openports="{{ '1' if has_open else '0' }}"
             data-mac="{{ r.mac or '' }}"
+            data-vendor="{{ _vendor|lower }}"
             data-host="{{ (r.hostname or '')|lower }}">
           <td><code>{{ r.ip }}</code></td>
           <td>
@@ -195,9 +210,20 @@
             {% endif %}
           </td>
           <td>
-            {% if r.mac %}<code class="small">{{ r.mac }}</code>{% else %}<span class="text-muted">—</span>{% endif %}
+            {% if r.mac %}
+              <code class="small">{{ r.mac }}</code>
+            {% else %}<span class="text-muted">—</span>{% endif %}
             {% if r.arp_reply and not r.icmp_reply %}
               <span class="badge bg-warning text-dark ms-1" title="L2 visible only — ICMP filtered">firewalled</span>
+            {% endif %}
+          </td>
+          <td class="small">
+            {% if _vendor %}
+              <span title="Resolved from OUI database">{{ _vendor }}</span>
+            {% elif r.mac %}
+              <span class="text-muted" title="MAC prefix not in OUI database">unknown</span>
+            {% else %}
+              <span class="text-muted">—</span>
             {% endif %}
           </td>
           <td class="small">{{ r.hostname or '—' }}</td>
@@ -222,6 +248,46 @@
 
 {% else %}
 {# ── Picker mode — start a new scan ─────────────────────────────────── #}
+
+{# ── OUI vendor database status card ────────────────────────────────── #}
+{% if oui_info %}
+<div class="card mb-3">
+  <div class="card-body py-2 d-flex flex-wrap align-items-center gap-3">
+    <div class="me-auto">
+      <strong><i class="bi bi-tag"></i> OUI vendor database</strong>
+      <div class="small text-muted">
+        {% if oui_info.exists and oui_info.record_count %}
+          {{ "{:,}".format(oui_info.record_count) }} vendor records
+          &middot; updated {{ oui_info.age_human }}
+          {% if oui_info.size_bytes %}
+            &middot; {{ (oui_info.size_bytes / 1024)|round(1) }} KB
+          {% endif %}
+        {% elif oui_info.exists %}
+          File present but no records loaded — try Refresh.
+        {% else %}
+          Not yet downloaded. Click Refresh to fetch from
+          <code>{{ oui_info.source_url }}</code>.
+        {% endif %}
+      </div>
+      <div class="small text-muted">
+        Used to decorate MAC addresses in scan results with vendor names
+        (e.g. <code>aa:bb:cc:dd:ee:ff · Cisco Systems</code>).
+      </div>
+    </div>
+    <form method="POST" action="{{ url_for('engines.tools_scan_oui_refresh') }}"
+          onsubmit="this.querySelector('button').disabled = true;
+                    this.querySelector('button').innerHTML =
+                      '<span class=&quot;spinner-border spinner-border-sm&quot;></span> Downloading…';">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button type="submit" class="btn btn-sm btn-outline-primary">
+        <i class="bi bi-arrow-clockwise"></i>
+        {% if oui_info.exists %}Refresh{% else %}Download{% endif %}
+      </button>
+    </form>
+  </div>
+</div>
+{% endif %}
+
 {% if inventory_error %}
 <div class="alert alert-danger small">
   <i class="bi bi-exclamation-triangle"></i> Could not load cluster
@@ -310,8 +376,12 @@
           <label class="form-check-label" for="tmSingle">
             <strong>Single IP</strong>
           </label>
-          <input type="text" name="single_ip" class="form-control form-control-sm mt-1 ms-3"
-                 placeholder="e.g. 10.0.0.5" style="max-width: 240px;">
+          <div class="input-group input-group-sm mt-1 ms-3" style="max-width: 280px;">
+            <span class="input-group-text font-monospace octet-prefix"
+                  id="single-ip-prefix" style="display: none;"></span>
+            <input type="text" name="single_ip" id="single-ip-input"
+                   class="form-control" placeholder="e.g. 10.0.0.5">
+          </div>
         </div>
         <div class="form-check mb-2">
           <input type="radio" name="target_mode" value="custom_range" id="tmRange"
@@ -319,9 +389,27 @@
           <label class="form-check-label" for="tmRange">
             <strong>Custom range</strong>
           </label>
-          <div class="row g-2 mt-1 ms-3" style="max-width: 480px;">
-            <div class="col"><input type="text" name="custom_start" class="form-control form-control-sm" placeholder="start"></div>
-            <div class="col"><input type="text" name="custom_end"   class="form-control form-control-sm" placeholder="end"></div>
+          <div class="row g-2 mt-1 ms-3" style="max-width: 540px;">
+            <div class="col">
+              <div class="input-group input-group-sm">
+                <span class="input-group-text font-monospace octet-prefix"
+                      id="custom-start-prefix" style="display: none;"></span>
+                <input type="text" name="custom_start" id="custom-start-input"
+                       class="form-control" placeholder="start">
+              </div>
+            </div>
+            <div class="col">
+              <div class="input-group input-group-sm">
+                <span class="input-group-text font-monospace octet-prefix"
+                      id="custom-end-prefix" style="display: none;"></span>
+                <input type="text" name="custom_end" id="custom-end-input"
+                       class="form-control" placeholder="end">
+              </div>
+            </div>
+          </div>
+          <div class="form-text small ms-3" id="octet-helper-hint" style="display:none;">
+            Subnet prefix auto-filled from the selected interface — type only
+            the variable octet(s).
           </div>
         </div>
       </div>
@@ -377,6 +465,16 @@
             Verbose log — show every <code>busybox ping / arping / nc /
             nslookup</code> command in the live watcher (slower; useful
             for troubleshooting why a scan looks empty).
+          </label>
+        </div>
+        <div class="form-check mt-1">
+          <input class="form-check-input" type="checkbox" name="lazy"
+                 value="1" id="lazyScan">
+          <label class="form-check-label small text-muted" for="lazyScan">
+            <i class="bi bi-tortoise"></i>
+            Lazy scan — random 1-3 second pause between hosts in the
+            port-probe phase. Slower but gentler on the network /
+            target firewalls (avoids triggering rate-limit alarms).
           </label>
         </div>
       </div>
@@ -516,7 +614,62 @@
         ? `arping uses this leg. Subnet: ${subnet}`
         : "arping uses this leg. (No IPv4 attached — pick Custom range or Single IP.)";
     }
+    updateOctetPrefixes(subnet);
   });
+
+  // ── Octet-prefix auto-fill ──────────────────────────────────────────
+  // When the operator picks an interface attached to a /24 (or /16, /8),
+  // pre-populate the input-group prefix span with the fixed octets, so
+  // they only have to type the variable last octet(s). On form submit,
+  // values without dots get the prefix prepended automatically.
+  function computeIpPrefix(cidr) {
+    if (!cidr) return "";
+    const m = cidr.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/);
+    if (!m) return "";
+    const masklen = parseInt(m[5], 10);
+    if (masklen === 24) return `${m[1]}.${m[2]}.${m[3]}.`;
+    if (masklen === 16) return `${m[1]}.${m[2]}.`;
+    if (masklen === 8)  return `${m[1]}.`;
+    return "";  // non-octet-aligned masks: don't auto-prefix
+  }
+
+  function updateOctetPrefixes(cidr) {
+    const prefix = computeIpPrefix(cidr);
+    const ids = ["single-ip-prefix", "custom-start-prefix", "custom-end-prefix"];
+    for (const id of ids) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      if (prefix) {
+        el.textContent = prefix;
+        el.style.display = "";
+      } else {
+        el.textContent = "";
+        el.style.display = "none";
+      }
+    }
+    const hint = document.getElementById("octet-helper-hint");
+    if (hint) hint.style.display = prefix ? "" : "none";
+  }
+
+  // Form-submit interceptor: prepend the displayed prefix to any
+  // input that doesn't already contain a dot. Trusts inputs with
+  // dots as full IPs (operator override).
+  const form = ifaceSel?.form;
+  if (form) {
+    form.addEventListener("submit", () => {
+      const prefixSpan = document.getElementById("single-ip-prefix");
+      const prefix = prefixSpan && prefixSpan.style.display !== "none"
+        ? (prefixSpan.textContent || "") : "";
+      if (!prefix) return;
+      const inputs = ["single-ip-input", "custom-start-input", "custom-end-input"];
+      for (const id of inputs) {
+        const inp = document.getElementById(id);
+        if (!inp) continue;
+        const v = (inp.value || "").trim();
+        if (v && !v.includes(".")) inp.value = prefix + v;
+      }
+    });
+  }
 })();
 
 // ─────────────────────────────────────────────────────────────────────
@@ -774,7 +927,10 @@
 })();
 
 // ─────────────────────────────────────────────────────────────────────
-//  Watcher — poll /tools/scan/status, update bar + log + counters
+//  Watcher — poll /tools/scan/status (progress) + /tools/scan/log
+//  (debug log file). The dialog log pane mirrors the file content
+//  written by webapp/engine_scan.py — same as `tail -f` outside the
+//  web UI, so what the user sees here equals what's on disk.
 // ─────────────────────────────────────────────────────────────────────
 (function pollScanWatcher() {
   const w = document.getElementById("scan-watcher");
@@ -782,6 +938,9 @@
   const scanId    = w.dataset.scanId;
   const statusUrl = w.dataset.statusUrl;
   const leasesUrl = w.dataset.leasesUrl;
+  const logUrl    = w.dataset.logUrl;       // /engines/tools/scan/log/<id>
+  const cancelUrl = w.dataset.cancelUrl;    // POST to abort the scan
+  const stopBtn   = document.getElementById("scan-stop-btn");
   const bar  = document.getElementById("scan-progress-bar");
   const text = document.getElementById("scan-progress-text");
   const icmp = document.getElementById("scan-icmp");
@@ -790,7 +949,85 @@
   const log  = document.getElementById("scan-log");
 
   let stopped = false;
-  let lastLogLen = log ? log.textContent.split("\n").filter(l => l.length).length : 0;
+  let cancelling = false;
+  let logOffset = 0;
+
+  // ── STOP button → POST cancel, watcher poll picks up state="failed" ──
+  if (stopBtn && cancelUrl) {
+    stopBtn.addEventListener("click", async () => {
+      if (cancelling) return;
+      if (!confirm("Stop this scan? Any progress so far will be lost.")) return;
+      cancelling = true;
+      stopBtn.disabled = true;
+      stopBtn.innerHTML = '<span class="spinner-border spinner-border-sm"></span> Stopping…';
+      try {
+        // CSRF token from base.html meta tag (window.fexFetch is used
+        // elsewhere; here we need a vanilla fetch with X-CSRFToken).
+        const csrf = document.querySelector('meta[name="csrf-token"]')?.content || "";
+        await fetch(cancelUrl, {
+          method: "POST",
+          headers: {"X-CSRFToken": csrf, "Accept": "application/json"},
+          credentials: "same-origin",
+        });
+      } catch (err) {
+        console.warn("cancel failed:", err);
+        cancelling = false;
+        stopBtn.disabled = false;
+        stopBtn.innerHTML = '<i class="bi bi-stop-circle"></i> STOP';
+      }
+    });
+  }
+  let logInitialized = false;     // first file fetch clears the deque-paint placeholder
+  const MAX_LOG_CHARS = 1_500_000; // ~1.5 MB cap on the in-DOM log to keep the browser happy
+
+  // Auto-scroll behavior: keep pinning to bottom UNLESS the operator
+  // has scrolled up to read older content. Detect by checking whether
+  // the pre is currently scrolled near its bottom edge BEFORE we
+  // append; if it was at the bottom, pin again afterward.
+  function appendLog(chunk) {
+    if (!log || !chunk) return;
+    const wasAtBottom = (log.scrollHeight - log.scrollTop - log.clientHeight) < 40;
+    if (!logInitialized) {
+      log.textContent = "";
+      logInitialized = true;
+    }
+    log.textContent += chunk;
+    if (log.textContent.length > MAX_LOG_CHARS) {
+      // Trim from the front, keep last ~80% — losing oldest lines is
+      // the right trade-off for a live tail view.
+      log.textContent = log.textContent.slice(-Math.floor(MAX_LOG_CHARS * 0.8));
+    }
+    if (wasAtBottom) log.scrollTop = log.scrollHeight;
+  }
+
+  async function pollLog() {
+    if (!logUrl) return;
+    try {
+      const r = await fetch(logUrl + "?offset=" + logOffset, {
+        headers: {"Accept": "text/plain"},
+        cache: "no-store",
+      });
+      if (!r.ok) return;
+      const newOff = parseInt(r.headers.get("X-Log-Offset") || String(logOffset), 10);
+      const txt = await r.text();
+      if (txt.length > 0) appendLog(txt);
+      if (Number.isFinite(newOff) && newOff >= logOffset) logOffset = newOff;
+    } catch (err) {
+      // Silent — next tick retries.
+    }
+  }
+
+  function setProgress(progress, total) {
+    const safeTotal = total || 1;
+    const pctNum = Math.min(100, (progress / safeTotal) * 100);
+    const pctStr = pctNum.toFixed(2);          // two decimals — granular feedback on big scans
+    if (bar) {
+      bar.style.width = pctStr + "%";
+      bar.setAttribute("aria-valuenow", String(progress));
+      bar.textContent = pctStr + "%";          // bar itself shows the number
+    }
+    if (text) text.textContent = `${progress} / ${total} (${pctStr}%)`;
+  }
 
   async function tick() {
     if (stopped) return;
@@ -804,25 +1041,20 @@
         return;
       }
       const s = await res.json();
-      const total = s.total || 1;
-      const pct = Math.min(100, Math.round((s.progress / total) * 1000) / 10);
-      if (bar) {
-        bar.style.width = pct + "%";
-        bar.setAttribute("aria-valuenow", String(s.progress));
-      }
-      if (text) text.textContent = s.progress + " / " + s.total;
+      setProgress(s.progress || 0, s.total || 1);
       if (icmp) icmp.textContent = s.counters?.icmp_replies || 0;
       if (arp)  arp.textContent  = s.counters?.arp_replies  || 0;
       if (open) open.textContent = s.counters?.ports_open   || 0;
-      if (log) {
-        const lines = s.log_tail || [];
-        if (lines.length !== lastLogLen) {
-          log.textContent = lines.join("\n") + (lines.length ? "\n" : "");
-          log.scrollTop = log.scrollHeight;
-          lastLogLen = lines.length;
-        }
-      }
+
+      // Pull the latest debug-log file chunk every tick, in parallel
+      // with the progress poll. Keeps the dialog log in sync with
+      // what's on disk regardless of the deque size.
+      await pollLog();
+
       if (s.state === "done" || s.state === "failed") {
+        // One last log poll to flush the script footer (# finished_at,
+        // # counters, # host_count) before we navigate away.
+        await pollLog();
         stopped = true;
         window.location = leasesUrl + "?scan_id=" + encodeURIComponent(scanId);
         return;
@@ -904,6 +1136,7 @@
     let v;
     if (key === "icmp") v = row.dataset.icmp;
     else if (key === "mac") v = row.dataset.mac;
+    else if (key === "vendor") v = row.dataset.vendor;
     else if (key === "host") v = row.dataset.host;
     else v = row.dataset[key] || "";
     return type === "ip" ? ipKey(v) : v;

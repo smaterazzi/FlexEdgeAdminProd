@@ -244,7 +244,7 @@ def _fetch_element_data(href: str) -> Optional[dict]:
 # ── Scan ─────────────────────────────────────────────────────────────────
 
 
-def scan_domain_drift(domain) -> DriftReport:
+def scan_domain_drift(domain, progress_cb=None) -> DriftReport:
     """Walk every `smc_objects` row for the Domain and classify drift.
 
     Updates each row's `drift_state`, `last_drift_check_at`, and
@@ -256,6 +256,12 @@ def scan_domain_drift(domain) -> DriftReport:
     CLI sweep) is responsible for committing transactions and emitting
     a top-level audit entry — the row updates are committed inside this
     function to avoid one bad row poisoning the whole batch.
+
+    H6 (audit fix-up, 2026-05-09): `progress_cb` is an optional callable
+    invoked after every row with positional args
+    `(checked, total, smc_name, smc_type, drift_state)`. The web route
+    (`webapp/drift_jobs.py`) hooks this to drive the scan_jobs watcher
+    UI; CLI / synchronous callers pass None.
     """
     from shared.db import db
     from webapp.models import SmcObject
@@ -271,6 +277,7 @@ def scan_domain_drift(domain) -> DriftReport:
             .order_by(SmcObject.smc_type.asc(), SmcObject.smc_name.asc())
             .all())
     report.total_rows = len(rows)
+    total = len(rows)
 
     if not rows:
         report.finished_at = datetime.now(timezone.utc)
@@ -300,6 +307,16 @@ def scan_domain_drift(domain) -> DriftReport:
                 db.session.commit()
             except Exception:
                 db.session.rollback()
+            if progress_cb is not None:
+                try:
+                    progress_cb(
+                        report.checked, total,
+                        row.smc_name or row.smc_href or "?",
+                        row.smc_type or "",
+                        getattr(res, "state", "") or row.drift_state or "",
+                    )
+                except Exception:
+                    log.exception("drift progress_cb raised — continuing")
 
     report.finished_at = datetime.now(timezone.utc)
 
