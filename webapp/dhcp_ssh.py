@@ -37,6 +37,32 @@ class SSHCredential:
     host_fingerprint: str = ""     # "SHA256:xxxxx" form
 
 
+def target_from_credential(cred, *, timeout: int = 10) -> "SSHTarget":
+    """Build an SSHTarget from a DhcpEngineCredential row, honoring the
+    `connect_ip_override` field (P1, 2026-05-12).
+
+    When the row carries a non-empty ``connect_ip_override`` (NAT exit
+    IP), FEA dials that address instead of ``cred.hostname``. The
+    hostname stays the engine's real interface IP because that's what
+    the SMC SSH-allow rule's destination Host needs to match — the
+    engine sees inbound packets on its real IP, not the public NAT IP.
+
+    Centralised here so every SSH call site (verify / bootstrap /
+    file-push / scope-scan / terminal / lease-read) picks up the
+    override identically, and a future change of the override
+    semantics needs to touch only this one place.
+    """
+    host = (getattr(cred, "connect_ip_override", "") or "").strip()
+    if not host:
+        host = cred.hostname
+    return SSHTarget(
+        hostname=host,
+        port=cred.ssh_port,
+        username=cred.ssh_username,
+        timeout=timeout,
+    )
+
+
 class FingerprintMismatch(Exception):
     """Raised when the server's host key doesn't match the stored fingerprint.
 

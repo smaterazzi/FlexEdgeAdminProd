@@ -331,9 +331,12 @@ def _push_to_node(scope: DhcpScope,
                       status="failed",
                       reservations_count=len(reservations))
 
-    target = SSHTarget(hostname=cred_row.hostname,
-                       port=cred_row.ssh_port,
-                       username=cred_row.ssh_username)
+    # P1 (2026-05-12): dial through `target_from_credential` so the
+    # NAT exit IP is used when set. `node.node_hostname` keeps the
+    # engine's real interface IP for audit-log clarity (matches the
+    # SMC rule's destination Host).
+    from webapp.dhcp_ssh import target_from_credential
+    target = target_from_credential(cred_row)
     payload = SSHCredential(password=cred_row.encrypted_password,
                             host_fingerprint=cred_row.host_fingerprint)
 

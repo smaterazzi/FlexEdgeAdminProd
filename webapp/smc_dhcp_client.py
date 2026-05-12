@@ -672,6 +672,15 @@ class NodeAddress:
     is_primary_mgt: bool = False
     is_outgoing: bool = False
     is_dynamic: bool = False      # True for DHCP-assigned (not a stable target)
+    # P1 — contact-address awareness. `reverse_connection=True` on the
+    # primary-mgt interface marks the cluster as node-initiated; that
+    # alone says nothing about whether FEA can reach this specific
+    # interface from outside. `contact_addresses` holds any per-location
+    # NAT exit IPs SMC has registered for this NDI — populated by
+    # `list_cluster_nodes` from `engine.contact_addresses`. Each entry:
+    #   {"address": str, "location": str, "is_public": bool, "dynamic": bool}
+    reverse_connection: bool = False
+    contact_addresses: list = field(default_factory=list)
 
 
 @dataclass
@@ -716,6 +725,13 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                 is_primary_mgt=bool(inner.get("primary_mgt")),
                 is_outgoing=bool(inner.get("outgoing")),
                 is_dynamic=is_dynamic,
+                # `reverse_connection=True` lives per-interface on the
+                # NodeInterface payload. Today only the primary_mgt
+                # interface carries it (= cluster is node-initiated),
+                # but we surface the raw flag per-interface so the UI
+                # can show "this specific NDI is the node-initiated
+                # channel" without re-walking.
+                reverse_connection=bool(inner.get("reverse_connection")),
             ))
 
     # VLAN children
@@ -772,6 +788,67 @@ def is_node_initiated_contact(engine_name: str) -> bool:
     return False
 
 
+def _build_contact_address_map(engine) -> dict:
+    """Return ``{(interface_id, interface_ip): [ {address, location, is_public,
+    dynamic}, ... ]}`` from ``engine.contact_addresses``.
+
+    Forcepoint SMC keeps contact addresses at the *engine* level, keyed by
+    `(interface_id, interface_ip)` — each entry can carry several
+    addresses (one per Location, typically one of which is "Default").
+    This map gets joined onto each ``NodeAddress`` by the same key in
+    ``list_cluster_nodes`` below.
+
+    Empty / failure → empty dict so the caller never has to None-check.
+    """
+    import ipaddress
+
+    def _classify(addr: str) -> bool:
+        try:
+            ip = ipaddress.ip_address((addr or "").strip())
+        except (ValueError, TypeError):
+            return False
+        # is_global is False for RFC1918, loopback, link-local, multicast,
+        # reserved, etc. Exactly what we want: True = routable on the
+        # public internet => probably a NAT exit.
+        return bool(ip.is_global)
+
+    out: dict = {}
+    try:
+        cas = list(engine.contact_addresses)
+    except Exception as exc:
+        logger.info("_build_contact_address_map(%s): no contact_addresses: %s",
+                    getattr(engine, "name", "?"), exc)
+        return out
+
+    for ca in cas:
+        try:
+            iface_id = str(getattr(ca, "interface_id", "") or "")
+            iface_ip = str(getattr(ca, "interface_ip", "") or "")
+            addresses = list(getattr(ca, "addresses", None) or [])
+            # The SDK's ContactAddress can also expose .location_ref /
+            # .dynamic; surface them defensively so the UI can show
+            # "Default" vs a named Location.
+            location = str(getattr(ca, "location", "") or
+                           getattr(ca, "location_ref", "") or "")
+            dynamic = bool(getattr(ca, "dynamic", False))
+        except Exception:
+            continue
+        if not iface_id and not iface_ip:
+            continue
+        bucket = out.setdefault((iface_id, iface_ip), [])
+        for addr in addresses:
+            addr_s = str(addr or "").strip()
+            if not addr_s:
+                continue
+            bucket.append({
+                "address": addr_s,
+                "location": location,
+                "is_public": _classify(addr_s),
+                "dynamic": dynamic,
+            })
+    return out
+
+
 def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
     """Return one record per cluster node with **all** static NDI addresses
     (per-node).
@@ -786,6 +863,10 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
       4. The "primary address" for each node is the one tagged `primary_mgt`
          (the IP SMC uses to reach the node). For node-initiated clusters
          this may not be reachable from FEA — the operator picks instead.
+      5. Join per-interface contact addresses from `engine.contact_addresses`
+         onto each NodeAddress. With 1:1 NAT a node-initiated node may
+         still expose a public NAT exit IP here, which is what FEA can
+         then dial (P1 — contact-address awareness, 2026-05-12).
     """
     engine = Engine(engine_name)
 
@@ -797,6 +878,14 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
         except Exception:
             continue
         all_addresses.extend(_walk_node_interfaces(data))
+
+    # Build the contact-address map ONCE, attach to each matching NDI.
+    contact_map = _build_contact_address_map(engine)
+    if contact_map:
+        for na in all_addresses:
+            key = (na.interface_id, na.address)
+            if key in contact_map:
+                na.contact_addresses = contact_map[key]
 
     # Group by nodeid (1-based in SMC). Single-node engines may not assign
     # a nodeid; treat unset as 1.

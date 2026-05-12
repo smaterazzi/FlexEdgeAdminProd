@@ -1239,12 +1239,13 @@ def tools_scan_csv(scan_id):
 def _cred_to_target_engines(cred):
     """Build SSHTarget from a DhcpEngineCredential row. Mirrors
     `dhcp_manager._cred_to_target` to avoid the cross-blueprint import.
+
+    P1 (2026-05-12): routes through `target_from_credential` so the
+    `connect_ip_override` field is honored — the terminal and scan
+    tool both dial the NAT exit IP when set.
     """
-    from webapp.dhcp_ssh import SSHTarget
-    return SSHTarget(
-        hostname=cred.hostname, port=cred.ssh_port,
-        username=cred.ssh_username,
-    )
+    from webapp.dhcp_ssh import target_from_credential
+    return target_from_credential(cred)
 
 
 def _cred_to_payload_engines(cred):

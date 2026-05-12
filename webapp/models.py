@@ -651,6 +651,16 @@ class DhcpEngineCredential(db.Model):
     encrypted_password = db.Column(EncryptedString, nullable=False)
     host_fingerprint = db.Column(db.String(128), default="", nullable=False)
 
+    # P1 — contact-address-aware connect IP (2026-05-12).
+    # When NOT empty, SSH callers dial this address instead of `hostname`
+    # so a node-initiated cluster sitting behind 1:1 NAT can still be
+    # reached via its public contact address. The SMC SSH allow rule's
+    # destination Host element keeps using `hostname` (the engine's real
+    # interface IP) because that's what the engine sees on inbound
+    # packets; the override only affects which TCP socket FEA opens.
+    # NULL / "" preserves today's behavior (dial hostname directly).
+    connect_ip_override = db.Column(db.String(64), default="", nullable=False)
+
     last_verified_at = db.Column(db.DateTime, nullable=True)
     last_verify_status = db.Column(db.String(32), default="unverified", nullable=False)  # ok|failed|unverified
     last_error = db.Column(db.Text, default="", nullable=False)

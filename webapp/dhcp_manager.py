@@ -1646,8 +1646,11 @@ def _run_push(scope_id: int, action: str):
 # ── SSH credentials (Phase 1c — auto-enrollment via SMC API) ────────────
 
 def _cred_to_target(cred_row: DhcpEngineCredential) -> SSHTarget:
-    return SSHTarget(hostname=cred_row.hostname, port=cred_row.ssh_port,
-                     username=cred_row.ssh_username)
+    # P1: delegate to the centralised helper so the connect_ip_override
+    # is honored. `hostname` on the row stays the engine's real
+    # interface IP — what the SMC rule's destination Host matches.
+    from webapp.dhcp_ssh import target_from_credential
+    return target_from_credential(cred_row)
 
 
 def _cred_to_payload(cred_row: DhcpEngineCredential) -> SSHCredential:
@@ -1665,6 +1668,32 @@ def _audit_comment(action: str, engine_name: str = "") -> str:
     op = _operator_email() or "unknown"
     suffix = f" engine={engine_name}" if engine_name else ""
     return f"FlexEdgeAdmin {action} by {op}{suffix}"
+
+
+def _validate_connect_ip_override(raw) -> str:
+    """Return a clean IPv4 string, or "" if the input is missing/invalid.
+
+    P1 (2026-05-12). The credentials wizard submits this from a
+    dropdown of public contact addresses we ourselves discovered, but
+    the form value is operator-controlled so we re-validate
+    defensively before storing it. Empty / whitespace / bad shape →
+    "" (= no override; today's behavior).
+
+    IPv4 only for now. IPv6 NAT exit support can extend this later
+    by widening `ip_address` to `ip_address(...)` and accepting any
+    version, but the storage column is sized for IPv4.
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    try:
+        from ipaddress import IPv4Address
+        return str(IPv4Address(s))
+    except (ValueError, TypeError):
+        log.warning("connect_ip_override refused: not a valid IPv4: %r", s)
+        return ""
 
 
 def _bump_access_refreshed(tenant_id: int, engine_name: str,
@@ -2051,9 +2080,40 @@ def credentials_discover_nodes():
                     "network_value": a.network_value,
                     "is_primary_mgt": a.is_primary_mgt,
                     "is_outgoing": a.is_outgoing,
+                    # P1 — surface per-interface contact addresses so the
+                    # UI can offer a connect-IP override when 1:1 NAT
+                    # exposes a public exit address on this NDI.
+                    "reverse_connection": a.reverse_connection,
+                    "contact_addresses": a.contact_addresses,
                 } for a in n.addresses if a.address
             ]
             suggested = "" if node_initiated else n.primary_address
+
+            # P1 — compute the suggested *connect IP override* per the
+            # A+C rule the operator picked (2026-05-12):
+            #   A) If the primary-mgt interface has a public contact
+            #      address, default to that public address.
+            #   C) Otherwise no auto-pick — the UI shows the picker and
+            #      the operator chooses, OR leaves it blank (= today's
+            #      behavior, dial the real interface IP).
+            #
+            # `reachable_via_nat` is the node-level summary: True iff at
+            # least one NDI has at least one public contact address.
+            # Drives the per-node banner regardless of cluster contact
+            # mode.
+            suggested_connect_ip = ""
+            reachable_via_nat = False
+            primary_public_contact = ""
+            for a in n.addresses:
+                publics = [c for c in a.contact_addresses if c.get("is_public")]
+                if publics:
+                    reachable_via_nat = True
+                    if a.is_primary_mgt and not primary_public_contact:
+                        primary_public_contact = publics[0]["address"]
+            # Rule A: only auto-pick when it's the primary-mgt interface's
+            # public contact address — that's what SMC itself dials.
+            if primary_public_contact:
+                suggested_connect_ip = primary_public_contact
 
             # Live cred test — drives the per-node UI in the wizard.
             # Status one of:
@@ -2067,9 +2127,7 @@ def credentials_discover_nodes():
                 cred_status = "not_enrolled"
                 cred_status_reason = ""
             else:
-                target = SSHTarget(hostname=enrolled.hostname,
-                                   port=enrolled.ssh_port,
-                                   username=enrolled.ssh_username)
+                target = _cred_to_target(enrolled)
                 payload = SSHCredential(
                     password=enrolled.encrypted_password,
                     host_fingerprint=enrolled.host_fingerprint,
@@ -2105,6 +2163,18 @@ def credentials_discover_nodes():
                 # Status-aware fields used by the new wizard:
                 "cred_status": cred_status,
                 "cred_status_reason": cred_status_reason,
+                # P1 — connect-IP override (NAT-aware).
+                "reachable_via_nat": reachable_via_nat,
+                "primary_public_contact": primary_public_contact,
+                "suggested_connect_ip": suggested_connect_ip,
+                # Echo the persisted override, if any. Phase 5 fills this
+                # when the operator confirms during enrollment; this read
+                # path lets the UI show the current override on a node
+                # the operator is re-visiting.
+                "connect_ip_override": (
+                    getattr(enrolled, "connect_ip_override", "") or ""
+                    if enrolled else ""
+                ),
             })
 
         # Aggregate destination-IP picker for the rule install:
@@ -2154,9 +2224,16 @@ def credentials_discover_nodes():
         else:
             source_drift_state = "sources_drift"
 
+        # P1 cluster-level summary: True iff ANY node has a public
+        # contact address. Drives the cluster banner ("Node-initiated
+        # but reachable via NAT for the nodes below").
+        cluster_reachable_via_nat = any(n.get("reachable_via_nat")
+                                        for n in out_nodes)
+
         return jsonify({
             "nodes": out_nodes,
             "node_initiated_contact": node_initiated,
+            "cluster_reachable_via_nat": cluster_reachable_via_nat,
             "rule_destinations": rule_destinations,
             "policy_name": policy_name,
             "policy_error": policy_error,
@@ -2785,6 +2862,12 @@ def credentials_bootstrap():
     hostname = request.form["hostname"].strip()
     ssh_port = int(request.form.get("ssh_port", "22"))
     ssh_username = request.form.get("ssh_username", "root").strip() or "root"
+    # P1: optional NAT-exit IP the wizard offers when the node is
+    # node-initiated but has a public contact address. Validated by
+    # `_validate_connect_ip_override` so the form can't smuggle in a
+    # bogus value.
+    connect_ip_override = _validate_connect_ip_override(
+        request.form.get("connect_ip_override", ""))
 
     wants_json = (
         request.headers.get("X-Requested-With") == "XMLHttpRequest"
@@ -2799,9 +2882,14 @@ def credentials_bootstrap():
         flash("Tenant or API key not found.", "danger")
         return redirect(url_for("dhcp.credentials_list"))
 
-    target = SSHTarget(hostname=hostname, port=ssh_port, username=ssh_username)
+    # P1: SSH dial uses the override when set; the SMC SSH-allow rule
+    # destination keeps using `hostname` (engine's real interface IP).
+    dial_host = connect_ip_override or hostname
+    target = SSHTarget(hostname=dial_host, port=ssh_port, username=ssh_username)
     cfg = _smc_cfg(tenant, api_key)
-    target_label = f"{engine_name}/node{node_index}@{hostname}"
+    target_label = f"{engine_name}/node{node_index}@{dial_host}"
+    if connect_ip_override:
+        target_label += f" (real={hostname})"
     audit = _audit_comment("auto-enrollment", engine_name)
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
 
@@ -2846,6 +2934,7 @@ def credentials_bootstrap():
             existing.last_verify_status = "ok"
             existing.last_error = ""
             existing.state_refreshed_at = now
+            existing.connect_ip_override = connect_ip_override
         else:
             db.session.add(DhcpEngineCredential(
                 domain_id=domain_id,
@@ -2857,6 +2946,7 @@ def credentials_bootstrap():
                 host_fingerprint=result.host_fingerprint,
                 last_verified_at=now, last_verify_status="ok",
                 state_refreshed_at=now,
+                connect_ip_override=connect_ip_override,
             ))
         # Enrollment proves both SSH (we connected to the node) and the
         # rule (it must have been in policy for the connect to work) —
@@ -2865,6 +2955,23 @@ def credentials_bootstrap():
         db.session.commit()
         _log_activity("ssh", "bootstrap", "ok", target_label,
                       f"fingerprint={result.host_fingerprint}")
+        # P1: dedicated audit row when a NAT override is in effect so
+        # operators can grep `/logs?feature=dhcp&action=credential.enrolled_via_nat`
+        # to see which nodes are being reached via 1:1 NAT.
+        if connect_ip_override:
+            try:
+                from shared.logging import audit
+                audit(
+                    feature="dhcp",
+                    action="credential.enrolled_via_nat",
+                    target=target_label,
+                    detail=(f"real_ip={hostname} "
+                            f"connect_ip={connect_ip_override} "
+                            f"node_index={node_index}"),
+                    domain_id=domain_id,
+                )
+            except Exception:
+                pass
         if wants_json:
             return jsonify(
                 ok=True,
@@ -2930,6 +3037,10 @@ def credentials_apply():
     except ValueError:
         new_port = 22
     new_username = (request.form.get("ssh_username") or "root").strip() or "root"
+    # P1: pick up the override from the wizard; empty / invalid → ""
+    # (= today's behavior, dial new_hostname).
+    new_connect_ip_override = _validate_connect_ip_override(
+        request.form.get("connect_ip_override", ""))
 
     # Phase B.3: tenant_id is going away on feature tables.
     _dids = _domain_ids_for_tenant(tenant_id)
@@ -2942,13 +3053,17 @@ def credentials_apply():
         return _err(f"No credential on record for {engine_name}/node_id={node_id}. "
                     f"Use Auto-enroll instead.", http=404)
 
-    target_label = f"{engine_name}/node{cred.node_index}@{new_hostname}"
+    # P1: SSH dial uses override; rule destination stays real IP.
+    dial_host = new_connect_ip_override or new_hostname
+    target_label = f"{engine_name}/node{cred.node_index}@{dial_host}"
+    if new_connect_ip_override:
+        target_label += f" (real={new_hostname})"
 
     # Live verify against the new target before committing. Apply must
     # never silently break a previously-working credential — if the
     # operator points us at an IP that doesn't actually accept this
     # credential, refuse and tell them to use Overwrite.
-    target = SSHTarget(hostname=new_hostname, port=new_port,
+    target = SSHTarget(hostname=dial_host, port=new_port,
                        username=new_username)
     payload = SSHCredential(password=cred.encrypted_password,
                             host_fingerprint=cred.host_fingerprint)
@@ -2972,10 +3087,12 @@ def credentials_apply():
     # All good — commit metadata.
     now = datetime.now(timezone.utc)
     old_summary = (f"hostname={cred.hostname!r} port={cred.ssh_port} "
-                   f"user={cred.ssh_username!r}")
+                   f"user={cred.ssh_username!r} "
+                   f"override={cred.connect_ip_override!r}")
     cred.hostname = new_hostname
     cred.ssh_port = new_port
     cred.ssh_username = new_username
+    cred.connect_ip_override = new_connect_ip_override
     cred.last_verified_at = now
     cred.last_verify_status = "ok"
     cred.last_error = ""
@@ -3071,6 +3188,11 @@ def credentials_bootstrap_batch():
                 "hostname":   host,
                 "port":       int(request.form.get(prefix + "ssh_port", "22")),
                 "username":   request.form.get(prefix + "ssh_username", "root").strip() or "root",
+                # P1: per-node override carried alongside the rest of
+                # the spec.  Validated defensively here so a bad value
+                # for one node doesn't poison the whole batch.
+                "connect_ip_override": _validate_connect_ip_override(
+                    request.form.get(prefix + "connect_ip_override", "")),
             })
         except (KeyError, ValueError) as exc:
             _log_activity("ssh", "bootstrap_batch", "failed",
@@ -3087,14 +3209,19 @@ def credentials_bootstrap_batch():
         with engine_bootstrap_lock(engine_name, timeout=180):
             with smc_session(cfg):
                 for spec in specs:
-                    target_label = f"{engine_name}/node{spec['node_index']}@{spec['hostname']}"
-                    target = SSHTarget(hostname=spec["hostname"], port=spec["port"],
+                    # P1: dial via override; rule destination stays real IP.
+                    dial_host = spec["connect_ip_override"] or spec["hostname"]
+                    target_label = f"{engine_name}/node{spec['node_index']}@{dial_host}"
+                    if spec["connect_ip_override"]:
+                        target_label += f" (real={spec['hostname']})"
+                    target = SSHTarget(hostname=dial_host, port=spec["port"],
                                        username=spec["username"])
                     res_entry: dict = {
                         "node_index": spec["node_index"],
                         "node_id":    spec["node_id"],
                         "node_name":  spec["node_name"],
                         "hostname":   spec["hostname"],
+                        "connect_ip_override": spec["connect_ip_override"],
                     }
                     try:
                         result = enroll_node(
@@ -3140,6 +3267,7 @@ def credentials_bootstrap_batch():
                         existing.last_verify_status = "ok"
                         existing.last_error = ""
                         existing.state_refreshed_at = now
+                        existing.connect_ip_override = spec["connect_ip_override"]
                     else:
                         db.session.add(DhcpEngineCredential(
                             domain_id=domain_id,
@@ -3153,6 +3281,7 @@ def credentials_bootstrap_batch():
                             host_fingerprint=result.host_fingerprint,
                             last_verified_at=now, last_verify_status="ok",
                             state_refreshed_at=now,
+                            connect_ip_override=spec["connect_ip_override"],
                         ))
                     db.session.commit()
                     successes += 1

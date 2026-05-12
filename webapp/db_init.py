@@ -312,6 +312,23 @@ def _migrate_post_create(db, app):
             db.session.rollback()
             log.error("Failed to add dhcp_engine_ssh_access.state_refreshed_at: %s", exc)
 
+    # P1 — contact-address-aware connect IP (2026-05-12). NULL/empty
+    # preserves today's behavior (dial `hostname` directly); set per-row
+    # via the credentials wizard when a node sits behind 1:1 NAT and
+    # FEA needs to reach its public exit address.
+    cols = _sqlite_columns(db, "dhcp_engine_credentials")
+    if cols and "connect_ip_override" not in cols:
+        log.info("P1: ALTER dhcp_engine_credentials ADD COLUMN connect_ip_override")
+        try:
+            db.session.execute(db.text(
+                "ALTER TABLE dhcp_engine_credentials ADD COLUMN "
+                "connect_ip_override TEXT NOT NULL DEFAULT ''"
+            ))
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            log.error("Failed to add dhcp_engine_credentials.connect_ip_override: %s", exc)
+
     # Phase G — drift detector. Adds `drift_state`, `last_drift_check_at`,
     # `drift_detail` columns to smc_objects. Pre-existing rows get a default
     # of 'unknown' and become 'clean' on the first scan that successfully
