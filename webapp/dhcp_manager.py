@@ -4559,17 +4559,36 @@ def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
                                 entry[key] = str(v)
                         except Exception as exc:
                             entry[f"{key}__error"] = str(exc)
-                    # Fallback: the SDK's `.data` if exposed.
+                    # Materialise ca.data (the ElementCache) into a
+                    # real dict so the diagnostic shows the on-wire
+                    # JSON, not just `<ElementCache at 0x...>`.
+                    # Accessing ca.data triggers the lazy fetch the
+                    # first time round.
                     try:
                         raw = getattr(ca, "data", None)
                         if raw is not None:
-                            entry["__raw_data"] = (
-                                raw if isinstance(raw, (dict, list, str, int, bool))
-                                else str(raw)
-                            )
+                            if hasattr(raw, "data") and isinstance(raw.data, dict):
+                                entry["__raw_data"] = dict(raw.data)
+                            else:
+                                try:
+                                    entry["__raw_data"] = dict(raw)
+                                except (TypeError, ValueError):
+                                    entry["__raw_data_repr"] = str(raw)
+                    except Exception as exc:
+                        entry["__raw_data_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    entry["__class__"] = type(ca).__name__
+                    # Also surface the wrapper's public attributes so
+                    # we can see whether `addresses` etc. exist.
+                    try:
+                        entry["__public_attrs"] = sorted(
+                            a for a in dir(ca)
+                            if not a.startswith("_")
+                            and not callable(getattr(ca, a, None))
+                        )
                     except Exception:
                         pass
-                    entry["__class__"] = type(ca).__name__
                     engine_level_raw.append(entry)
             except Exception as exc:
                 engine_level_raw = [{"error": str(exc),

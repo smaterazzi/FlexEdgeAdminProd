@@ -916,31 +916,108 @@ def _build_contact_address_map(engine) -> dict:
         return out
 
     for ca in cas:
+        # The SDK exposes ContactAddressNode as a wrapper whose only
+        # eagerly-set attributes are `interface_id` and `interface_ip`.
+        # The actual contact-address strings live in an ElementCache
+        # fetched lazily from `<engine>/contact_addresses` — accessing
+        # `ca.data` triggers the fetch and returns a dict-like view.
+        # We treat ca.data as the source of truth and fall back to
+        # the bare SDK attributes only if the cache is empty (very
+        # old SMC, or fetch error).
         try:
             iface_id = str(getattr(ca, "interface_id", "") or "")
             iface_ip = str(getattr(ca, "interface_ip", "") or "")
-            addresses = list(getattr(ca, "addresses", None) or [])
-            # The SDK's ContactAddress can also expose .location_ref /
-            # .dynamic; surface them defensively so the UI can show
-            # "Default" vs a named Location.
-            location = str(getattr(ca, "location", "") or
-                           getattr(ca, "location_ref", "") or "")
-            dynamic = bool(getattr(ca, "dynamic", False))
         except Exception:
             continue
+        # Materialize the lazy cache. `dict(ca.data)` forces the
+        # underlying HTTP fetch the first time it's called.
+        raw_data: dict = {}
+        try:
+            raw = ca.data
+            # ElementCache → dict via .data attribute or dict() coercion.
+            if hasattr(raw, "data") and isinstance(raw.data, dict):
+                raw_data = dict(raw.data)
+            else:
+                try:
+                    raw_data = dict(raw)
+                except (TypeError, ValueError):
+                    raw_data = {}
+        except Exception as exc:
+            logger.warning(
+                "_build_contact_address_map(%s): could not materialise "
+                "ContactAddressNode.data for (%s, %s): %s",
+                getattr(engine, "name", "?"), iface_id, iface_ip, exc,
+            )
+            raw_data = {}
+
+        # iface_id / iface_ip may also live inside ca.data — prefer
+        # whichever is populated (lets us key correctly even if the
+        # SDK wrapper attributes are blank).
+        iface_id = iface_id or str(raw_data.get("interface_id") or "")
+        iface_ip = iface_ip or str(raw_data.get("interface_ip") or "")
         if not iface_id and not iface_ip:
             continue
+
         bucket = out.setdefault((iface_id, iface_ip), [])
-        for addr in addresses:
-            addr_s = str(addr or "").strip()
-            if not addr_s:
-                continue
-            bucket.append({
-                "address": addr_s,
-                "location": location,
-                "is_public": _classify_public(addr_s),
-                "dynamic": dynamic,
-            })
+
+        # Inner contact-address list — each entry typically looks like
+        # ``{"address": "20.250.134.1", "location_ref": "...", "dynamic": false}``.
+        # The key may be ``contact_addresses`` (plural, list) or
+        # ``contact_address`` (singular, dict) depending on SMC version.
+        inner_list = raw_data.get("contact_addresses")
+        if inner_list is None:
+            singular = raw_data.get("contact_address")
+            inner_list = [singular] if isinstance(singular, dict) else []
+        if not isinstance(inner_list, list):
+            inner_list = []
+
+        for entry in inner_list:
+            if isinstance(entry, dict):
+                addr_s = str(entry.get("address") or
+                             entry.get("addr") or "").strip()
+                if not addr_s:
+                    continue
+                location = ""
+                for key in ("location", "location_name", "location_ref"):
+                    v = entry.get(key)
+                    if v:
+                        location = str(v)
+                        break
+                bucket.append({
+                    "address": addr_s,
+                    "location": location,
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": bool(entry.get("dynamic", False)),
+                })
+            elif isinstance(entry, str):
+                addr_s = entry.strip()
+                if not addr_s:
+                    continue
+                bucket.append({
+                    "address": addr_s,
+                    "location": "",
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": False,
+                })
+
+        # Last-resort fallback: very old SMC payloads expose an
+        # `addresses` list directly on the wrapper. Only consult it
+        # if ca.data was empty AND the wrapper actually has it.
+        if not bucket:
+            try:
+                fallback = list(getattr(ca, "addresses", None) or [])
+            except Exception:
+                fallback = []
+            for addr in fallback:
+                addr_s = str(addr or "").strip()
+                if not addr_s:
+                    continue
+                bucket.append({
+                    "address": addr_s,
+                    "location": "",
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": False,
+                })
     return out
 
 
