@@ -49,15 +49,31 @@ def _write_json(filepath, data):
 
 # ── Project CRUD ──────────────────────────────────────────────────────────
 
-def list_projects():
-    """Return a list of all project manifests, sorted by creation date (newest first)."""
+def list_projects(domain_id=None):
+    """Return project manifests sorted newest-first.
+
+    When ``domain_id`` is passed, returns only projects whose manifest's
+    ``domain_id`` field matches it. Legacy manifests with no ``domain_id``
+    (pre-C2 fix, 2026-05-20) are always included regardless — they need
+    to remain visible so operators can claim or delete them. Pass
+    ``domain_id=None`` to fetch every project on disk (used by callers
+    that don't have a Domain context, e.g. CLI cleanup tooling).
+    """
     _ensure_projects_dir()
     projects = []
     for d in PROJECTS_DIR.iterdir():
         if d.is_dir() and (d / "project.json").exists():
             proj = _read_json(d / "project.json")
-            if proj:
-                projects.append(proj)
+            if not proj:
+                continue
+            if domain_id is not None:
+                proj_did = proj.get("domain_id")
+                # proj_did is None → legacy manifest, always visible.
+                # proj_did matches → in-scope.
+                # proj_did differs → hidden from this Domain's view.
+                if proj_did is not None and proj_did != domain_id:
+                    continue
+            projects.append(proj)
     projects.sort(key=lambda p: p.get("created_at", ""), reverse=True)
     return projects
 
@@ -68,13 +84,18 @@ def get_project(project_id):
     return _read_json(manifest)
 
 
-def create_project(name, config_file_path, config_filename):
+def create_project(name, config_file_path, config_filename, domain_id=None):
     """Create a new project from a FortiGate config file.
 
     Args:
         name: Human-readable project name
         config_file_path: Path to the uploaded .conf file (temporary)
         config_filename: Original filename
+        domain_id: Active Domain's id (pinned into the manifest so
+            future routes can enforce Domain isolation per audit C2).
+            None is permitted for CLI-driven creates that have no
+            Domain context — those projects show up as "legacy" until
+            the first UI mutation claims them.
 
     Returns:
         Project manifest dict
@@ -92,6 +113,7 @@ def create_project(name, config_file_path, config_filename):
     manifest = {
         "id": project_id,
         "name": name,
+        "domain_id": domain_id,  # C2: per-Domain isolation
         "created_at": now,
         "updated_at": now,
         "status": "created",

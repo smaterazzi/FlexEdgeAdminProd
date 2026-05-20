@@ -7,9 +7,11 @@
         <h5 class="mb-0"><i class="bi bi-arrow-left-right"></i> Migration Projects</h5>
         <small class="text-muted">FortiGate to Forcepoint import projects</small>
     </div>
+    {% if is_domain_admin %}
     <a href="{{ url_for('migration_new') }}" class="btn btn-primary btn-sm">
         <i class="bi bi-plus-lg"></i> New Project
     </a>
+    {% endif %}
 </div>
 
 <div class="p-4">
@@ -60,15 +62,22 @@
                     </div>
                     {% endif %}
                 </div>
-                <div class="card-footer bg-transparent border-secondary d-flex gap-1">
+                <div class="card-footer bg-transparent border-secondary d-flex gap-1 align-items-center">
                     <a href="{{ url_for('migration_parsed', project_id=p.id) }}" class="btn btn-outline-light btn-sm flex-fill">
                         <i class="bi bi-eye"></i> View
                     </a>
-                    {% if status in ('parsed', 'validated', 'ready', 'imported') %}
+                    {% if not p.domain_id %}
+                    <span class="badge bg-warning text-dark"
+                          title="Legacy project — has no Domain assigned. First mutating action will claim it for the active Domain.">
+                        no Domain
+                    </span>
+                    {% endif %}
+                    {% if is_domain_admin and status in ('parsed', 'validated', 'ready', 'imported') %}
                     <a href="{{ url_for('migration_target', project_id=p.id) }}" class="btn btn-outline-info btn-sm">
                         <i class="bi bi-gear"></i>
                     </a>
                     {% endif %}
+                    {% if is_domain_admin %}
                     <form method="POST" action="{{ url_for('migration_delete', project_id=p.id) }}"
                           onsubmit="return confirm('Delete project {{ p.name }}?')" class="d-inline">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
@@ -76,6 +85,7 @@
                             <i class="bi bi-trash"></i>
                         </button>
                     </form>
+                    {% endif %}
                 </div>
             </div>
         </div>
@@ -85,9 +95,13 @@
     <div class="text-center py-5 text-muted">
         <i class="bi bi-inbox" style="font-size:3rem;"></i>
         <p class="mt-2">No migration projects yet.</p>
+        {% if is_domain_admin %}
         <a href="{{ url_for('migration_new') }}" class="btn btn-primary">
             <i class="bi bi-plus-lg"></i> Create First Project
         </a>
+        {% else %}
+        <p class="small">Domain Admin privileges are required to create migration projects.</p>
+        {% endif %}
     </div>
     {% endif %}
 </div>

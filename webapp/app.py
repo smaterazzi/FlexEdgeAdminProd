@@ -65,6 +65,7 @@ import smc_client
 import project_manager
 import fgt_parser
 from auth import auth_bp, init_auth, login_required, profile_required
+from webapp.auth_roles import domain_admin_required
 import user_manager
 
 # ── App Setup ────────────────────────────────────────────────────────────
@@ -1124,19 +1125,84 @@ def api_policy_rules(policy_name):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MIGRATION ROUTES  (require login; use project-stored target, not session cfg)
+#  MIGRATION ROUTES
+#
+#  Per audit C2 (landed 2026-05-20): mutating routes are gated by
+#  @domain_admin_required and refuse cross-Domain access via
+#  _migration_project_for_domain(). Read-only routes stay @login_required
+#  but still go through the helper so a Viewer in Domain A cannot enumerate
+#  Domain B's projects by URL-typing the id.
+#
+#  Project manifests carry `domain_id` from creation onwards. Pre-C2
+#  manifests have no `domain_id` field — they're surfaced under "Legacy
+#  (no Domain)" in the list and auto-claim into the active Domain on the
+#  first mutation (the helper writes back `domain_id` then).
 # ═══════════════════════════════════════════════════════════════════════════
+
+def _migration_project_for_domain(project_id, *, mutating: bool = False):
+    """Load a migration project + enforce Domain isolation.
+
+    Returns the project dict on success, or a Flask redirect/abort on
+    failure (caller forwards it).
+
+    Logic:
+      * Project not found → flash + redirect to /migration/.
+      * Project has ``domain_id`` set and it doesn't match ``g.domain.id``
+        → refuse (HTTP 403 + flash). Same for both mutating + viewing
+        callers — operators shouldn't see other Domains' migrations.
+      * Project has no ``domain_id`` (legacy manifest from before C2):
+        * On a mutating call, claim it for the current Domain — write
+          back ``domain_id = g.domain.id`` so subsequent calls are
+          properly scoped.
+        * On a viewing call, allow access and leave the field unset
+          so the operator can decide whether to claim it explicitly
+          later. Surfaces as "Legacy (no Domain)" badge in the list.
+    """
+    project = project_manager.get_project(project_id)
+    if not project:
+        flash("Project not found.", "danger")
+        return redirect(url_for("migration_projects"))
+
+    active_did = getattr(getattr(g, "domain", None), "id", None)
+    proj_did = project.get("domain_id")
+
+    if proj_did is not None and active_did is not None and proj_did != active_did:
+        flash("This migration project belongs to a different Domain. "
+              "Switch Domains via the topbar to access it.", "danger")
+        return redirect(url_for("migration_projects"))
+
+    if proj_did is None and mutating and active_did is not None:
+        # Implicit claim — first mutation pins the project to the
+        # operator's active Domain. This keeps legacy manifests usable
+        # without forcing a manual UI step. Audit-logged via project
+        # manifest's updated_at timestamp.
+        project_manager.update_project(project_id, {"domain_id": active_did})
+        project["domain_id"] = active_did
+
+    return project
+
 
 @app.route("/migration/")
 @login_required
 def migration_projects():
-    """List all migration projects."""
-    projects = project_manager.list_projects()
+    """List migration projects scoped to the active Domain.
+
+    Projects whose ``domain_id`` doesn't match the active Domain are
+    hidden — operators only see their own Domain's work. Legacy
+    manifests (no ``domain_id`` field) are surfaced for everyone with
+    a "no Domain" badge so they can be claimed or cleaned up.
+
+    Super Admins on a Domain still see only that Domain's projects —
+    if they want a cross-Domain view, they can switch Domains via the
+    topbar (one Domain at a time matches the operator mental model).
+    """
+    active_did = getattr(getattr(g, "domain", None), "id", None)
+    projects = project_manager.list_projects(domain_id=active_did)
     return render_template("migration/projects.html", projects=projects)
 
 
 @app.route("/migration/new", methods=["GET", "POST"])
-@login_required
+@domain_admin_required
 def migration_new():
     """Create a new migration project from a FortiGate config file."""
     if request.method == "GET":
@@ -1152,9 +1218,11 @@ def migration_new():
         flash("Please upload a FortiGate .conf file.", "danger")
         return render_template("migration/new_project.html")
 
+    active_did = getattr(getattr(g, "domain", None), "id", None)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".conf") as tmp:
         file.save(tmp.name)
-        project = project_manager.create_project(name, tmp.name, file.filename)
+        project = project_manager.create_project(
+            name, tmp.name, file.filename, domain_id=active_did)
 
     try:
         source_path = project_manager.get_source_path(project["id"])
@@ -1177,10 +1245,9 @@ def migration_new():
 @login_required
 def migration_parsed(project_id):
     """View parsed objects from the FortiGate config."""
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(project_id, mutating=False)
+    if not isinstance(project, dict):
+        return project  # redirect from the helper
     parsed = project_manager.get_parsed_objects(project_id)
     if not parsed:
         flash("Config not yet parsed.", "warning")
@@ -1190,13 +1257,12 @@ def migration_parsed(project_id):
 
 
 @app.route("/migration/<project_id>/target", methods=["GET", "POST"])
-@login_required
+@domain_admin_required
 def migration_target(project_id):
     """Configure SMC target for migration."""
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return project
 
     if request.method == "POST":
         target = {
@@ -1229,7 +1295,7 @@ def migration_target(project_id):
 
 
 @app.route("/migration/<project_id>/dhcp-map", methods=["GET", "POST"])
-@login_required
+@domain_admin_required
 def migration_dhcp_map(project_id):
     """Map FortiGate DHCP servers to target SMC scopes.
 
@@ -1244,10 +1310,9 @@ def migration_dhcp_map(project_id):
     """
     from webapp.dhcp_readiness import find_tenant_for_target, list_scope_options
 
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return project
 
     parsed = project_manager.get_parsed_objects(project_id)
     if not parsed:
@@ -1315,10 +1380,9 @@ def migration_dhcp_map(project_id):
 @login_required
 def migration_dedup(project_id):
     """Run deduplication and show results."""
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(project_id, mutating=False)
+    if not isinstance(project, dict):
+        return project
     parsed = project_manager.get_parsed_objects(project_id)
     if not parsed:
         flash("Config not yet parsed.", "warning")
@@ -1389,9 +1453,12 @@ def migration_dedup(project_id):
 
 
 @app.route("/migration/<project_id>/dedup/update", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_dedup_update(project_id):
     """Update dedup action for a specific object (AJAX)."""
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error", "message": "domain mismatch"}), 403
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
@@ -1413,7 +1480,7 @@ def migration_dedup_update(project_id):
 
 
 @app.route("/migration/<project_id>/dhcp/update", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_dhcp_update(project_id):
     """Toggle DHCP-reservation selection (AJAX).
 
@@ -1423,6 +1490,9 @@ def migration_dhcp_update(project_id):
     ``conflict_overwrite`` (so the importer treats it as an explicit
     overwrite of the existing Host) — UI button does this in one click.
     """
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error", "message": "domain mismatch"}), 403
     data = request.get_json() or {}
     fg_server_id = data.get("fg_server_id")
     fg_res_id    = str(data.get("fg_res_id", ""))
@@ -1460,10 +1530,9 @@ def migration_dhcp_update(project_id):
 @login_required
 def migration_rules(project_id):
     """View converted rules and select which to import."""
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(project_id, mutating=False)
+    if not isinstance(project, dict):
+        return project
     parsed = project_manager.get_parsed_objects(project_id)
     dedup  = project_manager.get_dedup_results(project_id)
     if not parsed or not dedup:
@@ -1489,9 +1558,12 @@ def migration_rules(project_id):
 
 
 @app.route("/migration/<project_id>/rules/update", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_rules_update(project_id):
     """Update rule selection (AJAX)."""
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error", "message": "domain mismatch"}), 403
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
@@ -1509,9 +1581,12 @@ def migration_rules_update(project_id):
 
 
 @app.route("/migration/<project_id>/nat-rules/update", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_nat_rules_update(project_id):
     """Update NAT rule selection (AJAX)."""
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error", "message": "domain mismatch"}), 403
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
@@ -1528,9 +1603,12 @@ def migration_nat_rules_update(project_id):
 
 
 @app.route("/migration/<project_id>/vpn/update", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_vpn_update(project_id):
     """Update VPN tunnel selection (AJAX)."""
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error", "message": "domain mismatch"}), 403
     data = request.get_json()
     if not data:
         return jsonify({"status": "error", "message": "No data"}), 400
@@ -1546,13 +1624,13 @@ def migration_vpn_update(project_id):
 
 
 @app.route("/migration/<project_id>/import", methods=["GET", "POST"])
-@login_required
+@domain_admin_required
 def migration_import(project_id):
     """Import execution page."""
-    project = project_manager.get_project(project_id)
-    if not project:
-        flash("Project not found.", "danger")
-        return redirect(url_for("migration_projects"))
+    project = _migration_project_for_domain(
+        project_id, mutating=(request.method == "POST"))
+    if not isinstance(project, dict):
+        return project
 
     if request.method == "POST":
         import_type = request.form.get("import_type", "all")
@@ -1978,9 +2056,12 @@ def migration_import(project_id):
 
 
 @app.route("/migration/<project_id>/delete", methods=["POST"])
-@login_required
+@domain_admin_required
 def migration_delete(project_id):
     """Delete a migration project."""
+    project = _migration_project_for_domain(project_id, mutating=True)
+    if not isinstance(project, dict):
+        return project
     project_manager.delete_project(project_id)
     flash("Project deleted.", "info")
     return redirect(url_for("migration_projects"))
@@ -1991,15 +2072,22 @@ def migration_delete(project_id):
 @app.route("/api/migration/<project_id>/status")
 @login_required
 def api_migration_status(project_id):
-    project = project_manager.get_project(project_id)
-    if not project:
-        return jsonify({"status": "error", "message": "Not found"}), 404
+    project = _migration_project_for_domain(project_id, mutating=False)
+    # The helper returns a Flask redirect on not-found / cross-Domain;
+    # API callers want JSON, so substitute.
+    if not isinstance(project, dict):
+        return jsonify({"status": "error",
+                        "message": "Not found or domain mismatch"}), 404
     return jsonify({"status": "ok", "project": project})
 
 
 @app.route("/api/migration/<project_id>/import-log")
 @login_required
 def api_migration_import_log(project_id):
+    project = _migration_project_for_domain(project_id, mutating=False)
+    if not isinstance(project, dict):
+        return jsonify({"status": "error",
+                        "message": "Not found or domain mismatch"}), 404
     log_data = project_manager.get_import_log(project_id)
     if not log_data:
         return jsonify({"status": "ok", "log": None})
