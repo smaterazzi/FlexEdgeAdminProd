@@ -117,5 +117,28 @@
             </div>
         </div>
     </div>
+
+    {% if is_super_admin %}
+    <div class="row g-4 mt-2">
+        <div class="col-md-12">
+            <div class="card bg-dark border-danger">
+                <div class="card-header bg-danger text-white">
+                    <i class="bi bi-exclamation-octagon-fill"></i> Danger zone — Super Admin only
+                </div>
+                <div class="card-body">
+                    <p style="font-size:0.85rem;" class="text-muted mb-2">
+                        <strong>Factory reset</strong> wipes every Tenant, API Key, Domain,
+                        and feature-table row. Only your Super Admin account, the encryption
+                        key, and platform settings survive. A backup ZIP is auto-downloaded
+                        before the wipe runs. There is no undo.
+                    </p>
+                    <a href="{{ url_for('admin.factory_reset_form') }}" class="btn btn-outline-danger btn-sm">
+                        <i class="bi bi-trash3-fill me-1"></i>Factory reset…
+                    </a>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endif %}
 </div>
 {% endblock %}

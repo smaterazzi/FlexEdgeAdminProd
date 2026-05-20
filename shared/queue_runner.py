@@ -1571,14 +1571,29 @@ def _handle_install_ssh_rule(change, cfg) -> HandlerResult:
                 return HandlerResult(success=False,
                                      error=f"install_ssh_rule failed: {result.error}")
 
-            # Persist DB record. Lookup-by-domain so we don't duplicate.
+            # Persist DB record. Check both new (domain_id) and legacy
+            # (tenant_id) uniqueness to avoid hitting the vestigial
+            # UNIQUE(tenant_id, engine_name) constraint on a stale row
+            # from a previous Domain. Same pattern as credentials + scopes.
+            from webapp.models import Domain
+            domain = db.session.get(Domain, change.domain_id)
+            ak = domain.api_key if domain is not None else None
+            legacy_tenant_id = ak.tenant_id if ak is not None else None
             access = (DhcpEngineSshAccess.query
                       .filter_by(domain_id=change.domain_id,
                                  engine_name=engine_name)
                       .first())
+            if access is None and legacy_tenant_id is not None:
+                access = (DhcpEngineSshAccess.query
+                          .filter_by(tenant_id=legacy_tenant_id,
+                                     engine_name=engine_name)
+                          .first())
             now = datetime.now(timezone.utc)
             csv_dst = ",".join(dest_ips)
             if access:
+                access.domain_id = change.domain_id  # backfill if NULL on legacy row
+                access.tenant_id = legacy_tenant_id
+                access.api_key_id = ak.id if ak is not None else None
                 access.policy_name = result.policy_name
                 access.rule_name = result.rule_name
                 access.rule_href = result.rule_href
@@ -1588,12 +1603,6 @@ def _handle_install_ssh_rule(change, cfg) -> HandlerResult:
                 access.last_seen_in_policy_at = now
                 access.state_refreshed_at = now
             else:
-                # Look up the Domain so we can fill the legacy tenant_id /
-                # api_key_id columns (still referenced by code reading the
-                # access row outside of g.domain context).
-                from webapp.models import Domain
-                domain = db.session.get(Domain, change.domain_id)
-                ak = domain.api_key if domain is not None else None
                 db.session.add(DhcpEngineSshAccess(
                     domain_id=change.domain_id,
                     tenant_id=ak.tenant_id if ak is not None else None,

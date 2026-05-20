@@ -848,6 +848,125 @@ def backup():
     )
 
 
+# ── Factory reset (Super Admin only) ────────────────────────────────────
+
+@admin_bp.route("/factory-reset", methods=["GET"])
+def factory_reset_form():
+    """Danger page — typed-confirmation form for full environment wipe.
+
+    Gated by Super Admin (not just admin) so a Domain Admin can't
+    detonate the whole deployment.
+    """
+    from webapp.auth_roles import is_super_admin
+    if not is_super_admin():
+        flash("Factory reset requires Super Admin privileges.", "danger")
+        return redirect(url_for("admin.dashboard"))
+
+    from webapp.factory_reset import CONFIRM_PHRASE
+    user_email = (session.get("user") or {}).get("email", "")
+    return render_template(
+        "admin/factory_reset.html",
+        confirm_phrase=CONFIRM_PHRASE,
+        super_admin_email=user_email,
+    )
+
+
+@admin_bp.route("/factory-reset", methods=["POST"])
+def factory_reset_execute():
+    """Stream the pre-reset backup ZIP, perform the reset, redirect to
+    dashboard with a flash summary.
+
+    Two-step within one request:
+      1. Validate the typed confirmation phrase. Bail with a flash on
+         mismatch.
+      2. Build the backup ZIP in memory (DB file + encryption key).
+      3. Execute the reset (DB wipe + filesystem clean + cache flush).
+      4. Stream the backup as a file download — the operator's browser
+         saves it BEFORE seeing the post-reset dashboard.
+
+    Note: the file download happens AFTER the wipe, but the ZIP was
+    built BEFORE — so it captures pre-reset state. The operator can
+    open it to recover any tenant/key/domain config they didn't mean
+    to lose.
+    """
+    from webapp.auth_roles import is_super_admin
+    if not is_super_admin():
+        flash("Factory reset requires Super Admin privileges.", "danger")
+        return redirect(url_for("admin.dashboard"))
+
+    from webapp.factory_reset import (
+        CONFIRM_PHRASE, is_confirmed, build_backup_zip, perform_reset,
+    )
+
+    typed = request.form.get("confirm_phrase", "")
+    if not is_confirmed(typed):
+        flash(
+            f"Confirmation phrase mismatch — type exactly '{CONFIRM_PHRASE}' "
+            f"to authorise the reset. Nothing was changed.",
+            "warning",
+        )
+        return redirect(url_for("admin.factory_reset_form"))
+
+    # Resolve the invoking user from the session BEFORE the wipe so we
+    # still have their User.id after non-super-admin users are gone.
+    import user_manager
+    user_email = (session.get("user") or {}).get("email", "")
+    user_row = User.query.filter_by(email=user_email).first()
+    if user_row is None:
+        flash("Could not resolve your User record — refusing reset to "
+              "avoid lockout. Contact support.", "danger")
+        return redirect(url_for("admin.dashboard"))
+
+    # 1. Build the backup BEFORE we wipe.
+    try:
+        backup_bytes, backup_filename = build_backup_zip()
+    except Exception as exc:
+        log.exception("factory_reset: backup build failed")
+        flash(f"Could not build pre-reset backup — aborting reset. {exc}",
+              "danger")
+        return redirect(url_for("admin.factory_reset_form"))
+
+    # 2. Wipe.
+    try:
+        report = perform_reset(invoking_user_id=user_row.id)
+    except Exception as exc:
+        log.exception("factory_reset: perform_reset raised")
+        flash(f"Reset FAILED partway through — system may be in an "
+              f"inconsistent state. Error: {exc}. Restore from the "
+              f"backup ZIP if needed.", "danger")
+        return send_file(
+            io.BytesIO(backup_bytes),
+            mimetype="application/zip",
+            as_attachment=True,
+            download_name=backup_filename,
+        )
+
+    # 3. Stash a summary into the flash queue. The operator lands back
+    #    on the dashboard with a green banner explaining what happened.
+    summary = (
+        f"Factory reset complete. "
+        f"{report.total_rows_deleted} rows deleted across "
+        f"{len(report.rows_deleted)} tables, "
+        f"{len(report.files_deleted)} on-disk artifacts removed, "
+        f"{report.cache_sections_cleared} cache section(s) cleared. "
+        f"Your Super Admin account ({report.super_admin_email}) survived "
+        f"the reset. Pre-reset backup downloading now — store it safely."
+    )
+    flash(summary, "success")
+
+    # 4. Stream the backup as the response body. The dashboard URL
+    #    redirect can't carry the file download, so the response itself
+    #    IS the ZIP — the operator gets the file, then can navigate
+    #    back manually. (Browsers handle file-download responses without
+    #    leaving the current page if the headers are right.)
+    return send_file(
+        io.BytesIO(backup_bytes),
+        mimetype="application/zip",
+        as_attachment=True,
+        download_name=backup_filename,
+    )
+
+
 # ── JSON Migration ──────────────────────────────────────────────────────
 
 @admin_bp.route("/migrate-json", methods=["POST"])

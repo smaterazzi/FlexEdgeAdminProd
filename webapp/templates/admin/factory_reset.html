@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+{% block title %}Factory Reset{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">Factory Reset</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <div class="card bg-dark border-danger mb-4">
+        <div class="card-header bg-danger text-white">
+            <i class="bi bi-exclamation-octagon-fill me-2"></i>
+            <strong>Danger zone — Factory reset</strong>
+        </div>
+        <div class="card-body">
+            <p>This action wipes the FlexEdgeAdmin deployment back to factory state.
+                It is intended for cases where the Domain layout has drifted too far
+                to clean up by hand, or when handing the box to a different operator.</p>
+
+            <h6 class="text-danger mt-3"><i class="bi bi-trash"></i> What gets wiped</h6>
+            <ul class="small mb-3">
+                <li>Every <strong>Tenant</strong>, <strong>API Key</strong>, and <strong>Domain</strong> row.</li>
+                <li>Every <strong>User</strong> row except Super Admin(s) — including yourself.</li>
+                <li>All <strong>DHCP</strong> scopes, reservations, deployments, credentials, and SSH-access rows.</li>
+                <li>All <strong>TLS</strong> certificates, deployments, and deployment logs.</li>
+                <li>All <strong>Engines</strong> data (scan history, sgInfo collections, terminal sessions).</li>
+                <li>All <strong>Change Queue</strong> entries + <strong>SMC object registry</strong>.</li>
+                <li>All <strong>Platform logs</strong> + legacy DHCP/TLS activity logs.</li>
+                <li><strong>On-disk artifacts</strong>: sgInfo archives, scan log files, webhook bearer tokens.</li>
+                <li>Every <strong>in-process cache</strong> section (SMC reads, engines list, scope discovery).</li>
+            </ul>
+
+            <h6 class="text-success mt-3"><i class="bi bi-shield-check"></i> What survives</h6>
+            <ul class="small mb-3">
+                <li>Your <strong>Super Admin</strong> account ({{ super_admin_email }}) — so you don't get locked out.</li>
+                <li>Any other user flagged <code>is_super_admin=True</code>.</li>
+                <li>The <strong>encryption key</strong> file on disk (so existing backup ZIPs remain restorable).</li>
+                <li><strong>Platform settings</strong> (log mode, retention, cache TTLs, feature toggles).</li>
+                <li><strong>Azure AD config</strong> in <code>.env</code> (outside the DB — automatically untouched).</li>
+            </ul>
+
+            <div class="alert alert-warning small mb-3">
+                <i class="bi bi-info-circle me-1"></i>
+                A <strong>backup ZIP</strong> of the current database + encryption key will be
+                generated and downloaded to your browser BEFORE the reset executes. Store
+                it safely — it's your only rollback path if you change your mind.
+            </div>
+
+            <form method="POST" action="{{ url_for('admin.factory_reset_execute') }}"
+                  id="factory-reset-form" autocomplete="off">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                <div class="mb-3">
+                    <label for="confirm_phrase" class="form-label">
+                        Type <code class="text-danger">{{ confirm_phrase }}</code>
+                        below to confirm — case-sensitive, no quotes.
+                    </label>
+                    <input type="text" class="form-control bg-dark text-light border-danger"
+                           id="confirm_phrase" name="confirm_phrase"
+                           autocomplete="off" spellcheck="false"
+                           required>
+                </div>
+
+                <div class="d-flex justify-content-between">
+                    <a href="{{ url_for('admin.dashboard') }}" class="btn btn-outline-secondary">
+                        <i class="bi bi-x-circle"></i> Cancel — back to dashboard
+                    </a>
+                    <button type="submit" class="btn btn-danger" id="reset-btn" disabled>
+                        <i class="bi bi-trash3-fill me-1"></i>
+                        Download backup &amp; reset to factory
+                    </button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<script>
+(function() {
+  const expected = {{ confirm_phrase|tojson }};
+  const input = document.getElementById('confirm_phrase');
+  const btn = document.getElementById('reset-btn');
+  const form = document.getElementById('factory-reset-form');
+
+  input.addEventListener('input', () => {
+    btn.disabled = (input.value !== expected);
+  });
+
+  form.addEventListener('submit', (e) => {
+    if (input.value !== expected) {
+      e.preventDefault();
+      return;
+    }
+    // Last-chance native confirm. Browsers can't suppress this — gives
+    // the operator one more out before the wipe runs.
+    if (!confirm('FINAL WARNING — this wipes the entire deployment back to '
+                 + 'factory state. Click OK to download the backup ZIP and '
+                 + 'execute the reset, or Cancel to abort.')) {
+      e.preventDefault();
+    }
+  });
+})();
+</script>
+{% endblock %}
