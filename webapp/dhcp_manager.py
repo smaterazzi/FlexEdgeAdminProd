@@ -663,11 +663,21 @@ def scopes_discover():
         added, updated = 0, 0
         now = datetime.now(timezone.utc)
         for info in found:
+            # Check both new (domain_id) and legacy (tenant_id) uniqueness to
+            # avoid hitting the vestigial UNIQUE(tenant_id, engine_name,
+            # interface_id) constraint on a stale row from a previous Domain.
+            # Same pattern as the credentials upsert.
             existing = DhcpScope.query.filter_by(
                 domain_id=domain_id,
                 engine_name=engine_name,
                 interface_id=info.interface_id,
             ).first()
+            if existing is None:
+                existing = DhcpScope.query.filter_by(
+                    tenant_id=tenant.id,
+                    engine_name=engine_name,
+                    interface_id=info.interface_id,
+                ).first()
             if existing:
                 existing.api_key_id = api_key.id
                 existing.domain_id = domain_id  # backfill if it was NULL on legacy rows
