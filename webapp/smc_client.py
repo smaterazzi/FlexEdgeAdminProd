@@ -56,17 +56,20 @@ def smc_session(cfg=None):
     if cfg is None:
         cfg = load_config()
 
+    # Accept both dict and dataclass (SMCConfig) callers.
+    _g = (lambda k, d=None: cfg.get(k, d)) if isinstance(cfg, dict) else (lambda k, d=None: getattr(cfg, k, d))
+
     login_kwargs = {
-        "url": cfg["smc_url"],
-        "api_key": cfg["api_key"],
-        "verify": cfg.get("verify_ssl", False),
-        "timeout": cfg.get("timeout", 120),
+        "url": _g("smc_url") or _g("url"),
+        "api_key": _g("api_key"),
+        "verify": _g("verify_ssl", False),
+        "timeout": _g("timeout", 120),
     }
-    if cfg.get("api_version"):
-        login_kwargs["api_version"] = cfg["api_version"]
-    if cfg.get("domain"):
-        login_kwargs["domain"] = cfg["domain"]
-    if cfg.get("retry_on_busy", True):
+    if _g("api_version"):
+        login_kwargs["api_version"] = _g("api_version")
+    if _g("domain"):
+        login_kwargs["domain"] = _g("domain")
+    if _g("retry_on_busy", True):
         login_kwargs["retry_on_busy"] = True
 
     with smc_global_lock():
