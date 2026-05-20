@@ -176,7 +176,12 @@
 <div class="alert alert-warning py-2 px-3 mb-3 small">
   <i class="bi bi-exclamation-triangle me-1"></i>
   This scope has no parseable <code>subnet_cidr</code> — leases are NOT
-  filtered. Re-run scope discovery in DHCP Manager to fix.
+  filtered, and the <strong>Full subnet</strong> scan mode is unavailable.
+  We tried to derive a CIDR from saved
+  gateway=<code>{{ scope.gateway or '∅' }}</code>
+  pool=<code>{{ scope.dhcp_pool_start or '∅' }}</code>–<code>{{ scope.dhcp_pool_end or '∅' }}</code>
+  but didn't have enough anchors. Re-run scope discovery, or use the
+  <strong>Custom range</strong> scan mode (it does not require a CIDR).
 </div>
 {% endif %}
 

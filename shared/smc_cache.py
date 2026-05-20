@@ -181,12 +181,21 @@ class CachedValue:
     """Wrapper returned by ``cache_get_or_fetch`` — bundles the actual
     data with metadata the renderer needs to surface freshness to the
     operator (badge + refresh button).
+
+    ``domain_id`` is auto-stamped from ``key_parts[0]`` when it's an
+    integer (the convention every Domain-scoped section follows per the
+    standing rule). Consumers that iterate the raw cache for cross-cut
+    features (e.g. the quick-search index) MUST filter by this field to
+    keep the Domain-Scoping invariant — see audit C5 (landed 2026-05-20).
+    Sections that don't carry a Domain (none today) get ``domain_id=None``
+    and are surfaced cross-Domain.
     """
     data: Any
     cached_at: datetime
     served_from_cache: bool
     section: str
     cache_key: str
+    domain_id: int | None = None
 
     @property
     def age_seconds(self) -> float:
@@ -280,12 +289,25 @@ def cache_get_or_fetch(section: str,
     global _hit_count, _miss_count
     cache, lock = _get_section_cache(section, ttl)
     cache_key = _build_key(section, key_parts)
+    # Domain-Scoping stamp (C5): the standing rule is "first key part is
+    # ``domain_id`` for any Domain-scoped section". When that holds, we
+    # persist domain_id alongside the value so cross-cut iterators can
+    # filter without re-hashing or re-walking. When the rule doesn't
+    # hold (legacy or genuinely cross-Domain section), domain_id is None
+    # and consumers must treat the entry as visible everywhere.
+    domain_id = _extract_domain_id(key_parts)
 
     if not refresh:
         with lock:
             cached = cache.get(cache_key)
         if cached is not None:
-            data, cached_at = cached
+            # Tolerate both legacy 2-tuple entries and new 3-tuple form
+            # so a rolling upgrade doesn't lose cache state.
+            if len(cached) == 3:
+                data, cached_at, stored_domain_id = cached
+            else:
+                data, cached_at = cached
+                stored_domain_id = domain_id
             _hit_count += 1
             return CachedValue(
                 data=data,
@@ -293,6 +315,7 @@ def cache_get_or_fetch(section: str,
                 served_from_cache=True,
                 section=section,
                 cache_key=cache_key,
+                domain_id=stored_domain_id,
             )
 
     # Miss / refresh — fetch live (outside the lock so SMC I/O doesn't
@@ -308,14 +331,43 @@ def cache_get_or_fetch(section: str,
 
     cached_at = datetime.now(timezone.utc)
     with lock:
-        cache[cache_key] = (fresh_data, cached_at)
+        cache[cache_key] = (fresh_data, cached_at, domain_id)
     return CachedValue(
         data=fresh_data,
         cached_at=cached_at,
         served_from_cache=False,
         section=section,
         cache_key=cache_key,
+        domain_id=domain_id,
     )
+
+
+def _extract_domain_id(key_parts) -> int | None:
+    """Best-effort extraction of the Domain id from a ``key_parts`` tuple.
+
+    Returns the value of ``key_parts[0]`` when it's a positive int,
+    otherwise None. Matches the standing-rule convention used by every
+    Domain-scoped section in the codebase:
+      * ``engines``       — ``(domain_id,)``
+      * ``cluster``       — ``(domain_id, engine_name)``
+      * ``smc.explorer.*`` — ``(domain_id, filter_text, fgt_only)``
+      * ``smc.element.*`` — ``(domain_id, element_name)``
+      * ``smc.policy.*``  — ``(domain_id, …)``
+      * ``dhcp.*``        — ``(domain_id, …)``
+
+    Non-Domain-scoped sections (e.g. anything keyed by url+api_key_hash
+    only, or pure-static lookup tables) pass through with ``None``.
+    """
+    try:
+        first = key_parts[0]
+    except (IndexError, TypeError):
+        return None
+    if isinstance(first, bool):
+        # bool is an int subclass — treat True/False as "not a domain id".
+        return None
+    if isinstance(first, int) and first > 0:
+        return first
+    return None
 
 
 # ── Invalidation ─────────────────────────────────────────────────────────

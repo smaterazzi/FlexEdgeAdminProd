@@ -162,7 +162,7 @@
     {% with messages = get_flashed_messages(with_categories=true) %}
       {% for category, msg in messages %}
       <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
-          {{ msg|safe }}
+          {{ msg }}
           <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
       </div>
       {% endfor %}

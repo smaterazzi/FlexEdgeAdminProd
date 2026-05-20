@@ -44,6 +44,7 @@ from webapp.smc_dhcp_client import (
     is_valid_mac, normalize_mac,
     find_ssh_access_rule, find_active_policy,
     update_source_host_address, add_source_host_to_rule,
+    _derive_cidr_from_pool,
 )
 from webapp.smc_tls_client import list_engines, smc_error_detail
 from webapp.dhcp_ssh import (
@@ -267,6 +268,59 @@ def _scope_with_creds_or_redirect(scope_id: int) -> DhcpScope:
         )
         return None
     return scope
+
+
+def _lazy_backfill_subnet_cidr(scope: DhcpScope) -> bool:
+    """Backfill ``scope.subnet_cidr`` from saved gateway/pool fields when
+    discovery didn't manage to set it.
+
+    Why: scopes discovered before the 2026-05-20 CIDR-derivation fallback
+    landed (or scopes whose SMC payload has neither ``address`` nor
+    ``network_value`` on the interface level — observed on some cluster
+    VLAN sub-interfaces) ended up with ``subnet_cidr=""`` in the DB. That
+    blocks the leases subnet-filter AND the Full-subnet scan, with the
+    operator told to "Re-run scope discovery" — which doesn't help if
+    SMC still won't give us the missing fields. But the scope row often
+    *does* have ``gateway`` + ``dhcp_pool_start`` + ``dhcp_pool_end``
+    persisted from that same discovery, which is enough to derive a
+    usable CIDR locally.
+
+    Returns True iff a value was derived and persisted. No-op when
+    ``subnet_cidr`` is already set, or when there isn't enough data on
+    the row to produce at least a /30 (≥4 hosts) result.
+    """
+    if scope.subnet_cidr:
+        return False
+    derived_cidr, _ = _derive_cidr_from_pool(
+        {"default_gateway": scope.gateway or ""},
+        scope.dhcp_pool_start or "",
+        scope.dhcp_pool_end or "",
+    )
+    if not derived_cidr:
+        return False
+    # Refuse trivially small derivations (/31 or /32). They happen when
+    # only the gateway is known, or when pool_start == pool_end, and
+    # would be useless for scanning or filtering anyway.
+    try:
+        from ipaddress import ip_network
+        net = ip_network(derived_cidr, strict=False)
+        if net.prefixlen >= 31:
+            return False
+    except ValueError:
+        return False
+    scope.subnet_cidr = derived_cidr
+    try:
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        return False
+    log.info(
+        "Backfilled subnet_cidr=%s on scope %s (%s/%s) from saved "
+        "gateway=%r pool=%r-%r",
+        derived_cidr, scope.id, scope.engine_name, scope.interface_id,
+        scope.gateway, scope.dhcp_pool_start, scope.dhcp_pool_end,
+    )
+    return True
 
 
 def _domain_from_form(tenant_id: int, api_key_id: int) -> Domain | None:
@@ -3318,6 +3372,12 @@ def scope_leases(scope_id):
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
+    # Auto-recover scopes whose ``subnet_cidr`` was left empty by an old
+    # discovery run (pre-2026-05-20 fallback) but whose gateway/pool
+    # fields are intact in the DB. Avoids forcing the operator to
+    # re-discover when SMC still won't yield ``address``/``network_value``.
+    _lazy_backfill_subnet_cidr(scope)
+
     # Subnet-scan UX — handle ?scan_id=X. Either render the watcher
     # (state=running), consume + enrich (state=done), or fall through
     # cleanly with a flash on failure / expiry.
@@ -3664,6 +3724,11 @@ def scope_scan(scope_id):
     scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
+
+    # Match what scope_leases does — derive subnet_cidr from saved
+    # gateway/pool when discovery left it empty. Without this, the
+    # Full-subnet mode would refuse even though we have enough info.
+    _lazy_backfill_subnet_cidr(scope)
 
     creds = (DhcpEngineCredential.query
              .filter_by(domain_id=scope.domain_id,

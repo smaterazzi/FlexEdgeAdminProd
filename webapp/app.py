@@ -1027,13 +1027,42 @@ def api_quick_search():
     #   engines                 → /engines/clusters
     #   cluster                 → /engines/clusters/<name>
     #   policy_list / policy    → /policy/<name>
+    #
+    # Audit C5 (landed 2026-05-20): the iteration filters by domain_id
+    # so operators only see their own Domain's SMC elements. Cache
+    # entries store their domain_id as a 3-tuple (data, cached_at,
+    # domain_id); entries without one (legacy 2-tuple form) are treated
+    # as cross-Domain and surfaced everywhere. Active Domain is taken
+    # from `g.domain`; absent → no SMC-element matches surface (operator
+    # has no scope yet).
+    active_domain_id = getattr(getattr(g, "domain", None), "id", None)
     try:
         from shared.smc_cache import _section_caches
         # Iterate snapshot — concurrent eviction is fine, we just skip.
         for section, tcache in list(_section_caches.items()):
             try:
-                for _, val in list(tcache.items()):
-                    data = getattr(val, "data", val)
+                for _, cached_entry in list(tcache.items()):
+                    # Entries are 3-tuples since C5: (data, ts, domain_id).
+                    # Fall through for 2-tuple legacy entries that may
+                    # linger across a rolling restart.
+                    if isinstance(cached_entry, tuple):
+                        if len(cached_entry) == 3:
+                            data, _ts, entry_domain_id = cached_entry
+                        else:
+                            data = cached_entry[0]
+                            entry_domain_id = None
+                    else:
+                        data = getattr(cached_entry, "data", cached_entry)
+                        entry_domain_id = getattr(
+                            cached_entry, "domain_id", None)
+                    # Domain-Scoping filter: skip entries that belong to
+                    # OTHER Domains. ``None`` means "not Domain-scoped"
+                    # (e.g. a future static lookup) — those stay
+                    # visible. When the operator has no active Domain,
+                    # only None-stamped entries survive.
+                    if (entry_domain_id is not None
+                            and entry_domain_id != active_domain_id):
+                        continue
                     items = data if isinstance(data, list) else []
                     for item in items:
                         if not isinstance(item, dict):
