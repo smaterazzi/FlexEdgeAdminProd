@@ -721,6 +721,26 @@ def api_key_new():
                            existing_tenants=existing_tenants)
 
 
+@admin_bp.route("/api-keys/<int:id>/rotate", methods=["POST"])
+@admin_required
+def api_key_rotate(id):
+    """Replace the encrypted API key plaintext on an existing record.
+
+    All Domains, feature rows, and server config stay intact — only the
+    encrypted key blob and its hash are overwritten.
+    """
+    key = ApiKey.query.get_or_404(id)
+    new_plaintext = (request.form.get("new_api_key") or "").strip()
+    if not new_plaintext:
+        flash("New API key value is required.", "danger")
+        return redirect(url_for("admin.api_keys"))
+
+    key.set_key(new_plaintext)
+    db.session.commit()
+    flash(f"API key '{key.name}' rotated successfully.", "success")
+    return redirect(url_for("admin.api_keys"))
+
+
 @admin_bp.route("/api-keys/<int:id>/revoke", methods=["POST"])
 @admin_required
 def api_key_revoke(id):

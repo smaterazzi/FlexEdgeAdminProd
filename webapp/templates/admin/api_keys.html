@@ -75,6 +75,11 @@
                             </button>
                         </form>
                         {% endif %}
+                        <button type="button" class="btn btn-outline-info btn-sm py-0 px-2 ms-1"
+                                title="Rotate: replace the API key value (keeps all Domains and config intact)"
+                                data-bs-toggle="modal" data-bs-target="#rotateModal{{ k.id }}">
+                            <i class="bi bi-arrow-repeat"></i>
+                        </button>
                         {# Hard-delete — refused by the backend if any Domain
                            still references this key. Cascade-delete (force=1)
                            is intentionally NOT exposed in the UI — operator
@@ -96,4 +101,31 @@
         </table>
     </div>
 </div>
+
+{% for k in api_keys %}
+<div class="modal fade" id="rotateModal{{ k.id }}" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content bg-dark text-light">
+      <form method="POST" action="{{ url_for('admin.api_key_rotate', id=k.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-header border-secondary">
+          <h5 class="modal-title"><i class="bi bi-arrow-repeat me-2"></i>Rotate API Key</h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p class="text-muted mb-3">Replace the key for <strong>{{ k.name }}</strong>. All Domains, credentials, and server config stay intact.</p>
+          <label for="newKey{{ k.id }}" class="form-label">New API Key</label>
+          <input type="text" class="form-control bg-dark text-light border-secondary"
+                 id="newKey{{ k.id }}" name="new_api_key" required autocomplete="off"
+                 placeholder="Paste the new SMC API key">
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-info btn-sm">Rotate Key</button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endfor %}
 {% endblock %}
