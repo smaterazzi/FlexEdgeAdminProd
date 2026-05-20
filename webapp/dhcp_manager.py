@@ -2692,10 +2692,15 @@ def credentials_bootstrap():
                   f"{result.error}", "danger")
             return redirect(url_for("dhcp.credentials_list"))
 
-        # Persist credential
+        # Persist credential — check both new (domain_id) and legacy (tenant_id)
+        # uniqueness to avoid hitting the vestigial UNIQUE constraint.
         existing = DhcpEngineCredential.query.filter_by(
             domain_id=domain_id, engine_name=engine_name, node_id=node_id,
         ).first()
+        if existing is None:
+            existing = DhcpEngineCredential.query.filter_by(
+                tenant_id=tenant_id, engine_name=engine_name, node_id=node_id,
+            ).first()
         now = datetime.now(timezone.utc)
         if existing:
             existing.api_key_id = api_key_id
@@ -2985,11 +2990,17 @@ def credentials_bootstrap_batch():
                                       "failed", target_label, result.error)
                         continue
 
-                    # Persist this credential
+                    # Persist this credential — check both new (domain_id) and
+                    # legacy (tenant_id) uniqueness to avoid the vestigial constraint.
                     existing = DhcpEngineCredential.query.filter_by(
                         domain_id=domain_id, engine_name=engine_name,
                         node_id=spec["node_id"],
                     ).first()
+                    if existing is None:
+                        existing = DhcpEngineCredential.query.filter_by(
+                            tenant_id=tenant_id, engine_name=engine_name,
+                            node_id=spec["node_id"],
+                        ).first()
                     now = datetime.now(timezone.utc)
                     if existing:
                         existing.api_key_id = api_key_id
