@@ -318,6 +318,7 @@
             data-ends="{{ l.ends.isoformat() if l.ends else '' }}"
             data-seen="{{ (l.seen_on_nodes|join(',')) if l.seen_on_nodes else '' }}"
             data-reservation="{{ (l.reservation_host or '')|lower }}"
+            data-smc-host-status="{{ l.smc_host_status or '' }}"
             data-discovery="{{ l.scan_state or '' }}">
           <td>
             {% if l.reservation_id %}
@@ -376,6 +377,16 @@
                   <i class="bi bi-exclamation-triangle"></i> {{ l.reservation_host }} (expects {{ l.reservation_ip }})
                 </a>
               {% endif %}
+            {% elif l.smc_host_status == 'will_adopt' %}
+              <span class="badge bg-warning text-dark"
+                    title="SMC already has Host '{{ l.smc_host_name }}' with this IP (from a previous deployment). Reserving will ADOPT the existing element — no duplicate created.">
+                <i class="bi bi-link-45deg"></i> in SMC — will adopt
+              </span>
+            {% elif l.smc_host_status == 'name_collision' %}
+              <span class="badge bg-danger"
+                    title="SMC already has Host '{{ l.smc_host_name }}' with a different IP ({{ l.smc_host_ip }}). Reserving will FAIL until the old Host is renamed or deleted in SMC Management Client.">
+                <i class="bi bi-exclamation-triangle"></i> name collision in SMC
+              </span>
             {% else %}
               <span class="text-muted">pool</span>
             {% endif %}

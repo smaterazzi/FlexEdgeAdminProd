@@ -439,6 +439,58 @@ def _looks_like_ip(s: str) -> bool:
     return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
 
 
+def _derive_cidr_from_pool(dhcp_cfg: dict, pool_start: str, pool_end: str
+                           ) -> tuple[str, str]:
+    """Best-effort subnet derivation when the interface payload didn't
+    expose ``address``/``network_value`` directly.
+
+    Uses the DHCP gateway (advertised to clients via ``default_gateway``)
+    plus the pool start/end as anchor IPs, then picks the smallest
+    summarising IPv4 network that covers all of them. The gateway value
+    is also returned so callers can use it instead of an empty string.
+
+    Returns ``("", "")`` when there isn't enough information.
+    """
+    gw_raw = dhcp_cfg.get("default_gateway") if isinstance(dhcp_cfg, dict) else ""
+    if isinstance(gw_raw, dict):
+        # Some SMC shapes wrap the gateway as {"address": "..."}.
+        gw_raw = gw_raw.get("address") or ""
+    gw = str(gw_raw or "").strip()
+
+    anchors: list[ipaddress.IPv4Address] = []
+    for cand in (gw, pool_start, pool_end):
+        if not cand or not _looks_like_ip(cand):
+            continue
+        try:
+            anchors.append(ipaddress.IPv4Address(cand))
+        except (ValueError, ipaddress.AddressValueError):
+            continue
+
+    if not anchors:
+        return "", ""
+
+    try:
+        # collapse_addresses + summarize_address_range gives us the
+        # smallest single network covering low..high.
+        low = min(anchors)
+        high = max(anchors)
+        networks = list(ipaddress.summarize_address_range(low, high))
+        if not networks:
+            return "", gw
+        # summarize_address_range can return multiple networks for
+        # ranges that don't align — pick the supernet that covers all.
+        # Walk up prefix lengths until one network contains everything.
+        prefix = networks[0].prefixlen
+        while prefix > 0:
+            candidate = ipaddress.ip_network(f"{low}/{prefix}", strict=False)
+            if all(a in candidate for a in anchors):
+                return str(candidate), gw
+            prefix -= 1
+    except Exception:
+        return "", gw
+    return "", gw
+
+
 def _build_scope(engine_name: str, iface_id: str,
                  level_payload: dict, dhcp_cfg: dict,
                  address: str, network: str) -> DhcpScopeInfo:
@@ -483,6 +535,23 @@ def _build_scope(engine_name: str, iface_id: str,
             gateway = address
         except ValueError:
             cidr = network
+
+    # Fallback for interface shapes where SMC didn't expose
+    # `address`/`network_value` on the level payload (observed on
+    # cluster VLAN sub-interfaces). If we have the DHCP gateway and
+    # a pool, derive the smallest covering /N network. This keeps the
+    # lease-page filter working and unlocks the "Full subnet" scan mode
+    # without operators having to manually re-run discovery.
+    if not cidr:
+        derived_cidr, derived_gw = _derive_cidr_from_pool(dhcp_cfg, pool_start, pool_end)
+        if derived_cidr:
+            cidr = derived_cidr
+            gateway = gateway or derived_gw
+            logger.info(
+                "DHCP scope %s/%s: subnet_cidr derived from gateway+pool → %s "
+                "(level payload had no address/network_value)",
+                engine_name, iface_id, cidr,
+            )
 
     lease = int(
         level_payload.get("default_lease_time")

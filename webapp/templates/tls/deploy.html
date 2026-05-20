@@ -29,7 +29,7 @@
                     {% for t in tenants %}<option value="{{ t.id }}">{{ t.name }} ({{ t.smc_url }})</option>{% endfor %}
                 </select>
                 <div class="form-text">Tenants are managed in the
-                    <a href="{{ url_for('admin.tenants') }}">Admin Portal</a>.</div>
+                    <a href="{{ url_for('admin.dashboard') }}">Admin Portal</a>.</div>
             </div>
 
             <div class="mb-3">

@@ -3466,6 +3466,9 @@ def scope_leases(scope_id):
             row["reservation_ip"] = ""
             row["reservation_matches"] = None
         row["from_scan"] = False  # came from dhcpd.leases
+        row["smc_host_status"] = ""    # populated below from SMC index
+        row["smc_host_name"] = ""
+        row["smc_host_ip"] = ""
 
     # If we just consumed a scan report, fold the L3/L2 results into
     # every lease row, AND promote in-pool scan responders without a
@@ -3560,6 +3563,52 @@ def scope_leases(scope_id):
                 key=lambda r: tuple(int(p) for p in r["ip"].split(".")))
         except Exception:
             pass
+
+    # ── SMC-Host pre-check for untracked rows ────────────────────────
+    #
+    # For every lease row that isn't already tracked as a DhcpReservation,
+    # compute the planned SMC Host name and look it up in SMC. If SMC
+    # already has a Host with that name (left over from a prior
+    # deployment), the bulk-reserve action will either ADOPT (same IP)
+    # or REFUSE (IP mismatch) — surface that intent here so the operator
+    # can see it before ticking the box.
+    #
+    # One SMC roundtrip per page render (cached via dhcp.hosts.<subnet>
+    # for 60s); pulls every Host whose IP is in the scope's subnet and
+    # builds a name→view dict for O(1) lookups across N untracked rows.
+    untracked_to_check = [r for r in merged
+                          if not r.get("reservation_id")
+                          and r.get("mac")
+                          and r.get("ip")]
+    if untracked_to_check and scope.subnet_cidr:
+        try:
+            smc_host_index = _fetch_smc_host_index_for_scope(scope)
+            taken_check: set[str] = set()
+            for row in untracked_to_check:
+                planned_name = _smc_name_from_lease(
+                    row.get("client_hostname", ""),
+                    row["mac"],
+                    taken_check,
+                )
+                # NOTE: do NOT add planned_name to taken_check — each row
+                # is evaluated independently; the reserve action's
+                # disambiguation (-2, -3) only applies within a single
+                # POST batch.
+                existing = smc_host_index.get(planned_name)
+                if existing is None:
+                    continue
+                row["smc_host_name"] = planned_name
+                row["smc_host_ip"] = (existing.address or "").strip()
+                if row["smc_host_ip"] == row["ip"]:
+                    row["smc_host_status"] = "will_adopt"
+                else:
+                    row["smc_host_status"] = "name_collision"
+        except Exception as exc:
+            # Don't fail the leases page if SMC is briefly unreachable —
+            # the operator still sees lease state. The bulk-reserve action
+            # will surface the real error if they tick a colliding row.
+            log.warning("scope_leases: SMC host pre-check failed for "
+                        "scope %s: %s", scope.id, exc)
 
     # Final stable sort by IP (numeric octet tuple) — fixes the
     # lexicographic ordering bug where 192.168.1.6 sorted after
@@ -3733,6 +3782,52 @@ def scope_scan_status(scope_id):
 _SMC_NAME_SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
 
+def _fetch_smc_host_index_for_scope(scope) -> dict:
+    """Return ``{host.name: DhcpHostView}`` for every SMC Host element
+    whose IP is inside the scope's subnet.
+
+    Cached via ``smc_cache`` section ``dhcp.hosts.<subnet>`` with the
+    Quick TTL (1h by default) — fast enough that operators viewing the
+    same scope's leases repeatedly don't pay the SMC roundtrip again.
+    The cache is best-effort: cache failure or SMC unavailability bubble
+    up as exceptions for the caller to swallow.
+
+    Used by ``scope_leases`` to pre-flag rows whose planned SMC Host
+    name already exists (so the operator sees adopt-vs-collide intent
+    before clicking "Reserve").
+    """
+    if not (scope and scope.subnet_cidr):
+        return {}
+    domain = scope.domain
+    if domain is None or domain.api_key is None:
+        return {}
+
+    from shared.smc_cache import cache_get_or_fetch, get_quick_ttl
+
+    def _fetch() -> list[dict]:
+        cfg = _smc_cfg(domain)
+        with smc_session(cfg):
+            views = host_list_by_scope(scope.subnet_cidr)
+        # Persist as JSON-safe dicts so future Redis swap is mechanical.
+        return [
+            {"name": v.name, "href": v.href, "address": v.address,
+             "mac_address": v.mac_address, "comment": v.comment}
+            for v in views
+        ]
+
+    cv = cache_get_or_fetch(
+        section="dhcp.hosts",
+        key_parts=(domain.id, scope.subnet_cidr),
+        fetcher=_fetch,
+        ttl=get_quick_ttl(),
+    )
+    # Re-hydrate to lightweight objects that expose the attributes the
+    # caller actually reads (.name, .address). Using SimpleNamespace
+    # avoids importing the full DhcpHostView dataclass here.
+    from types import SimpleNamespace
+    return {d["name"]: SimpleNamespace(**d) for d in (cv.data or [])}
+
+
 def _smc_name_from_lease(hostname: str, mac_norm: str,
                          taken: set[str]) -> str:
     """Build a unique, SMC-safe Host name from a lease's client-hostname + MAC.
@@ -3856,12 +3951,62 @@ def scope_leases_reserve(scope_id):
     cfg = _smc_cfg(domain)
 
     created: list[str] = []
+    adopted: list[str] = []
     errors: list[str] = []
     try:
         with smc_session(cfg):
             for c in valid:
                 target = f"{scope.engine_name}/{scope.interface_id}/{c['name']}"
                 try:
+                    # Look up the planned name in SMC first. A previous
+                    # deployment may have left a Host element with the
+                    # same name — re-creating would trip SMC's "element
+                    # name must be unique" error. Two outcomes:
+                    #   * existing.address == c["ip"]  → adopt it,
+                    #     record a DhcpReservation pointing at the
+                    #     existing href with status='synced' (SMC
+                    #     already has the canonical row).
+                    #   * existing.address != c["ip"]  → genuine name
+                    #     collision; surface a clean error so the
+                    #     operator can rename or delete the old Host.
+                    existing = host_get(c["name"])
+                    if existing is not None:
+                        if (existing.address or "").strip() == c["ip"]:
+                            res = DhcpReservation(
+                                scope_id=scope.id,
+                                smc_host_name=existing.name,
+                                smc_host_href=existing.href,
+                                ip_address=existing.address,
+                                mac_address=c["mac"],
+                                status="synced",
+                                source="lease",
+                            )
+                            db.session.add(res)
+                            db.session.commit()
+                            adopted.append(c["name"])
+                            _log_activity(
+                                "reservation", "adopt_from_lease", "ok",
+                                target,
+                                f"existing SMC Host adopted "
+                                f"(MAC={c['mac']} IP={c['ip']})",
+                            )
+                            continue
+                        # IP mismatch — refuse rather than silently
+                        # overwriting someone else's Host.
+                        msg = (
+                            f"SMC already has a Host '{c['name']}' "
+                            f"with IP {existing.address or '(blank)'}, "
+                            f"but this lease has IP {c['ip']}. "
+                            f"Rename or delete the existing Host in "
+                            f"SMC Management Client, then retry."
+                        )
+                        errors.append(f"{c['name']} ({c['mac']} → {c['ip']}): {msg}")
+                        _log_activity(
+                            "reservation", "create_from_lease",
+                            "failed", target, msg,
+                        )
+                        continue
+
                     view = host_create(
                         name=c["name"],
                         address=c["ip"],
@@ -3895,6 +4040,14 @@ def scope_leases_reserve(scope_id):
     if created:
         flash(f"Created {len(created)} reservation(s) from leases: "
               f"{', '.join(created)}.", "success")
+    if adopted:
+        flash(
+            f"Adopted {len(adopted)} existing SMC Host element(s) from a "
+            f"previous deployment (same name + same IP): "
+            f"{', '.join(adopted)}. These were re-linked to FlexEdge "
+            f"with status 'synced' — no new SMC element was created.",
+            "info",
+        )
     for s in skipped:
         flash(s, "warning")
     for e in errors:
