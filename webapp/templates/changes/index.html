@@ -25,7 +25,7 @@
 
   {% with messages = get_flashed_messages(with_categories=true) %}
   {% for category, msg in messages %}
-  <div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+  <div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
   {% endfor %}
   {% endwith %}
 
@@ -79,7 +79,6 @@
           <select name="state" class="form-select form-select-sm">
             <option value="active"      {% if filters.state == 'active' %}selected{% endif %}>Needs attention</option>
             <option value="queued"      {% if filters.state == 'queued' %}selected{% endif %}>Queued</option>
-            <option value="pushing"     {% if filters.state == 'pushing' %}selected{% endif %}>Pushing (in flight)</option>
             <option value="conflict"    {% if filters.state == 'conflict' %}selected{% endif %}>Conflict</option>
             <option value="push_failed" {% if filters.state == 'push_failed' %}selected{% endif %}>Push failed</option>
             <option value="pushed"      {% if filters.state == 'pushed' %}selected{% endif %}>Pushed</option>
@@ -178,37 +177,11 @@
       </div>
     {% endif %}
 
-    {% if pagination and pagination.total_pages > 1 %}
-    {# M13 (audit fix-up, 2026-05-09) — paginated; was hard-capped at 500. #}
-    <nav class="mt-3" aria-label="Change queue pagination">
-      <ul class="pagination pagination-sm mb-0 justify-content-center">
-        {% set qargs = request.args.to_dict() %}
-        {% if pagination.page > 1 %}
-          {% set _ = qargs.update({'page': pagination.page - 1}) %}
-          <li class="page-item">
-            <a class="page-link" href="?{{ qargs|urlencode }}"
-               title="Previous page">&laquo; Prev</a>
-          </li>
-        {% else %}
-          <li class="page-item disabled"><span class="page-link">&laquo; Prev</span></li>
-        {% endif %}
-        <li class="page-item disabled">
-          <span class="page-link">
-            Page {{ pagination.page }} / {{ pagination.total_pages }}
-            <span class="text-muted">({{ pagination.total_rows }} total)</span>
-          </span>
-        </li>
-        {% if pagination.page < pagination.total_pages %}
-          {% set _ = qargs.update({'page': pagination.page + 1}) %}
-          <li class="page-item">
-            <a class="page-link" href="?{{ qargs|urlencode }}"
-               title="Next page">Next &raquo;</a>
-          </li>
-        {% else %}
-          <li class="page-item disabled"><span class="page-link">Next &raquo;</span></li>
-        {% endif %}
-      </ul>
-    </nav>
+    {% if rows|length >= 500 %}
+    <div class="alert alert-warning mt-3 small">
+      Showing the most recent 500 changes — narrow the filter (state /
+      source / search) to see older ones.
+    </div>
     {% endif %}
   {% endif %}
 

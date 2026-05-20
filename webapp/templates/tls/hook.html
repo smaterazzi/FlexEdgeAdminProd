@@ -8,51 +8,25 @@
 <div class="row">
     <div class="col-md-8">
         <div class="card mb-4">
-            <div class="card-header"><h5 class="mb-0">Deploy Hook Script <small class="text-muted">— chmod 0700</small></h5></div>
+            <div class="card-header"><h5 class="mb-0">Deploy Hook Script</h5></div>
             <div class="card-body">
                 <p>This script runs after each successful certbot renewal. Place it in
                 <code>/etc/letsencrypt/renewal-hooks/deploy/</code> or pass via
-                <code>certbot renew --deploy-hook</code>. The bearer token is
-                NOT inline — the script sources a sibling file (next card) so
-                a wider <code>chmod</code> on the script can't leak the token.</p>
-                <pre class="json-detail" id="hook-script"><code>{{ hook_script }}</code></pre>
+                <code>certbot renew --deploy-hook</code>.</p>
+                <pre class="json-detail"><code>{{ hook_script }}</code></pre>
                 <div class="d-flex gap-2 mt-3">
-                    <button class="btn btn-outline-primary"
-                            onclick="navigator.clipboard.writeText(document.getElementById('hook-script').textContent)">
+                    <button class="btn btn-outline-primary" onclick="navigator.clipboard.writeText(document.querySelector('pre code').textContent)">
                         <i class="bi bi-clipboard"></i> Copy
                     </button>
                     <form method="post" action="{{ url_for('tls.hook_install') }}">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
                         <input type="hidden" name="api_url" value="{{ api_url }}">
                         <button type="submit" class="btn btn-warning"
-                                onclick="return confirm('Install both files (script chmod 0700, token chmod 0600) to /etc/letsencrypt/renewal-hooks/deploy/?')">
+                                onclick="return confirm('Install to /etc/letsencrypt/renewal-hooks/deploy/?')">
                             <i class="bi bi-download"></i> Install Automatically
                         </button>
                     </form>
                 </div>
-            </div>
-        </div>
-
-        <div class="card mb-4 border-warning">
-            <div class="card-header bg-warning bg-opacity-25">
-                <h5 class="mb-0">
-                    <i class="bi bi-key-fill"></i>
-                    Token File <small class="text-muted">— chmod 0600 — <code>{{ token_file_path }}</code></small>
-                </h5>
-            </div>
-            <div class="card-body">
-                <p class="small mb-2">
-                    <strong>Audit fix-up (M3, 2026-05-09):</strong> the script above
-                    <code>source</code>s this file at runtime. Save it to the
-                    exact path shown in the header, owned by root with mode
-                    <code>0600</code>. If you use a different path, edit the
-                    <code>TOKEN_FILE=…</code> line in the script too.
-                </p>
-                <pre class="json-detail" id="token-file"><code>{{ token_file_content }}</code></pre>
-                <button class="btn btn-outline-primary"
-                        onclick="navigator.clipboard.writeText(document.getElementById('token-file').textContent)">
-                    <i class="bi bi-clipboard"></i> Copy
-                </button>
             </div>
         </div>
     </div>

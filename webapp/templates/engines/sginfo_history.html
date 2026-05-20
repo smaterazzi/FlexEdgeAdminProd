@@ -22,7 +22,7 @@
 
 {% with messages = get_flashed_messages(with_categories=true) %}
 {% for category, msg in messages %}
-<div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+<div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
 {% endfor %}
 {% endwith %}
 

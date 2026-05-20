@@ -30,96 +30,10 @@
 
   {% with messages = get_flashed_messages(with_categories=true) %}
   {% for category, msg in messages %}
-  <div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+  <div class="alert alert-{{ category }}" role="alert">{{ msg|safe }}</div>
   {% endfor %}
   {% endwith %}
 
-  {% if scan_running %}
-  <!-- H6 (audit fix-up, 2026-05-09) — drift scan watcher card.
-       JS at the bottom polls /changes/drift/scan/status?id=<scan_id>
-       every 800ms and reloads the page on completion. -->
-  <div class="card mb-3 border-primary" id="drift-watcher"
-       data-scan-id="{{ scan_running.scan_id }}">
-    <div class="card-body">
-      <div class="d-flex justify-content-between align-items-center mb-2">
-        <strong><i class="bi bi-arrow-repeat"></i> Drift scan in progress</strong>
-        <span class="small text-muted">
-          domain: <code>{{ scan_running.domain_label }}</code>
-        </span>
-      </div>
-      <div class="progress mb-2" style="height: 22px;">
-        <div id="drift-progress-bar"
-             class="progress-bar progress-bar-striped progress-bar-animated"
-             role="progressbar"
-             style="width: {% if scan_running.total %}{{ (scan_running.progress / scan_running.total * 100)|round(2) }}{% else %}0{% endif %}%;"
-             aria-valuenow="{{ scan_running.progress }}"
-             aria-valuemin="0"
-             aria-valuemax="{{ scan_running.total }}">
-          <span id="drift-progress-label">
-            {{ scan_running.progress }} / {{ scan_running.total }}
-            ({% if scan_running.total %}{{ (scan_running.progress / scan_running.total * 100)|round(1) }}{% else %}0{% endif %}%)
-          </span>
-        </div>
-      </div>
-      <div class="row g-2 small">
-        <div class="col-auto"><span class="badge bg-success">clean
-          <span id="drift-cnt-clean">{{ scan_running.drift_clean or 0 }}</span></span></div>
-        <div class="col-auto"><span class="badge bg-warning text-dark">drifted
-          <span id="drift-cnt-drifted">{{ scan_running.drift_drifted or 0 }}</span></span></div>
-        <div class="col-auto"><span class="badge bg-danger">gone
-          <span id="drift-cnt-gone">{{ scan_running.drift_gone or 0 }}</span></span></div>
-        <div class="col-auto"><span class="badge bg-danger">errored
-          <span id="drift-cnt-errored">{{ scan_running.drift_errored or 0 }}</span></span></div>
-        <div class="col-auto"><span class="badge bg-secondary">skipped
-          <span id="drift-cnt-skipped">{{ scan_running.drift_skipped or 0 }}</span></span></div>
-      </div>
-      <pre id="drift-log-tail"
-           style="background:#1a1d20;color:#cbd1d8;font-size:12px;
-                  padding:8px;margin-top:10px;max-height:200px;
-                  overflow-y:auto;border-radius:4px;">{% for ln in (scan_running.log_tail or []) %}{{ ln }}
-{% endfor %}</pre>
-    </div>
-  </div>
-  <script>
-  (function() {
-    var card = document.getElementById('drift-watcher');
-    if (!card) return;
-    var scanId = card.dataset.scanId;
-    var bar = document.getElementById('drift-progress-bar');
-    var lbl = document.getElementById('drift-progress-label');
-    var logEl = document.getElementById('drift-log-tail');
-    function fmt(n, d) {
-      if (!n) return 0;
-      return Math.round((n / d) * 1000) / 10;
-    }
-    function poll() {
-      fetch('{{ url_for("changes.drift_scan_status") }}?id=' + encodeURIComponent(scanId))
-        .then(function(r) { return r.json(); })
-        .then(function(s) {
-          if (s.state === 'running') {
-            var pct = s.total ? fmt(s.progress, s.total) : 0;
-            bar.style.width = pct + '%';
-            lbl.textContent = s.progress + ' / ' + s.total + ' (' + pct + '%)';
-            ['clean','drifted','gone','errored','skipped'].forEach(function(k) {
-              var el = document.getElementById('drift-cnt-' + k);
-              if (el) el.textContent = s['drift_' + k] || 0;
-            });
-            if (s.log_tail && logEl) {
-              logEl.textContent = s.log_tail.join('\n');
-              logEl.scrollTop = logEl.scrollHeight;
-            }
-            setTimeout(poll, 800);
-          } else {
-            // done / failed / missing — reload to consume the report.
-            window.location.href = window.location.pathname;
-          }
-        })
-        .catch(function() { setTimeout(poll, 1500); });
-    }
-    setTimeout(poll, 800);
-  })();
-  </script>
-  {% else %}
   <div class="alert alert-info small">
     <i class="bi bi-info-circle"></i>
     The drift detector compares the SMC registry's recorded state against
@@ -136,9 +50,7 @@
     <br><span class="text-muted">No scan run yet — click <strong>Scan now</strong> to baseline.</span>
     {% endif %}
   </div>
-  {% endif %}{# scan_running else #}
 
-  {% if not scan_running %}
   <!-- Filter bar -->
   <form method="get" class="card mb-3">
     <div class="card-body py-2 px-3">
@@ -252,7 +164,6 @@
   </div>
   {% endif %}
   {% endif %}
-  {% endif %}{# not scan_running #}
 
 </div>
 {% endblock %}

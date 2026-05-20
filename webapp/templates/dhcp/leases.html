@@ -42,22 +42,8 @@
     Active leases <small class="text-muted">on <code>{{ scope.subnet_cidr }}</code></small>
   </h2>
   <div class="d-flex align-items-center gap-2">
-    <span class="text-muted small">
-      Read from <code>{{ lease_file_path }}</code> · {{ now.strftime('%H:%M:%S') }}
-      {% if leases_cache_meta %}
-        {% if leases_cache_meta.served_from_cache %}
-          <span class="badge bg-secondary ms-1"
-                title="Cached snapshot — click Refresh to re-read from every node">
-            cached · {{ leases_cache_meta.age_seconds }}s ago
-          </span>
-        {% else %}
-          <span class="badge bg-success ms-1">fresh</span>
-        {% endif %}
-      {% endif %}
-    </span>
-    <a href="{{ url_for('dhcp.scope_leases', scope_id=scope.id, refresh=1) }}"
-       class="btn btn-sm btn-outline-primary"
-       title="Drop the 2-minute cache and SSH-read the lease file from every node"
+    <span class="text-muted small">Read from <code>{{ lease_file_path }}</code> · {{ now.strftime('%H:%M:%S') }}</span>
+    <a href="{{ url_for('dhcp.scope_leases', scope_id=scope.id) }}" class="btn btn-sm btn-outline-primary"
        {% if creds_missing %}aria-disabled="true" tabindex="-1" style="pointer-events:none;opacity:.5"{% endif %}>
       <i class="bi bi-arrow-clockwise"></i> Refresh
     </a>

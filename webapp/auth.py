@@ -9,54 +9,18 @@ Provides:
 """
 
 import logging
-import re
 from functools import wraps
 
 from flask import (
     Blueprint, session, redirect, url_for,
     request, flash, render_template, current_app,
 )
-from markupsafe import Markup, escape
 from authlib.integrations.flask_client import OAuth
 
 log = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 oauth = OAuth()
-
-
-_UUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-    re.IGNORECASE,
-)
-
-
-def _aad_tenant_id() -> str:
-    return (current_app.config.get("AZURE_TENANT_ID") or "").strip().lower()
-
-
-def aad_tenant_is_single() -> bool:
-    """True iff AZURE_TENANT_ID is a concrete UUID (not common/organizations).
-
-    The OIDC userinfo `tid` claim cannot be safely matched against a
-    multi-tenant placeholder, so any deployment configured with
-    `common` / `organizations` / `consumers` is reachable from ANY
-    Microsoft tenant — the first stranger to find the URL becomes Super
-    Admin during setup. Audit fix-up H10 (2026-05-09) — gate the setup
-    wizard and the per-login `tid` check on this returning True.
-    """
-    return bool(_UUID_RE.match(_aad_tenant_id()))
-
-
-def verify_aad_tid(userinfo: dict) -> bool:
-    """Return True iff userinfo's `tid` claim equals AZURE_TENANT_ID.
-
-    Returns False when the tenant is multi-tenant (no concrete UUID
-    to match against — fail closed). Audit fix-up H10 (2026-05-09).
-    """
-    if not aad_tenant_is_single():
-        return False
-    return (userinfo.get("tid") or "").lower() == _aad_tenant_id()
 
 
 # ── Initialisation ────────────────────────────────────────────────────────
@@ -151,41 +115,12 @@ def callback():
         return render_template("auth/login.html")
 
     userinfo = token.get("userinfo") or {}
-
-    # H10 (audit fix-up, 2026-05-09): verify the token's `tid` claim
-    # matches AZURE_TENANT_ID. Without this check, deployments configured
-    # with `common`/`organizations` accept tokens from ANY Microsoft tenant
-    # — and during setup mode the first stranger to find /setup becomes
-    # Super Admin. Fail-closed: if AZURE_TENANT_ID isn't a concrete UUID,
-    # the verifier returns False and we refuse the login here.
-    if not verify_aad_tid(userinfo):
-        log.warning(
-            "Login refused for tid=%r (AZURE_TENANT_ID=%r): tid claim does "
-            "not match the configured tenant or AZURE_TENANT_ID is not a "
-            "single-tenant UUID.",
-            userinfo.get("tid"), _aad_tenant_id(),
-        )
-        flash(
-            "Authentication failed: token issuer does not match the "
-            "configured Azure tenant. Contact the administrator.",
-            "danger",
-        )
-        session.clear()
-        return render_template("auth/login.html")
-
     email = (
         userinfo.get("email") or userinfo.get("preferred_username", "")
     ).lower().strip()
     name = userinfo.get("name") or email
     sub = userinfo.get("sub", "")
 
-    # M2 (audit fix-up, 2026-05-09): regenerate the session on login.
-    # Flask sessions are signed cookies — clearing the dict and re-setting
-    # the keys re-issues the cookie with fresh content, making any
-    # pre-login fixation attempt's snooped cookie state worthless. Drops
-    # any stale `active_profile` / `active_domain` from a previous user
-    # on the same browser too.
-    session.clear()
     session["user"] = {"email": email, "name": name, "sub": sub}
     session.permanent = True
     log.info("User logged in: %s", email)
@@ -198,14 +133,9 @@ def callback():
     profiles = user_manager.get_user_profiles(email)
     if not profiles:
         log.warning("Unlisted user attempted login: %s", email)
-        # C8 (audit fix-up, 2026-05-09): escape the user-controlled email
-        # before mixing with the literal HTML wrapper. Flash render no
-        # longer uses |safe globally, so non-HTML flashes are auto-escaped;
-        # this one wraps with Markup so the <strong> styling survives.
         flash(
-            Markup("<strong>") + escape(email) + Markup("</strong>")
-            + " is not authorised. "
-            + "Contact the administrator to request access.",
+            f"<strong>{email}</strong> is not authorised. "
+            "Contact the administrator to request access.",
             "danger",
         )
         session.clear()

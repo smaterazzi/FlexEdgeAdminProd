@@ -80,7 +80,7 @@
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% for category, message in messages %}
         <div class="alert alert-{{ category }} alert-dismissible text-start mb-3" role="alert" style="font-size:0.85rem;">
-            {{ message }}
+            {{ message|safe }}
             <button type="button" class="btn-close btn-close-sm" data-bs-dismiss="alert"></button>
         </div>
         {% endfor %}

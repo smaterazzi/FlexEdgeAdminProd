@@ -90,33 +90,6 @@ def _truncate_prev(value: Optional[str]) -> str:
     return s[:_PREV_MAX - 1] + "…"
 
 
-_USER_EMAIL_MAX = 256  # RFC 5321 §4.5.3.1.3 caps mailbox at 254
-
-
-def _sanitize_user_email(value: str) -> str:
-    """Strip terminator chars and length-cap the audit-marker `user=` field.
-
-    M5 (audit fix-up, 2026-05-09). The marker grammar requires `user=`
-    to terminate at whitespace or `]`. An email containing either
-    would break the marker structure and let a forged-email attacker
-    plant fake `[flexedge:audit …]` markers in adjacent comment text.
-    We strip those characters defensively, drop control chars, and cap
-    at 256 (one past the RFC 5321 mailbox limit).
-
-    Returns "system" on empty / sanitised-to-empty input — same fallback
-    as `_resolve_user_email`.
-    """
-    if not value:
-        return "system"
-    s = str(value).strip()
-    # Remove characters that would prematurely terminate the marker
-    # field or inject sibling key=value pairs into the marker.
-    cleaned = s.translate(str.maketrans("", "", " \t\r\n]"))
-    if not cleaned:
-        return "system"
-    return cleaned[:_USER_EMAIL_MAX]
-
-
 def _escape_for_marker(value: str) -> str:
     """Escape backslashes + double-quotes so the marker stays parseable."""
     return value.replace("\\", "\\\\").replace("\"", "\\\"")
@@ -148,7 +121,7 @@ def pack_audit_into_comment(user_comment: str = "",
     """
     base = _strip_audit_marker(user_comment or "")
     ts = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    user = _sanitize_user_email(_resolve_user_email(user_email))
+    user = _resolve_user_email(user_email)
     parts = [f"ts={ts}", f"user={user}"]
     if previous_value is not None and previous_value != "":
         prev = _escape_for_marker(_truncate_prev(previous_value))

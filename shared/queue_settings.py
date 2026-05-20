@@ -73,11 +73,6 @@ _BYPASS_FEATURES: list[tuple[str, str]] = [
     ("migration_rule",    "Migration — FortiGate firewall rule + section import"),
     ("migration_nat",     "Migration — FortiGate NAT rule import"),
     ("migration_vpn",     "Migration — FortiGate VPN topology (profiles / gateways / sites / PolicyVPN)"),
-    # Roadmap item 5 / Phase LE.2 (2026-05-11): Let's Encrypt cert ops
-    # (request / renew / revoke). One feature key for all three op types —
-    # bypass behaviour is identical and operators reason about "cert ops"
-    # as a single capability.
-    ("letsencrypt",       "Let's Encrypt — cert request / renew / revoke"),
 ]
 
 

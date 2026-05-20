@@ -11,73 +11,6 @@
   </ol>
 </nav>
 
-{% if deploy_running %}
-{# H7 (audit fix-up, 2026-05-09) — DHCP deploy watcher card. #}
-<div class="card mb-3 border-primary" id="deploy-watcher"
-     data-scan-id="{{ deploy_running.scan_id }}">
-  <div class="card-body">
-    <div class="d-flex justify-content-between align-items-center mb-2">
-      <strong><i class="bi bi-rocket-takeoff"></i>
-        {{ deploy_running.action|capitalize }} in progress
-      </strong>
-      <span class="small text-muted">
-        engine: <code>{{ deploy_running.engine_name }}</code>
-      </span>
-    </div>
-    <div class="progress mb-2" style="height: 22px;">
-      <div id="deploy-progress-bar"
-           class="progress-bar progress-bar-striped progress-bar-animated"
-           role="progressbar"
-           style="width: {% if deploy_running.total %}{{ (deploy_running.progress / deploy_running.total * 100)|round(2) }}{% else %}0{% endif %}%;"
-           aria-valuenow="{{ deploy_running.progress }}"
-           aria-valuemin="0"
-           aria-valuemax="{{ deploy_running.total }}">
-        <span id="deploy-progress-label">
-          {{ deploy_running.progress }} / {{ deploy_running.total }} nodes
-        </span>
-      </div>
-    </div>
-    <pre id="deploy-log-tail"
-         style="background:#1a1d20;color:#cbd1d8;font-size:12px;
-                padding:8px;margin-top:10px;max-height:240px;
-                overflow-y:auto;border-radius:4px;">{% for ln in (deploy_running.log_tail or []) %}{{ ln }}
-{% endfor %}</pre>
-  </div>
-</div>
-<script>
-(function() {
-  var card = document.getElementById('deploy-watcher');
-  if (!card) return;
-  var scanId = card.dataset.scanId;
-  var bar = document.getElementById('deploy-progress-bar');
-  var lbl = document.getElementById('deploy-progress-label');
-  var logEl = document.getElementById('deploy-log-tail');
-  function poll() {
-    fetch('{{ url_for("dhcp.scope_deploy_status", scope_id=scope.id) }}?id='
-          + encodeURIComponent(scanId))
-      .then(function(r) { return r.json(); })
-      .then(function(s) {
-        if (s.state === 'running') {
-          var pct = s.total ? Math.round((s.progress / s.total) * 1000) / 10 : 0;
-          bar.style.width = pct + '%';
-          lbl.textContent = s.progress + ' / ' + s.total + ' nodes';
-          if (s.log_tail && logEl) {
-            logEl.textContent = s.log_tail.join('\n');
-            logEl.scrollTop = logEl.scrollHeight;
-          }
-          setTimeout(poll, 800);
-        } else {
-          // done / failed / missing — reload to consume the report.
-          window.location.href = window.location.pathname;
-        }
-      })
-      .catch(function() { setTimeout(poll, 1500); });
-  }
-  setTimeout(poll, 800);
-})();
-</script>
-{% endif %}
-
 <div class="d-flex justify-content-between align-items-center mb-3">
   <h2 class="mb-0">
     <i class="bi bi-diagram-3"></i>
@@ -327,36 +260,6 @@
     Alternatively, click <em>Sync from SMC</em> to import existing Host
     elements that already carry a <code>[flexedge:mac=&hellip;]</code> marker.
   </div>
-  {% endif %}
-
-  {% if pagination and pagination.total_pages > 1 %}
-  {# M13 (audit fix-up, 2026-05-09) — paginated reservations. #}
-  <nav class="px-3 pb-2" aria-label="Reservation pagination">
-    <ul class="pagination pagination-sm mb-0 justify-content-center">
-      {% if pagination.page > 1 %}
-      <li class="page-item">
-        <a class="page-link"
-           href="{{ url_for('dhcp.scope_detail', scope_id=scope.id, page=pagination.page - 1) }}">&laquo; Prev</a>
-      </li>
-      {% else %}
-      <li class="page-item disabled"><span class="page-link">&laquo; Prev</span></li>
-      {% endif %}
-      <li class="page-item disabled">
-        <span class="page-link">
-          Page {{ pagination.page }} / {{ pagination.total_pages }}
-          <span class="text-muted">({{ pagination.total_rows }} total)</span>
-        </span>
-      </li>
-      {% if pagination.page < pagination.total_pages %}
-      <li class="page-item">
-        <a class="page-link"
-           href="{{ url_for('dhcp.scope_detail', scope_id=scope.id, page=pagination.page + 1) }}">Next &raquo;</a>
-      </li>
-      {% else %}
-      <li class="page-item disabled"><span class="page-link">Next &raquo;</span></li>
-      {% endif %}
-    </ul>
-  </nav>
   {% endif %}
 </div>
 

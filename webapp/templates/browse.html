@@ -70,9 +70,6 @@
                     <th>Port(s)</th>
                     {% elif type_key == 'domain_names' %}
                     <th>Value</th>
-                    {% elif type_key == 'fw_policies' %}
-                    <th class="text-center" style="width:110px;" title="Access (firewall) rules">FW rules</th>
-                    <th class="text-center" style="width:110px;" title="NAT rules in this policy">NAT rules</th>
                     {% endif %}
                     <th>Comment</th>
                     <th style="width:60px;"></th>
@@ -86,19 +83,9 @@
                         {% if elem.name.startswith('FGT-') %}
                         <span class="badge badge-fgt me-1">FGT</span>
                         {% endif %}
-                        {# Roadmap item 3 (Batch J, 2026-05-11): for
-                           firewall policies, the row name links to the
-                           rules viewer at /policy/<name> instead of the
-                           generic element detail page. #}
-                        {% if type_key == 'fw_policies' %}
-                        <a href="/policy/{{ elem.name }}" class="text-decoration-none">
-                            {{ elem.name }}
-                        </a>
-                        {% else %}
                         <a href="/detail/{{ type_key }}/{{ elem.name }}" class="text-decoration-none">
                             {{ elem.name }}
                         </a>
-                        {% endif %}
                     </td>
                     {% if type_key == 'hosts' %}
                     <td><code>{{ elem.address }}</code></td>
@@ -112,39 +99,13 @@
                     </td>
                     {% elif type_key == 'domain_names' %}
                     <td><code>{{ elem.value }}</code></td>
-                    {% elif type_key == 'fw_policies' %}
-                    <td class="text-center">
-                        {% if elem.fw_rule_count is none %}
-                        <span class="badge bg-secondary" title="Rule count unavailable">?</span>
-                        {% elif elem.fw_rule_count == 0 %}
-                        <span class="badge bg-secondary">0</span>
-                        {% else %}
-                        <span class="badge bg-primary">{{ elem.fw_rule_count }}</span>
-                        {% endif %}
-                    </td>
-                    <td class="text-center">
-                        {% if elem.nat_rule_count is none %}
-                        <span class="badge bg-secondary" title="Rule count unavailable">?</span>
-                        {% elif elem.nat_rule_count == 0 %}
-                        <span class="badge bg-secondary" title="No NAT rules in this policy">0</span>
-                        {% else %}
-                        <span class="badge bg-warning text-dark" title="NAT rules present — visible in /policy/{{ elem.name }}">{{ elem.nat_rule_count }}</span>
-                        {% endif %}
-                    </td>
                     {% endif %}
                     <td class="text-muted" style="font-size:0.8rem;">{{ elem.comment or '' }}</td>
                     <td>
-                        {% if type_key == 'fw_policies' %}
-                        <a href="/policy/{{ elem.name }}"
-                           class="btn btn-sm btn-outline-primary" title="View rules + NAT rules">
-                            <i class="bi bi-list-ul"></i>
-                        </a>
-                        {% else %}
                         <a href="/detail/{{ type_key }}/{{ elem.name }}"
                            class="btn btn-sm btn-outline-secondary" title="View detail">
                             <i class="bi bi-eye"></i>
                         </a>
-                        {% endif %}
                     </td>
                 </tr>
                 {% endfor %}

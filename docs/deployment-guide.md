@@ -389,46 +389,9 @@ Without `encryption.key`, API keys stored in the database are permanently irreco
 
 ## TLS Manager — certbot integration
 
-The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It can either:
+The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It reads certbot-managed certificates from `/etc/letsencrypt/live/` inside the application container.
 
-- Read certbot-managed certificates from `${CERTBOT_LIVE_DIR}` (default `/config/letsencrypt/live`) — the **legacy flow**, where you run certbot yourself (on the host or as a sidecar) and FEA discovers what's there; OR
-- Drive certbot itself via the built-in **Let's Encrypt CRUD** UI at `/tls/letsencrypt/*` (Roadmap item 5, landed 2026-05-11) — operator submits a request through the web UI, FEA's queue runner spawns `certbot certonly` against `/config/letsencrypt/`, and the resulting lineage is picked up by the same TLS deploy pipeline.
-
-Both flows share the same `ManagedCertificate` table; you can mix them on the same deployment.
-
-### Let's Encrypt CRUD setup (recommended for new deployments)
-
-The FEA Docker image bundles `certbot` and runs it under the unprivileged gunicorn user. To avoid the "Read-only file system: `/etc/letsencrypt/.certbot.lock`" failure mode, **certbot is redirected to `/config/letsencrypt/` and siblings** — all subdirectories of the existing `/config/` bind-mount that's already in `docker/docker-compose.yml`:
-
-| Env var | Default | What lives here |
-| ------- | ------- | --------------- |
-| `CERTBOT_CONFIG_DIR` | `/config/letsencrypt` | Account keys, cert lineage (`live/`, `archive/`, `renewal/`) |
-| `CERTBOT_WORK_DIR` | `/config/letsencrypt-work` | Transient state during issuance |
-| `CERTBOT_LOGS_DIR` | `/config/letsencrypt-logs` | Per-run certbot logs |
-| `CERTBOT_WEBROOT` | `/config/letsencrypt-webroot` | HTTP-01 challenge files; FEA's Flask app serves them at `/.well-known/acme-challenge/<token>` |
-| `CERTBOT_LIVE_DIR` | `${CERTBOT_CONFIG_DIR}/live` | Where the TLS Manager's `certbot_reader` scans for trackable certs |
-
-All five paths are env-overridable from `.env`. The defaults Just Work for the standard Docker deployment because `/config/` is already mounted writable.
-
-**HTTP-01 challenge proxy.** Let's Encrypt's validation servers fetch `http://<your-fqdn>/.well-known/acme-challenge/<token>` during issuance. nginx/Traefik in front of FEA MUST forward this path to FEA's gunicorn (the path lives on FEA's Flask app — see `acme_challenge_bp` in [webapp/letsencrypt_manager.py](../webapp/letsencrypt_manager.py)). For nginx, add this `location` block before any catch-all:
-
-```nginx
-location /.well-known/acme-challenge/ {
-    proxy_pass http://flexedge-web:8088;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $remote_addr;
-}
-```
-
-For Traefik, the default `PathPrefix(`/`)` rule already covers the path — no extra config needed.
-
-**Operator flow.** Open `/tls/letsencrypt`, accept the LE TOS in the one-shot account wizard, configure the per-FEA-Domain glob allowlist on `/tls/letsencrypt/patterns` (e.g. `*.prod.example.com`), then click **New cert**. Domain Admin or higher with the `letsencrypt` bypass feature gets instant issuance via a watcher card; otherwise the request goes through the standard change-management queue at `/changes/`. On success the cert appears in **TLS Manager → Certificates** ready to deploy.
-
-### Legacy / external certbot integration
-
-If you'd rather run certbot yourself (on the host, as a sidecar container, or via an existing managed-certs pipeline) and just have FEA discover the output, set `CERTBOT_LIVE_DIR` in `.env` to point at your existing lineage directory (typically `/etc/letsencrypt/live`) and ensure the FEA container can read it.
-
-#### Workflow
+### Workflow
 
 1. **Issue certificates with certbot** for each service behind a firewall (see per-deployment-option setup below)
 2. **Track** — open **TLS Manager → Certificates**; discovered certificates can be tracked with one click
@@ -436,11 +399,11 @@ If you'd rather run certbot yourself (on the host, as a sidecar container, or vi
 4. **Execute** — the pipeline imports the cert as a `TLSServerCredential`, creates `{service}-PublicIPv4` / `{service}-PrivateIPv4` host objects, assigns the credential to the engine's TLS inspection, creates an HTTPS access rule with deep inspection + file filtering + decryption in section `Service {name} - TLS Protection`, and uploads the policy
 5. **Auto-renewal** — wire the deploy-hook (below) so every certbot renewal re-runs the full pipeline automatically
 
-#### Certbot setup per deployment option
+### Certbot setup per deployment option
 
-#### Option 1 — Standalone
+### Option 1 — Standalone
 
-Certbot is already installed on the host (used for the webapp's own TLS). The `/etc/letsencrypt` directory is directly accessible to the Python process. Set `CERTBOT_LIVE_DIR=/etc/letsencrypt/live` in `/etc/flexedge/.env`.
+Certbot is already installed on the host (used for the webapp's own TLS). The `/etc/letsencrypt` directory is directly accessible to the Python process.
 
 No extra configuration needed. Issue a certificate for each service you want to protect:
 
@@ -451,9 +414,9 @@ sudo certbot certonly --standalone -d service2.yourcompany.com
 
 They appear automatically in **TLS Manager → Certificates**.
 
-#### Option 2 — Docker + nginx
+### Option 2 — Docker + nginx
 
-The main image now bundles `certbot`. If you keep the legacy flow, the `docker/docker-compose.yml` would mount `/etc/letsencrypt:/etc/letsencrypt:ro` into the `flexedge-web` container so certificates managed by the existing host `certbot` are visible to TLS Manager — and you'd set `CERTBOT_LIVE_DIR=/etc/letsencrypt/live` in `.env` to override the new default.
+The main image now bundles `certbot`. The `docker/docker-compose.yml` mounts `/etc/letsencrypt:/etc/letsencrypt:ro` into the `flexedge-web` container, so certificates managed by the existing `certbot` container are visible to TLS Manager without extra steps.
 
 To issue a certificate for a *target service* (not the webapp itself):
 
@@ -463,14 +426,12 @@ docker compose -f docker/docker-compose.yml \
   -d service.yourcompany.com
 ```
 
-#### Option 3 — Coolify / Traefik
+### Option 3 — Coolify / Traefik
 
-The webapp's own TLS is handled by Traefik and does not use certbot. To use TLS Manager via the legacy flow, either:
+The webapp's own TLS is handled by Traefik and does not use certbot. To use TLS Manager, either:
 
-1. Run certbot on the **host** and bind-mount `/etc/letsencrypt:/etc/letsencrypt:ro` into the Coolify container (add under "Persistent Storage" in Coolify UI), then set `CERTBOT_LIVE_DIR=/etc/letsencrypt/live` in `.env`
+1. Run certbot on the **host** and bind-mount `/etc/letsencrypt:/etc/letsencrypt:ro` into the Coolify container (add under "Persistent Storage" in Coolify UI)
 2. Or run a dedicated certbot sidecar container that writes to a shared volume mounted into the FlexEdgeAdmin container
-
-For Coolify deployments the **Let's Encrypt CRUD flow above is usually simpler** — FEA owns everything under `/config/letsencrypt/` and the host doesn't need certbot at all.
 
 ### Renewal hook
 
@@ -483,21 +444,13 @@ The script calls `POST /tls/api/renew` with the renewed domain. All deployments 
 
 ### Troubleshooting TLS Manager
 
-**No certificates in "Discovered"** — check the container can read `${CERTBOT_LIVE_DIR}` (default `/config/letsencrypt/live`):
+**No certificates in "Discovered"** — check the container can read `/etc/letsencrypt/live/`:
 
 ```bash
-docker exec flexedge-admin ls ${CERTBOT_LIVE_DIR:-/config/letsencrypt/live}
+docker exec flexedge-admin ls /etc/letsencrypt/live/
 ```
 
-Empty result + new-flow: no certs issued yet — submit one at `/tls/letsencrypt/new`. Empty result + legacy-flow: verify `CERTBOT_LIVE_DIR` in `.env` points at your external lineage directory and the bind-mount exposes it (read-only is fine for the legacy flow). Permission denied on the new flow: see the next entry.
-
-**Let's Encrypt CRUD fails with "Read-only file system: `/etc/letsencrypt/.certbot.lock`"** — certbot was launched against its compiled-in defaults instead of `/config/`. This was the LE.2 first-run bug surfaced 2026-05-11; the fix is in `webapp/letsencrypt_certbot.py` which now passes explicit `--config-dir` / `--work-dir` / `--logs-dir` to every invocation. If you hit this, your container is running pre-hotfix code — pull the latest image and restart.
-
-**Let's Encrypt CRUD fails with "unauthorized" / HTTP-01 challenge timeout** — Let's Encrypt couldn't fetch the challenge file. Verify:
-
-- `http://<your-fqdn>/.well-known/acme-challenge/test` is reachable from the public internet (port 80 open, DNS pointing at the FEA host, no upstream HTTPS-only redirect)
-- nginx/Traefik forwards `/.well-known/acme-challenge/*` to FEA's gunicorn (the proxy rule shown earlier in this section)
-- The `CERTBOT_WEBROOT` directory exists and is writable inside the container (`ls /config/letsencrypt-webroot` from `docker exec`)
+Permission denied means the volume mount is missing or read-only is blocking access. Verify `docker/docker-compose.yml` has the mount and certbot has issued at least one certificate.
 
 **Deployment fails with "SMC login failed"** — check the TLS dashboard's Activity Log for the full error. Most likely the tenant's Default Domain in Admin Portal doesn't match what the API key can access. For domain-scoped keys, the Admin Portal connection form auto-suggests the domain name from the API client name.
 

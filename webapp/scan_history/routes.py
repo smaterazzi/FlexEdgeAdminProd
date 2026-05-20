@@ -28,7 +28,6 @@ from flask import (
     request, session, url_for,
 )
 
-from shared.csv_safe import csv_safe, safe_filename
 from webapp.scan_history import service, retention, compare as compare_mod
 
 log = logging.getLogger("scan_history.routes")
@@ -394,19 +393,12 @@ def export_csv(scan_id: int):
     w.writerow(["ip", "icmp_reply", "arp_reply", "mac", "hostname",
                 "open_ports", "closed_ports"])
     for h in service.get_hosts(rec):
-        w.writerow([csv_safe(h.ip),
-                    "1" if h.icmp_reply else "0",
+        w.writerow([h.ip, "1" if h.icmp_reply else "0",
                     "1" if h.arp_reply else "0",
-                    csv_safe(h.mac), csv_safe(h.hostname),
-                    csv_safe(h.open_ports_csv), csv_safe(h.closed_ports_csv)])
-    # M4 (audit fix-up, 2026-05-09): SMC-derived engine_name /
-    # source_iface_label can carry quotes or CRLF; sanitise before
-    # interpolating into Content-Disposition.
-    fname = safe_filename(
-        f"scan-{rec.id}-{rec.engine_name}-{rec.source_iface_label}-"
-        f"{rec.started_at:%Y%m%d-%H%M}.csv",
-        default=f"scan-{rec.id}.csv",
-    )
+                    h.mac, h.hostname,
+                    h.open_ports_csv, h.closed_ports_csv])
+    fname = (f"scan-{rec.id}-{rec.engine_name}-"
+             f"{rec.source_iface_label}-{rec.started_at:%Y%m%d-%H%M}.csv")
     return Response(
         buf.getvalue(), mimetype="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},

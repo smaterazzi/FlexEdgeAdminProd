@@ -168,57 +168,8 @@ def install_ssh_rule(engine_name: str, source_ip: str,
     name = rule_name or rule_name_for(engine_name)
     existing = smc.find_ssh_access_rule(pre.policy_name, name)
     if existing:
-        # 2026-05-13 — compare the requested destination set against
-        # the rule's current destination Host names. The names follow
-        # the canonical `{rule_name}-dst-<i>` pattern; the comparison
-        # is by INDEX COUNT, not by IP (because Host names don't
-        # carry the IP). If counts differ, we know destinations were
-        # added/removed and we re-create the rule via
-        # update_ssh_rule_destinations.
-        #
-        # For "same count, different IPs" we can't distinguish from
-        # Host names alone — but `update_ssh_rule_destinations`
-        # internally calls `_ensure_host_for_ip_force` which syncs
-        # the Host's address to the requested IP regardless. So in
-        # practice: count drift triggers rule re-create; same-count-
-        # different-IP is handled in-place via Host element update
-        # (and we re-create the rule anyway when count differs).
-        managed_count = sum(
-            1 for n in (existing.get("destination_names") or [])
-            if n.startswith(f"{name}-dst-")
-        )
-        requested_count = len(destination_ips)
-        if managed_count != requested_count:
-            try:
-                new_href = smc.update_ssh_rule_destinations(
-                    policy_name=pre.policy_name,
-                    rule_name=name,
-                    destination_ips=destination_ips,
-                )
-                return RuleInstallResult(
-                    ok=True, rule_href=new_href,
-                    rule_name=name, policy_name=pre.policy_name,
-                    already_present=False,  # rule was re-created with new dsts
-                )
-            except Exception as exc:
-                return RuleInstallResult(
-                    ok=False, policy_name=pre.policy_name, rule_name=name,
-                    error=(f"existing rule has {managed_count} destination(s) "
-                           f"but request has {requested_count}; tried to "
-                           f"rewrite and failed: {exc}"),
-                )
-        # Same count — sync Host addresses in case the operator
-        # changed an IP at an existing slot. Then leave the rule's
-        # destination collection alone (it already points at the
-        # same Host names, now updated to the right IPs).
-        try:
-            for i, ip in enumerate(destination_ips):
-                smc._ensure_host_for_ip_force(f"{name}-dst-{i}", ip)
-        except Exception as exc:
-            return RuleInstallResult(
-                ok=False, policy_name=pre.policy_name, rule_name=name,
-                error=f"could not sync destination Host IPs: {exc}",
-            )
+        # Already in place — caller may still want to push policy if the
+        # rule was added but never installed.
         return RuleInstallResult(
             ok=True, rule_href=existing["href"],
             rule_name=name, policy_name=pre.policy_name,
@@ -306,63 +257,13 @@ def enroll_node(engine_name: str, node_index: int,
     SMC call that turns it on. We probe AFTER enable_ssh, with brief
     retries to let the daemon come up.
     """
-    # P1 pre-flight (2026-05-12) — query SMC for the current SSH-daemon
-    # state before flipping anything. Three branches:
-    #   * `enabled`  → log + skip the toggle. SMC's `ssh(enable=True)` is
-    #                  idempotent but emits an audit row each time, so we
-    #                  avoid the noise.
-    #   * `disabled` → today's path: flip via SMC, then re-query to
-    #                  verify it actually took effect (some SMC versions
-    #                  return success on the API call without the engine
-    #                  actually starting the daemon).
-    #   * `unknown`  → fall through to today's behavior. The TCP probe
-    #                  retries below catch the "daemon never came up"
-    #                  case.
-    pre_state = {}
+    # Stage 3a: enable SSH daemon via SMC API
     try:
-        pre_state = smc.get_node_ssh_state(engine_name, node_index)
+        smc.set_node_ssh_enabled(engine_name, node_index, True,
+                                 comment=audit_comment)
     except Exception as exc:
-        logger.debug("enroll_node: pre-flight SSH state probe raised: %s", exc)
-
-    pre_label = pre_state.get("state", "unknown")
-    if pre_label == "enabled":
-        logger.info(
-            "enroll_node(%s/%d): SMC reports SSH already enabled "
-            "(source=%s) — skipping ssh_enable toggle.",
-            engine_name, node_index, pre_state.get("source", ""),
-        )
-    else:
-        # Stage 3a: enable SSH daemon via SMC API
-        try:
-            smc.set_node_ssh_enabled(engine_name, node_index, True,
-                                     comment=audit_comment)
-        except Exception as exc:
-            return EnrollmentResult(ok=False, failed_at_stage="enable_ssh",
-                                    error=f"enable SSH on node failed: {exc}")
-
-        # Post-flight — re-query state. If SMC STILL reports SSH as
-        # disabled after our toggle, abort with a clear error rather
-        # than charging into a TCP probe that's guaranteed to fail.
-        # We only refuse on a CONFIRMED disabled reading; "unknown"
-        # falls through to the existing TCP-probe retry loop.
-        try:
-            post_state = smc.get_node_ssh_state(engine_name, node_index)
-            if post_state.get("state") == "disabled":
-                return EnrollmentResult(
-                    ok=False, failed_at_stage="enable_ssh",
-                    error=(f"SMC accepted ssh_enable but the daemon "
-                           f"is STILL reported as disabled "
-                           f"(source={post_state.get('source')!r}). "
-                           f"Check the SMC Management Client: the "
-                           f"node's 'SSH Daemon' setting under "
-                           f"'Engine → General → SSH Daemon' should "
-                           f"be enabled. If a policy push reverts "
-                           f"it, the policy template is overriding "
-                           f"the engine-level setting."),
-                )
-        except Exception as exc:
-            logger.debug("enroll_node: post-flight SSH state probe raised: %s",
-                         exc)
+        return EnrollmentResult(ok=False, failed_at_stage="enable_ssh",
+                                error=f"enable SSH on node failed: {exc}")
 
     # Post-enable probe with retries — ssh daemon needs a moment to bind
     # after SMC flips the flag (typically <1s, occasionally up to ~5s).
@@ -383,39 +284,6 @@ def enroll_node(engine_name: str, node_index: int,
                   f"(the rule must list the node IP as a destination).",
         )
 
-    # Pre-flight auth-method probe (2026-05-13). Forcepoint engines
-    # can be hardened to refuse password auth — sshd_config sets
-    # `PasswordAuthentication no`. SMC's `change_ssh_pwd` still
-    # succeeds (the password IS set on the engine), but paramiko then
-    # fails with `BadAuthenticationType; allowed_types: ['publickey']`
-    # AFTER we've already burned the rotation. Probe BEFORE rotating
-    # and abort with a specific error so the operator can fix the
-    # engine config without churning the password.
-    from webapp.dhcp_ssh import probe_ssh_auth_methods
-    allowed, probe_err = probe_ssh_auth_methods(target,
-                                                 timeout=tcp_probe_timeout)
-    if not probe_err and allowed and "password" not in [
-            m.lower() for m in allowed]:
-        return EnrollmentResult(
-            ok=False, failed_at_stage="ssh_auth_methods",
-            error=(f"The engine's SSH daemon refuses password "
-                   f"authentication (advertised methods: "
-                   f"{', '.join(allowed)}). FEA uses password auth "
-                   f"only — `authorized_keys` is intentionally never "
-                   f"touched. Fix on the engine: open SMC Management "
-                   f"Client → Engine → General → SSH Daemon and "
-                   f"enable 'Allow Password Authentication' (or the "
-                   f"equivalent for your SMC version). If the engine "
-                   f"is template-hardened, the template needs "
-                   f"updating. Until that's fixed, no password "
-                   f"rotation will help — your previous enrollment's "
-                   f"password IS on the engine but unusable."),
-        )
-    # If the probe itself failed (TCP / banner error), don't block —
-    # fall through to today's behavior and let the existing failure
-    # path surface whatever's actually wrong. The probe is a useful
-    # signal when it works, not a hard gate.
-
     # Stage 3b: change password
     new_password = generate_password()
     try:
@@ -430,28 +298,6 @@ def enroll_node(engine_name: str, node_index: int,
     try:
         fingerprint = first_contact(target, new_password)
     except Exception as exc:
-        # Special-case "publickey-only daemon" — same engine-hardening
-        # cause as the pre-flight probe but surfaced post-rotation (e.g.
-        # the probe was inconclusive). Same actionable error so the
-        # operator doesn't bounce between two different messages for
-        # the same root cause.
-        exc_text = str(exc)
-        if ("Bad authentication type" in exc_text
-                and "publickey" in exc_text
-                and "password" not in exc_text.lower().split("allowed")[-1]):
-            return EnrollmentResult(
-                ok=False, failed_at_stage="ssh_auth_methods",
-                new_password=new_password,
-                error=(f"The engine's SSH daemon refused our password "
-                       f"({exc_text}). FEA uses password auth only. "
-                       f"Fix on the engine: SMC Management Client → "
-                       f"Engine → General → SSH Daemon → enable "
-                       f"'Allow Password Authentication'. The password "
-                       f"FEA just set IS on the engine but unusable "
-                       f"until that flag is on. Re-running this "
-                       f"enrollment will rotate the password again "
-                       f"once the daemon accepts password auth."),
-            )
         return EnrollmentResult(
             ok=False, failed_at_stage="connect",
             new_password=new_password,

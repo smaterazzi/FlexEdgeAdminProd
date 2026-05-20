@@ -68,7 +68,7 @@ def _create_all_with_race_retry(db):
 
 
 def _enable_sqlite_foreign_keys(app):
-    """Set per-connection SQLite pragmas: foreign_keys, busy_timeout, synchronous.
+    """Enable PRAGMA foreign_keys=ON on every new SQLite connection.
 
     SQLite ships with FK enforcement DISABLED by default — declared FKs
     are documentation only unless the connection sets the pragma.
@@ -77,17 +77,7 @@ def _enable_sqlite_foreign_keys(app):
     with a bogus parent id slips through. We hit exactly that during
     the multi-domain wipe + re-create on 2026-04-29.
 
-    busy_timeout=5000: default is 0, meaning a contended writer raises
-    `OperationalError: database is locked` instantly. 5s is enough to ride
-    out queue runner pushes / drift scans / boot-time migrations colliding
-    with operator clicks (audit H1, 2026-05-09).
-
-    synchronous=NORMAL: WAL-mode safe and ~3x faster than the FULL default
-    that SQLite uses out of the box. NORMAL still sync's at the WAL
-    checkpoint boundary, so a power-loss only loses the last in-flight
-    transaction (acceptable for an admin tool).
-
-    Registers a SQLAlchemy `connect` event listener that runs the pragmas
+    Registers a SQLAlchemy `connect` event listener that runs the pragma
     against the actual SQLite DBAPI connection.
     """
     if "sqlite" not in app.config.get("SQLALCHEMY_DATABASE_URI", ""):
@@ -96,12 +86,10 @@ def _enable_sqlite_foreign_keys(app):
     from sqlalchemy import event
 
     @event.listens_for(db.engine, "connect")
-    def _set_sqlite_pragmas(dbapi_connection, _connection_record):
+    def _set_fk_pragma(dbapi_connection, _connection_record):
         cursor = dbapi_connection.cursor()
         try:
             cursor.execute("PRAGMA foreign_keys=ON")
-            cursor.execute("PRAGMA busy_timeout=5000")
-            cursor.execute("PRAGMA synchronous=NORMAL")
         finally:
             cursor.close()
 
@@ -137,24 +125,13 @@ def init_database(app):
         _migrate_post_create(db, app)
         log.info("Database tables ensured at %s", app.config["SQLALCHEMY_DATABASE_URI"])
 
-    # 3. Check if setup wizard is needed (no users in DB AND no sentinel).
-    #    H10 (audit fix-up, 2026-05-09): the `setup_completed` row in
-    #    `platform_settings` is dropped by the wizard on success and acts
-    #    as a tamper-resistant marker — deleting User rows manually does
-    #    NOT re-arm the wizard, because the sentinel still says setup ran.
+    # 3. Check if setup wizard is needed (no users in DB)
     with app.app_context():
-        from webapp.models import User, PlatformSetting
+        from webapp.models import User
         user_count = User.query.count()
-        sentinel = db.session.get(PlatformSetting, "setup_completed")
-        app.config["SETUP_REQUIRED"] = (user_count == 0 and sentinel is None)
+        app.config["SETUP_REQUIRED"] = user_count == 0
         if app.config["SETUP_REQUIRED"]:
             log.warning("No users in database — setup wizard will be shown on first visit")
-        elif user_count == 0 and sentinel is not None:
-            log.warning(
-                "Setup sentinel present but no users — setup wizard will "
-                "NOT re-arm. Restore from backup or delete the "
-                "`setup_completed` row in platform_settings to recover."
-            )
 
 
 def is_setup_required(app) -> bool:
@@ -312,23 +289,6 @@ def _migrate_post_create(db, app):
             db.session.rollback()
             log.error("Failed to add dhcp_engine_ssh_access.state_refreshed_at: %s", exc)
 
-    # P1 — contact-address-aware connect IP (2026-05-12). NULL/empty
-    # preserves today's behavior (dial `hostname` directly); set per-row
-    # via the credentials wizard when a node sits behind 1:1 NAT and
-    # FEA needs to reach its public exit address.
-    cols = _sqlite_columns(db, "dhcp_engine_credentials")
-    if cols and "connect_ip_override" not in cols:
-        log.info("P1: ALTER dhcp_engine_credentials ADD COLUMN connect_ip_override")
-        try:
-            db.session.execute(db.text(
-                "ALTER TABLE dhcp_engine_credentials ADD COLUMN "
-                "connect_ip_override TEXT NOT NULL DEFAULT ''"
-            ))
-            db.session.commit()
-        except Exception as exc:
-            db.session.rollback()
-            log.error("Failed to add dhcp_engine_credentials.connect_ip_override: %s", exc)
-
     # Phase G — drift detector. Adds `drift_state`, `last_drift_check_at`,
     # `drift_detail` columns to smc_objects. Pre-existing rows get a default
     # of 'unknown' and become 'clean' on the first scan that successfully
@@ -380,124 +340,6 @@ def _migrate_post_create(db, app):
     # db.create_all() above; this migration only handles the additive
     # role columns + backfill. Idempotent.
     _phase_change_mgmt_a(db, app)
-
-    # M8 (audit fix-up, 2026-05-09): composite index on (domain_id, timestamp)
-    # for `platform_logs`. db.create_all() picks it up on fresh installs;
-    # existing DBs need an explicit `CREATE INDEX IF NOT EXISTS`.
-    _phase_audit_indexes(db, app)
-
-    # Roadmap item 5 — Let's Encrypt CRUD (Phase LE.1, 2026-05-11):
-    # extend `managed_certificates` with the FEA-driven request lifecycle.
-    # The two new tables `acme_accounts` and `domain_cert_patterns` are
-    # created empty by `db.create_all()` above; this phase only handles
-    # additive column adds on the existing `managed_certificates` table.
-    _phase_le_certs(db, app)
-
-
-def _phase_le_certs(db, app):
-    """Extend `managed_certificates` for the Let's Encrypt CRUD feature.
-
-    Idempotent: each column add is guarded by a `PRAGMA table_info`
-    lookup so subsequent boots skip them. Existing rows (legacy
-    operator-tracked certs that pointed at pre-existing certbot output)
-    get sensible defaults — `status='active'` because if they're
-    already in the DB they're already deployed; `is_staging=False`;
-    everything else NULL.
-
-    Phase LE.1 schema, 2026-05-11.
-    """
-    if not _is_sqlite(app):
-        return
-    cols = _sqlite_columns(db, "managed_certificates")
-    if not cols:
-        # Table doesn't exist yet — fresh install. `db.create_all()` will
-        # land the full new schema; nothing for this phase to do.
-        return
-    additions = [
-        # (column_name, ALTER TABLE fragment)
-        ("domain_id",
-         "ALTER TABLE managed_certificates ADD COLUMN domain_id INTEGER REFERENCES domains(id) ON DELETE SET NULL"),
-        ("requested_by_user_id",
-         "ALTER TABLE managed_certificates ADD COLUMN requested_by_user_id INTEGER REFERENCES users(id) ON DELETE SET NULL"),
-        ("status",
-         "ALTER TABLE managed_certificates ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'active'"),
-        ("last_error",
-         "ALTER TABLE managed_certificates ADD COLUMN last_error TEXT NOT NULL DEFAULT ''"),
-        ("is_staging",
-         "ALTER TABLE managed_certificates ADD COLUMN is_staging BOOLEAN NOT NULL DEFAULT 0"),
-        ("pending_change_id",
-         "ALTER TABLE managed_certificates ADD COLUMN pending_change_id INTEGER REFERENCES pending_changes(id) ON DELETE SET NULL"),
-        ("next_renewal_after",
-         "ALTER TABLE managed_certificates ADD COLUMN next_renewal_after DATETIME"),
-        ("account_id",
-         "ALTER TABLE managed_certificates ADD COLUMN account_id INTEGER REFERENCES acme_accounts(id) ON DELETE SET NULL"),
-        ("challenge_type",
-         "ALTER TABLE managed_certificates ADD COLUMN challenge_type VARCHAR(16) NOT NULL DEFAULT 'http01'"),
-        ("dns_challenge_state",
-         "ALTER TABLE managed_certificates ADD COLUMN dns_challenge_state VARCHAR(16)"),
-        ("dns_challenge_record_name",
-         "ALTER TABLE managed_certificates ADD COLUMN dns_challenge_record_name VARCHAR(512)"),
-        ("dns_challenge_record_value",
-         "ALTER TABLE managed_certificates ADD COLUMN dns_challenge_record_value VARCHAR(512)"),
-    ]
-    added = []
-    for col_name, sql in additions:
-        if col_name in cols:
-            continue
-        try:
-            db.session.execute(db.text(sql))
-            db.session.commit()
-            added.append(col_name)
-        except Exception as exc:
-            log.warning("LE.1: failed to add managed_certificates.%s (non-fatal): %s",
-                        col_name, exc)
-            try:
-                db.session.rollback()
-            except Exception:
-                pass
-    if added:
-        log.info("LE.1: added managed_certificates columns: %s",
-                 ", ".join(added))
-    # Index on next_renewal_after so the renewal scheduler's "due soon"
-    # query (Phase LE.3) is cheap.
-    try:
-        db.session.execute(db.text(
-            "CREATE INDEX IF NOT EXISTS ix_managed_certificates_next_renewal "
-            "ON managed_certificates (next_renewal_after)"
-        ))
-        db.session.commit()
-    except Exception as exc:
-        log.warning("LE.1: renewal index create failed (non-fatal): %s", exc)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
-
-
-def _phase_audit_indexes(db, app):
-    """Add audit-driven indexes on existing tables. Idempotent.
-
-    Currently:
-      * `ix_platform_logs_domain_ts` on `platform_logs(domain_id, timestamp)`
-        — drives the /logs viewer. SQLite's `CREATE INDEX IF NOT EXISTS`
-        is a no-op when the index already exists, so this is safe to run
-        on every boot.
-    """
-    if not _is_sqlite(app):
-        return
-    try:
-        db.session.execute(db.text(
-            "CREATE INDEX IF NOT EXISTS ix_platform_logs_domain_ts "
-            "ON platform_logs (domain_id, timestamp)"
-        ))
-        db.session.commit()
-    except Exception as exc:
-        log.warning("M8: composite log index creation failed (non-fatal): %s",
-                    exc)
-        try:
-            db.session.rollback()
-        except Exception:
-            pass
 
 
 # ── Multi-Domain Revamp — Phase A ────────────────────────────────────────

@@ -71,15 +71,10 @@ def _get_profiles_from_db(email: str) -> list:
         k = d.api_key
         if k is None or not k.is_active:
             return None
-        # H2 (audit fix-up, 2026-05-09): plaintext API key is intentionally
-        # NOT included here. ``tenant`` (= Domain.slug) is the resolution
-        # key — `app.py:_resolve_active_domain` populates `g.api_key_obj`
-        # per-request, and `active_api_key_plaintext()` decrypts on demand.
-        # Keeping the cookie cleartext-free reduces XSS / cookie-shadowing
-        # blast radius.
         return {
             "name": d.display_name,
             "smc_url": k.smc_url,
+            "api_key": k.decrypted_key,
             "verify_ssl": k.verify_ssl,
             "timeout": k.timeout,
             "domain": d.smc_domain_name,
@@ -258,18 +253,16 @@ def user_exists_in_db(email: str) -> bool:
 def is_active_profile_valid(profile: dict | None) -> bool:
     """Verify that a session's active_profile still maps to an active ApiKey.
 
-    H2 (audit fix-up, 2026-05-09): no longer requires the plaintext API key
-    to be in the session. Resolves via the profile's ``tenant`` slug
-    (= Domain.slug) → Domain → ApiKey.is_active. Same revocation-detection
-    behaviour, no plaintext exposure.
+    The session caches a snapshot of the resolved profile, including the
+    plaintext API key. If an admin revokes that key (in `/admin/api-keys`)
+    the cached profile keeps working until the user re-selects, which leads
+    to confusing ``SMCConnectionError: No session found`` failures when the
+    SMC SDK rejects the revoked credential mid-session.
 
-    Designed for ``@profile_required`` to call once per request; one
-    indexed DB lookup per call.
-
-    Backward-compat fallback: if the slug isn't resolvable but the profile
-    has an ``api_key`` field (JSON-fallback / older sessions), use the
-    legacy hash-the-plaintext check so existing sessions don't get evicted
-    on first load after the upgrade.
+    This helper hashes the cached plaintext and confirms a matching
+    ``ApiKey`` row with ``is_active=True`` still exists. Designed for
+    ``@profile_required`` to call once per request; the hash + DB lookup
+    are both indexed and effectively free.
 
     Behavior when the DB layer is unavailable (CLI / JSON-fallback mode):
     returns ``True`` so legacy deployments don't lock themselves out.
@@ -279,19 +272,6 @@ def is_active_profile_valid(profile: dict | None) -> bool:
     if not _db_available():
         return True   # Fall through for JSON-fallback / non-Flask callers.
 
-    slug = (profile.get("tenant") or "").strip()
-    if slug:
-        from webapp.models import Domain
-        d = Domain.query.filter_by(slug=slug, is_active=True).first()
-        if d is not None and d.api_key is not None and d.api_key.is_active:
-            return True
-        # Slug present but Domain inactive or its key revoked → invalid.
-        # Only fall through to the legacy hash check if the slug couldn't
-        # be resolved at all (truly old/JSON-fallback profile shape).
-        if d is not None or Domain.query.filter_by(slug=slug).first() is not None:
-            return False
-
-    # Legacy fallback: hash the cached plaintext (older sessions).
     api_key = (profile.get("api_key") or "").strip()
     if not api_key:
         return False
@@ -301,38 +281,3 @@ def is_active_profile_valid(profile: dict | None) -> bool:
     return ApiKey.query.filter_by(
         key_hash=hash_value(api_key), is_active=True,
     ).first() is not None
-
-
-# ── Plaintext API key resolver (H2 — keeps key out of the session cookie)
-
-def active_api_key_plaintext(profile: dict | None = None) -> str:
-    """Return the plaintext API key for the request's active Domain.
-
-    Resolution order (H2 audit fix-up, 2026-05-09):
-      1. ``g.api_key_obj.decrypted_key`` — populated by ``app.py``'s
-         ``_resolve_active_domain`` before-request hook from the session's
-         ``active_profile["tenant"]`` slug. This is the canonical path —
-         no plaintext in the session cookie, one Fernet decrypt per call.
-      2. ``profile["api_key"]`` — legacy fallback for JSON-fallback /
-         older sessions / out-of-Flask callers. Returns whatever the
-         profile carries.
-      3. Empty string if nothing resolves. Caller decides whether to raise.
-
-    Pass ``profile`` explicitly for callers that already have the dict
-    handy (cheaper than a session lookup). Otherwise falls through to
-    ``session.get('active_profile')``.
-    """
-    try:
-        from flask import g
-        api_key_obj = getattr(g, "api_key_obj", None)
-        if api_key_obj is not None and getattr(api_key_obj, "is_active", False):
-            return api_key_obj.decrypted_key or ""
-    except Exception:
-        pass
-    if profile is None:
-        try:
-            from flask import session
-            profile = session.get("active_profile") or {}
-        except Exception:
-            profile = {}
-    return (profile.get("api_key") or "").strip()

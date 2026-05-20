@@ -80,17 +80,14 @@ def _user_cfg() -> dict:
     """Build the dict-shaped SMC config from the current session.
 
     Mirrors ``app.get_user_cfg()`` — duplicated here to avoid importing
-    from app.py (circular import on blueprint registration). Plaintext
-    API key resolved via `user_manager.active_api_key_plaintext` (H2
-    audit fix-up — no plaintext in the session cookie).
+    from app.py (circular import on blueprint registration).
     """
     profile = session.get("active_profile") or {}
     if not profile:
         raise ValueError("No SMC profile selected.")
-    import user_manager
     return {
         "smc_url":      profile["smc_url"],
-        "api_key":      user_manager.active_api_key_plaintext(profile),
+        "api_key":      profile["api_key"],
         "verify_ssl":   profile.get("verify_ssl", False),
         "timeout":      profile.get("timeout", 120),
         "domain":       session.get("active_domain"),
@@ -1202,7 +1199,6 @@ def tools_scan_csv(scan_id):
     from io import StringIO
     from flask import Response
     from webapp import engine_scan_jobs
-    from shared.csv_safe import csv_safe
 
     user_email = (session.get("user") or {}).get("email", "")
     report = engine_scan_jobs.consume_report(scan_id, user_email=user_email)
@@ -1223,29 +1219,27 @@ def tools_scan_csv(scan_id):
         opens = ",".join(str(p) for p in r.open_ports)
         closes = ",".join(str(p) for p, s in sorted(r.ports.items())
                           if s == "closed")
-        w.writerow([csv_safe(r.ip), int(r.icmp_reply), int(r.arp_reply),
-                    csv_safe(r.mac), csv_safe(r.hostname),
-                    csv_safe(opens), csv_safe(closes)])
-    from shared.csv_safe import safe_filename
-    fname = safe_filename(f"engine-scan-{scan_id[:8]}.csv",
-                          default="engine-scan.csv")
+        w.writerow([r.ip, int(r.icmp_reply), int(r.arp_reply),
+                    r.mac, r.hostname, opens, closes])
     return Response(
         buf.getvalue(),
         mimetype="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+        headers={
+            "Content-Disposition":
+                f'attachment; filename="engine-scan-{scan_id[:8]}.csv"',
+        },
     )
 
 
 def _cred_to_target_engines(cred):
     """Build SSHTarget from a DhcpEngineCredential row. Mirrors
     `dhcp_manager._cred_to_target` to avoid the cross-blueprint import.
-
-    P1 (2026-05-12): routes through `target_from_credential` so the
-    `connect_ip_override` field is honored — the terminal and scan
-    tool both dial the NAT exit IP when set.
     """
-    from webapp.dhcp_ssh import target_from_credential
-    return target_from_credential(cred)
+    from webapp.dhcp_ssh import SSHTarget
+    return SSHTarget(
+        hostname=cred.hostname, port=cred.ssh_port,
+        username=cred.ssh_username,
+    )
 
 
 def _cred_to_payload_engines(cred):
@@ -1266,25 +1260,10 @@ def _cred_to_payload_engines(cred):
 def node_terminal(cred_id):
     """Render the xterm.js terminal page. The WebSocket route lives on the
     Flask-Sock instance — see webapp/engine_terminal.py.
-
-    C4 (audit fix-up, 2026-05-09): cross-Domain check enforced both here
-    (HTTP launcher) and on the WebSocket handshake. Without this guard,
-    a Domain-A admin could open a terminal on a Domain-B engine simply by
-    crafting the cred_id URL. Super Admin bypasses the per-Domain check.
     """
     from webapp.models import DhcpEngineCredential
-    from webapp.auth_roles import is_super_admin
     cred = db.session.get(DhcpEngineCredential, cred_id)
     if cred is None:
-        flash("Credential not found.", "danger")
-        return redirect(url_for("engines.clusters"))
-    active_domain = _current_domain()
-    active_domain_id = getattr(active_domain, "id", None)
-    if (cred.domain_id is not None
-            and cred.domain_id != active_domain_id
-            and not is_super_admin()):
-        log.warning("Terminal launch refused: cred %s belongs to domain %s, "
-                    "active domain is %s", cred_id, cred.domain_id, active_domain_id)
         flash("Credential not found.", "danger")
         return redirect(url_for("engines.clusters"))
     if cred.last_verify_status != "ok":
@@ -1484,11 +1463,8 @@ def sginfo_file_download(record_id):
                       rec.id, member_path)
         abort(500)
 
-    # M4 (audit fix-up, 2026-05-09): sanitise the SMC-archive-derived
-    # filename — strip CRLF / quote / backslash / tab / leading dot
-    # before interpolating into the Content-Disposition header.
-    from shared.csv_safe import safe_filename
-    fname = safe_filename(member_path.rsplit("/", 1)[-1], default="member.bin")
+    # Inline-safe filename (sanitise path separators).
+    fname = member_path.rsplit("/", 1)[-1] or "member.bin"
     return Response(
         data,
         mimetype="application/octet-stream",

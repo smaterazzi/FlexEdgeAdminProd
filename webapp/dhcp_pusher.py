@@ -331,12 +331,9 @@ def _push_to_node(scope: DhcpScope,
                       status="failed",
                       reservations_count=len(reservations))
 
-    # P1 (2026-05-12): dial through `target_from_credential` so the
-    # NAT exit IP is used when set. `node.node_hostname` keeps the
-    # engine's real interface IP for audit-log clarity (matches the
-    # SMC rule's destination Host).
-    from webapp.dhcp_ssh import target_from_credential
-    target = target_from_credential(cred_row)
+    target = SSHTarget(hostname=cred_row.hostname,
+                       port=cred_row.ssh_port,
+                       username=cred_row.ssh_username)
     payload = SSHCredential(password=cred_row.encrypted_password,
                             host_fingerprint=cred_row.host_fingerprint)
 
@@ -417,8 +414,7 @@ def _push_to_node(scope: DhcpScope,
 def push_scope_to_engine(scope_id: int,
                          operator_email: str,
                          action: str = "push",
-                         dry_run: bool = False,
-                         progress_cb=None) -> PushResult:
+                         dry_run: bool = False) -> PushResult:
     """Push a scope's FlexEdge-managed reservations to every node.
 
     Serialised per-engine via ``engine_op_lock`` (shared with bootstrap
@@ -437,16 +433,6 @@ def push_scope_to_engine(scope_id: int,
                  SKIPS the file write and reload. Reservation row status
                  is NOT mutated. Use to surface the diff in the UI for
                  operator confirmation before committing.
-        progress_cb: H7 (audit fix-up, 2026-05-09). Optional callable
-                 invoked twice per node — once with `phase="start"` when
-                 the SSH connection is initiated, then with
-                 `phase="done"` carrying the NodeResult. Web route
-                 (`webapp/dhcp_deploy_jobs.py`) hooks this to drive the
-                 scan_jobs watcher UI. CLI / synchronous callers pass
-                 None. Cb signature:
-                     progress_cb(*, phase: str, node_index: int,
-                                 node_hostname: str, total_nodes: int,
-                                 done_nodes: int, node_result=None)
 
     Returns a ``PushResult`` summarizing per-node outcomes. Reservation
     rows are flipped to ``status=synced`` on full success or
@@ -463,7 +449,7 @@ def push_scope_to_engine(scope_id: int,
     try:
         with engine_op_lock(scope.engine_name, timeout=300):
             return _push_scope_to_engine_locked(scope, operator_email,
-                                                action, dry_run, progress_cb)
+                                                action, dry_run)
     except RuntimeError as exc:
         return PushResult(scope_id=scope.id, engine_name=scope.engine_name,
                           overall_status="blocked",
@@ -474,8 +460,7 @@ def push_scope_to_engine(scope_id: int,
 def _push_scope_to_engine_locked(scope: DhcpScope,
                                  operator_email: str,
                                  action: str,
-                                 dry_run: bool,
-                                 progress_cb=None) -> PushResult:
+                                 dry_run: bool) -> PushResult:
     """Locked body of ``push_scope_to_engine`` — caller holds engine_op_lock."""
     result = PushResult(scope_id=scope.id, engine_name=scope.engine_name,
                         overall_status="failed")
@@ -506,27 +491,11 @@ def _push_scope_to_engine_locked(scope: DhcpScope,
     audit_action = "dry_run" if dry_run else action
 
     # 3. Per-node push.
-    total_nodes = len(creds)
-    for idx, cred in enumerate(creds):
-        if progress_cb is not None:
-            try:
-                progress_cb(phase="start", node_index=cred.node_index,
-                            node_hostname=cred.hostname or "",
-                            total_nodes=total_nodes, done_nodes=idx)
-            except Exception:
-                log.exception("dhcp push progress_cb (start) raised — continuing")
+    for cred in creds:
         node_result = _push_to_node(scope, cred, reservations,
                                     operator_email, action,
                                     dry_run=dry_run)
         result.nodes.append(node_result)
-        if progress_cb is not None:
-            try:
-                progress_cb(phase="done", node_index=cred.node_index,
-                            node_hostname=cred.hostname or "",
-                            total_nodes=total_nodes, done_nodes=idx + 1,
-                            node_result=node_result)
-            except Exception:
-                log.exception("dhcp push progress_cb (done) raised — continuing")
 
         # Persist a DhcpDeployment audit row. ``error`` and ``reload_warning``
         # are *separate* concerns: ``error`` means the file write failed,
