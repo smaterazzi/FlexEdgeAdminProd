@@ -693,6 +693,26 @@ document.addEventListener("DOMContentLoaded", () => {
   document.querySelectorAll("[data-filter]").forEach(btn => {
     btn.addEventListener("click", () => filterLeases(btn.dataset.filter));
   });
+
+  // Persist the "Fix IP collisions" toggle across the Reserve→redirect
+  // round-trip. Without this, operators tick the box, hit Reserve, see
+  // refusals on a still-stale rendering, then hit Reserve a second time
+  // without re-ticking — producing the misleading "Tick 'Fix IP
+  // collisions' above…" error a second time. Keyed per scope so toggling
+  // it on one scope doesn't leak to another.
+  const fixCb = document.getElementById("fix-collisions-cb");
+  if (fixCb) {
+    const lsKey = "fea_dhcp_fix_collisions_{{ scope.id }}";
+    try {
+      if (localStorage.getItem(lsKey) === "1") fixCb.checked = true;
+    } catch (e) { /* localStorage disabled — ignore */ }
+    fixCb.addEventListener("change", () => {
+      try {
+        if (fixCb.checked) localStorage.setItem(lsKey, "1");
+        else localStorage.removeItem(lsKey);
+      } catch (e) { /* ignore */ }
+    });
+  }
 });
 
 // ── Scan-range modal — toggle custom-range fields + warning checkbox ──
