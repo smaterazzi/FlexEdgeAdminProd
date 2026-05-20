@@ -3869,6 +3869,13 @@ def scope_leases_reserve(scope_id):
         flash("No leases selected.", "warning")
         return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
 
+    # Opt-in: when ticked, name-collision rows (SMC has a Host with the
+    # planned name but a DIFFERENT IP) get the existing Host's address
+    # updated to match the lease, then adopted as a DhcpReservation.
+    # Off by default — refusing-on-collision is the safer behaviour
+    # because it doesn't silently overwrite an SMC element's IP.
+    fix_collisions = request.form.get("fix_collisions") == "1"
+
     candidates: list[dict] = []
     seen_mac: set[str] = set()
     seen_ip: set[str] = set()
@@ -3952,6 +3959,7 @@ def scope_leases_reserve(scope_id):
 
     created: list[str] = []
     adopted: list[str] = []
+    repaired: list[str] = []
     errors: list[str] = []
     try:
         with smc_session(cfg):
@@ -3961,17 +3969,20 @@ def scope_leases_reserve(scope_id):
                     # Look up the planned name in SMC first. A previous
                     # deployment may have left a Host element with the
                     # same name — re-creating would trip SMC's "element
-                    # name must be unique" error. Two outcomes:
+                    # name must be unique" error. Three outcomes:
                     #   * existing.address == c["ip"]  → adopt it,
                     #     record a DhcpReservation pointing at the
                     #     existing href with status='synced' (SMC
                     #     already has the canonical row).
-                    #   * existing.address != c["ip"]  → genuine name
-                    #     collision; surface a clean error so the
-                    #     operator can rename or delete the old Host.
+                    #   * existing.address != c["ip"] AND
+                    #     fix_collisions is OFF → refuse cleanly.
+                    #   * existing.address != c["ip"] AND
+                    #     fix_collisions is ON → update the SMC
+                    #     Host's address to the lease IP, then adopt.
                     existing = host_get(c["name"])
                     if existing is not None:
-                        if (existing.address or "").strip() == c["ip"]:
+                        existing_ip = (existing.address or "").strip()
+                        if existing_ip == c["ip"]:
                             res = DhcpReservation(
                                 scope_id=scope.id,
                                 smc_host_name=existing.name,
@@ -3991,14 +4002,48 @@ def scope_leases_reserve(scope_id):
                                 f"(MAC={c['mac']} IP={c['ip']})",
                             )
                             continue
-                        # IP mismatch — refuse rather than silently
-                        # overwriting someone else's Host.
+
+                        if fix_collisions:
+                            # Update the SMC Host's primary address to
+                            # the lease IP, then adopt. The name, MAC
+                            # marker (in comment), and other fields stay
+                            # intact — only the address changes.
+                            updated_view = host_update(
+                                c["name"], address=c["ip"])
+                            res = DhcpReservation(
+                                scope_id=scope.id,
+                                smc_host_name=updated_view.name,
+                                smc_host_href=updated_view.href,
+                                ip_address=updated_view.address,
+                                mac_address=c["mac"],
+                                status="synced",
+                                source="lease",
+                            )
+                            db.session.add(res)
+                            db.session.commit()
+                            repaired.append(
+                                f"{c['name']} ({existing_ip} → {c['ip']})")
+                            _log_activity(
+                                "reservation",
+                                "adopt_with_ip_update", "ok",
+                                target,
+                                f"SMC Host IP repaired "
+                                f"({existing_ip} → {c['ip']}); "
+                                f"MAC={c['mac']}",
+                            )
+                            continue
+
+                        # IP mismatch and the operator didn't tick the
+                        # fix-collisions box — refuse rather than
+                        # silently overwriting someone else's Host.
                         msg = (
                             f"SMC already has a Host '{c['name']}' "
-                            f"with IP {existing.address or '(blank)'}, "
+                            f"with IP {existing_ip or '(blank)'}, "
                             f"but this lease has IP {c['ip']}. "
-                            f"Rename or delete the existing Host in "
-                            f"SMC Management Client, then retry."
+                            f"Tick 'Fix IP collisions' above to update "
+                            f"the existing Host's IP to {c['ip']} and "
+                            f"adopt it, OR rename / delete it in SMC "
+                            f"Management Client."
                         )
                         errors.append(f"{c['name']} ({c['mac']} → {c['ip']}): {msg}")
                         _log_activity(
@@ -4048,10 +4093,27 @@ def scope_leases_reserve(scope_id):
             f"with status 'synced' — no new SMC element was created.",
             "info",
         )
+    if repaired:
+        flash(
+            f"Updated IP on {len(repaired)} existing SMC Host element(s) "
+            f"to match the current lease, then adopted: "
+            f"{', '.join(repaired)}. The Host name + MAC marker were "
+            f"preserved; only the address field changed.",
+            "info",
+        )
     for s in skipped:
         flash(s, "warning")
     for e in errors:
         flash(e, "danger")
+    # If we updated SMC Host addresses, invalidate the cached
+    # dhcp.hosts.<subnet> index so the next leases page render reflects
+    # the new state (instead of serving stale name_collision badges).
+    if repaired:
+        try:
+            from shared.smc_cache import invalidate
+            invalidate("dhcp.hosts", (scope.domain_id, scope.subnet_cidr))
+        except Exception:
+            pass
     return redirect(url_for("dhcp.scope_leases", scope_id=scope.id))
 
 

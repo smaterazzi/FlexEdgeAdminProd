@@ -271,6 +271,15 @@
         <i class="bi bi-check-all"></i> Select visible
       </button>
       <button type="button" class="btn btn-sm btn-outline-light" onclick="selectAllLeases(false)">Clear</button>
+      <div class="form-check form-switch ms-2 d-flex align-items-center"
+           title="When a selected lease's planned name already exists in SMC with a different IP (red 'name collision' badge), update the existing SMC Host's IP to match the lease instead of refusing. Only the address field changes — the Host name, MAC marker, and any other config stay intact.">
+        <input type="checkbox" class="form-check-input me-1" id="fix-collisions-cb"
+               name="fix_collisions" value="1">
+        <label class="form-check-label small text-warning" for="fix-collisions-cb"
+               style="cursor:help; white-space:nowrap;">
+          <i class="bi bi-wrench"></i> Fix IP collisions
+        </label>
+      </div>
       <button type="submit" class="btn btn-sm btn-primary" id="reserve-btn" disabled>
         <i class="bi bi-pin-angle"></i> Add <span id="reserve-count">0</span> to reservations
       </button>
@@ -384,8 +393,8 @@
               </span>
             {% elif l.smc_host_status == 'name_collision' %}
               <span class="badge bg-danger"
-                    title="SMC already has Host '{{ l.smc_host_name }}' with a different IP ({{ l.smc_host_ip }}). Reserving will FAIL until the old Host is renamed or deleted in SMC Management Client.">
-                <i class="bi bi-exclamation-triangle"></i> name collision in SMC
+                    title="SMC already has Host '{{ l.smc_host_name }}' with a different IP ({{ l.smc_host_ip }}) than this lease ({{ l.ip }}). Tick 'Fix IP collisions' in the toolbar above to update the SMC Host's IP and adopt it, OR rename / delete it in SMC Management Client.">
+                <i class="bi bi-exclamation-triangle"></i> collision · stored {{ l.smc_host_ip }}
               </span>
             {% else %}
               <span class="text-muted">pool</span>
