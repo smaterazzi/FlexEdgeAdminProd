@@ -222,8 +222,15 @@ def _smc_cfg_for_change(change):
     )
 
 
-def _audit(action: str, change, *, status: str = "ok", detail: str = ""):
-    """Emit a `feature="changes"` audit log entry for a state transition."""
+def _audit(action: str, change, *, status: str = "ok", detail: str = "",
+           commit: bool = True):
+    """Emit a `feature="changes"` audit log entry for a state transition.
+
+    H9 (audit fix-up, 2026-05-09): pass ``commit=False`` to enrol the
+    audit row into the caller's open transaction so the state change +
+    audit row commit atomically. The caller must then call
+    ``db.session.commit()`` to persist both at once.
+    """
     try:
         from shared.logging import audit
         audit(
@@ -231,6 +238,7 @@ def _audit(action: str, change, *, status: str = "ok", detail: str = ""):
             target=_describe(change), detail=detail, status=status,
             source_correlation_id=change.source_correlation_id,
             domain_id=change.domain_id,
+            commit=commit,
         )
     except Exception as exc:
         log.warning("queue_runner: audit emit failed (%s, change=#%s): %s",
@@ -356,9 +364,77 @@ def _humanize_smc_error(exc_msg: str) -> str:
 
 
 # ── State-transition primitives ──────────────────────────────────────────
+#
+# C7 + H9 + H11 (audit fix-up, 2026-05-09):
+#
+# C7: every transition out of a "claimable" state goes through an atomic
+#     ``UPDATE pending_changes SET state=<new> WHERE id=? AND state=<old>``
+#     and only proceeds when ``rowcount == 1``. SMC ``create`` is not
+#     idempotent — without an atomic claim, two threads (or a double-click,
+#     or push_batch + a concurrent push_one for the same id) both reach
+#     the handler and we get duplicate Hosts / conflicts. The claim adds
+#     a transient ``pushing`` state that lives only between push_one()
+#     entry and the terminal commit.
+# H9: state-transition + audit row commit atomically. Before this fix,
+#     ``commit; _audit(...)`` left a short window where a process kill
+#     produced PUSHED rows with no audit trail. ``_audit(commit=False)``
+#     enrols the audit row into the same session; the surrounding
+#     ``db.session.commit()`` lands both rows together.
+# H11: implicit. With C7's atomic UPDATE, the stale-read in push_batch
+#     (no ``expire_all()`` between iterations) becomes harmless — the
+#     UPDATE either claims or returns rowcount=0 and we skip.
+
+
+def _claim_for_push(change_id: int) -> Optional[str]:
+    """Atomically transition a row from QUEUED to PUSHING.
+
+    Returns the prior state (always ``"queued"``) when the claim wins,
+    or ``None`` when the row no longer exists in queued state — meaning
+    a concurrent worker already claimed / completed / aborted it.
+    Caller MUST refresh the in-memory ORM row after a successful claim
+    (``db.session.expire_all()`` in caller pattern) so the row's state
+    column reflects ``"pushing"`` and any subsequent commit isn't a
+    stale-write from earlier read.
+    """
+    from shared.db import db
+    from webapp.models import PendingChange
+    rowcount = (
+        db.session.query(PendingChange)
+        .filter(PendingChange.id == change_id,
+                PendingChange.state == "queued")
+        .update({"state": "pushing"}, synchronize_session=False)
+    )
+    db.session.commit()
+    if rowcount == 1:
+        return "queued"
+    return None
+
+
+def _claim_for_abort(change_id: int) -> Optional[str]:
+    """Atomically transition QUEUED|CONFLICT → ABORTED.
+
+    Returns the prior state on success, ``None`` on lost claim.
+    """
+    from shared.db import db
+    from webapp.models import PendingChange
+    rowcount = (
+        db.session.query(PendingChange)
+        .filter(PendingChange.id == change_id,
+                PendingChange.state.in_(("queued", "conflict")))
+        .update({"state": "aborted"}, synchronize_session=False)
+    )
+    db.session.commit()
+    return "queued_or_conflict" if rowcount == 1 else None
+
 
 def _mark_pushed(change, *, applied: bool, detail: str = ""):
-    """QUEUED → PUSHED (or APPLIED). Commits + audits + invalidates cache."""
+    """PUSHING → PUSHED (or APPLIED). Atomic with audit row.
+
+    Caller must have already won the claim via ``_claim_for_push``.
+    Both the state transition AND the audit row land in one commit so
+    a process kill mid-operation can't leave a state-change without an
+    audit trail.
+    """
     from shared.db import db
     new_state = "applied" if applied else "pushed"
     change.state = new_state
@@ -366,13 +442,13 @@ def _mark_pushed(change, *, applied: bool, detail: str = ""):
     change.transitioned_by_id = _current_user_id()
     change.push_error_text = ""
     change.push_error_at = None
+    _audit(f"push.{new_state}", change, detail=detail, commit=False)
     db.session.commit()
-    _audit(f"push.{new_state}", change, detail=detail)
     _invalidate_cache_for_change(change)
 
 
 def _mark_push_failed(change, error: str):
-    """QUEUED → PUSH_FAILED. Commits + audits.
+    """PUSHING → PUSH_FAILED. Atomic with audit row.
 
     Runs the raw error through `_humanize_smc_error` so well-known SMC
     failure classes (policy lock, etc.) get a clearer remediation hint
@@ -384,20 +460,25 @@ def _mark_push_failed(change, error: str):
     change.state = "push_failed"
     change.push_error_text = friendly[:4000]
     change.push_error_at = _utcnow()
+    _audit("push.failed", change, status="failed", detail=friendly,
+           commit=False)
     db.session.commit()
-    _audit("push.failed", change, status="failed", detail=friendly)
 
 
-def _mark_aborted(change, reason: str = ""):
-    """QUEUED|CONFLICT → ABORTED. Commits + audits."""
+def _mark_aborted_via_claim(change, reason: str = ""):
+    """Audit-and-stamp helper called AFTER ``_claim_for_abort`` won.
+
+    The state column is already ``aborted`` (set by the atomic claim's
+    UPDATE). This stamps the rest of the row's metadata + emits the
+    audit entry, atomically with the metadata commit.
+    """
     from shared.db import db
-    change.state = "aborted"
     change.transitioned_at = _utcnow()
     change.transitioned_by_id = _current_user_id()
     if reason:
         change.push_error_text = (reason or "")[:4000]
+    _audit("abort", change, detail=reason or "operator abort", commit=False)
     db.session.commit()
-    _audit("abort", change, detail=reason or "operator abort")
 
 
 # ── Public API ────────────────────────────────────────────────────────────
@@ -405,8 +486,13 @@ def _mark_aborted(change, reason: str = ""):
 def push_one(change_id: int) -> PushResult:
     """Push a single QUEUED PendingChange against SMC.
 
-    Idempotent on race: if a concurrent caller has already moved the
-    row out of QUEUED, returns `skipped=True` without touching SMC.
+    C7 (audit fix-up, 2026-05-09): atomic state-claim. The runner does
+    a single ``UPDATE pending_changes SET state='pushing' WHERE id=? AND
+    state='queued'``; only the worker whose UPDATE returned ``rowcount=1``
+    proceeds to call the SMC handler. A double-clicked Push button or
+    parallel push_batch + push_one returns ``skipped=True`` for the
+    losing thread instead of double-firing the handler (SMC ``create``
+    is not idempotent — duplicate fires produced duplicate Hosts).
     """
     from webapp.models import PendingChange
     from shared.db import db
@@ -416,6 +502,8 @@ def push_one(change_id: int) -> PushResult:
         return PushResult(failed=True, error="Change not found",
                           change_id=change_id)
 
+    # Soft pre-checks — these don't claim, but they avoid the UPDATE
+    # round-trip for rows that obviously aren't pushable.
     if change.state != "queued":
         log.debug("push_one: change #%s not queued (state=%s) — skipping",
                   change_id, change.state)
@@ -427,6 +515,20 @@ def push_one(change_id: int) -> PushResult:
         # they can push. The runner refuses to act on review rows.
         return PushResult(skipped=True, change_id=change_id,
                           error=f"Scope is '{change.scope}', not 'main'")
+
+    # Atomic claim — the only race-safe gate before the handler runs.
+    if _claim_for_push(change_id) is None:
+        log.debug("push_one: change #%s claim lost (concurrent worker won)",
+                  change_id)
+        return PushResult(skipped=True, change_id=change_id,
+                          error="State changed concurrently")
+    # Refresh ORM after the bare-SQL UPDATE so subsequent commits aren't
+    # stale-writes (H11 — same fix that closes push_batch's stale-read).
+    db.session.expire_all()
+    change = db.session.get(PendingChange, change_id)
+    if change is None:
+        return PushResult(failed=True, error="Change vanished after claim",
+                          change_id=change_id)
 
     handler = _HANDLERS.get(change.operation)
     if handler is None:
@@ -519,16 +621,22 @@ def push_all_for_domain(domain_id: int) -> BatchResult:
 
 
 def abort_one(change_id: int, reason: str = "") -> bool:
-    """Abort a QUEUED or CONFLICT row. Returns True if state changed."""
+    """Abort a QUEUED or CONFLICT row. Returns True if state changed.
+
+    C7 (audit fix-up, 2026-05-09): atomic transition — same idempotency
+    guarantees as push_one. A user clicking Abort while another worker is
+    racing to Push the same row will reliably produce one winner.
+    """
     from webapp.models import PendingChange
     from shared.db import db
 
+    if _claim_for_abort(change_id) is None:
+        return False
+    db.session.expire_all()
     change = db.session.get(PendingChange, change_id)
     if change is None:
         return False
-    if change.state not in ("queued", "conflict"):
-        return False
-    _mark_aborted(change, reason=reason)
+    _mark_aborted_via_claim(change, reason=reason)
     return True
 
 
@@ -540,20 +648,33 @@ def confirm_to_be_deleted(change_id: int) -> PushResult:
     SMC delete fires. The `smc_objects.is_to_be_deleted` flag is left in
     place during PUSH so list-views still strikethrough the row; the
     flag is cleared by the `delete` handler on success.
+
+    C7 (audit fix-up, 2026-05-09): atomic operation flip via UPDATE +
+    rowcount==1 check, so a double-Confirm or Confirm-vs-Revoke race
+    can't double-trigger.
     """
     from webapp.models import PendingChange
     from shared.db import db
 
-    change = db.session.get(PendingChange, change_id)
-    if change is None:
-        return PushResult(failed=True, error="Change not found",
-                          change_id=change_id)
-    if change.operation != "to_be_deleted" or change.state != "queued":
-        return PushResult(skipped=True, change_id=change_id,
-                          error=f"Not a queued to_be_deleted row (op={change.operation}, state={change.state})")
-
-    change.operation = "delete"
+    rowcount = (
+        db.session.query(PendingChange)
+        .filter(PendingChange.id == change_id,
+                PendingChange.operation == "to_be_deleted",
+                PendingChange.state == "queued")
+        .update({"operation": "delete"}, synchronize_session=False)
+    )
     db.session.commit()
+    if rowcount != 1:
+        change = db.session.get(PendingChange, change_id)
+        if change is None:
+            return PushResult(failed=True, error="Change not found",
+                              change_id=change_id)
+        return PushResult(skipped=True, change_id=change_id,
+                          error=f"Not a queued to_be_deleted row "
+                                f"(op={change.operation}, state={change.state})")
+
+    db.session.expire_all()
+    change = db.session.get(PendingChange, change_id)
     _audit("to_be_deleted.confirm", change,
            detail="Operator-submitted delete confirmed → operation=delete")
     return push_one(change_id)
@@ -565,20 +686,37 @@ def revoke_to_be_deleted(change_id: int, reason: str = "") -> bool:
     Transitions the row to ABORTED and clears the
     `smc_objects.is_to_be_deleted` flag so list-views stop showing
     strikethrough. The object stays in SMC unchanged.
+
+    C7 (audit fix-up, 2026-05-09): atomic claim, same idempotency
+    guarantees as the other transitions.
     """
     from webapp.models import PendingChange
     from shared.db import db
 
+    rowcount = (
+        db.session.query(PendingChange)
+        .filter(PendingChange.id == change_id,
+                PendingChange.operation == "to_be_deleted",
+                PendingChange.state == "queued")
+        .update({"state": "aborted"}, synchronize_session=False)
+    )
+    db.session.commit()
+    if rowcount != 1:
+        return False
+
+    db.session.expire_all()
     change = db.session.get(PendingChange, change_id)
     if change is None:
         return False
-    if change.operation != "to_be_deleted" or change.state != "queued":
-        return False
-
     if change.smc_object is not None:
         change.smc_object.is_to_be_deleted = False
-    _mark_aborted(change, reason=reason or "to_be_deleted revoked")
-    _audit("to_be_deleted.revoke", change, detail=reason or "revoked")
+    change.transitioned_at = _utcnow()
+    change.transitioned_by_id = _current_user_id()
+    if reason:
+        change.push_error_text = (reason or "")[:4000]
+    _audit("to_be_deleted.revoke", change,
+           detail=reason or "revoked", commit=False)
+    db.session.commit()
     return True
 
 
@@ -1856,6 +1994,231 @@ def _handle_remove_ssh_rule(change, cfg) -> HandlerResult:
             detail=f"rule removed + policy uploaded: {upload_msg}",
         )
     except Exception as exc:
+        return HandlerResult(success=False, error=str(exc))
+
+
+# ── Let's Encrypt cert lifecycle (Roadmap item 5, Phase LE.2) ────────────
+#
+# Three discrete ops per Q6c — cert_request, cert_renew, cert_revoke.
+# All three drive the certbot subprocess in `webapp/letsencrypt_certbot.py`
+# and persist the result into the linked `ManagedCertificate` row.
+#
+# Note: the SMC session opened by `push_one()` is unused here — cert
+# operations don't talk to SMC. The session-open overhead is one-time
+# per cert operation and is left as-is to keep the queue handler shape
+# uniform.
+
+@register_handler("cert_request")
+def _handle_cert_request(change, cfg) -> HandlerResult:
+    """Issue a new Let's Encrypt cert via HTTP-01.
+
+    Payload: `{"certificate_id": N}`. The ManagedCertificate row was
+    created in pending state by the request route; we look it up,
+    run certbot, and persist the outcome.
+
+    Q6 allowlist is re-checked here defensively — the request route
+    already validated, but a race or a payload-tamper attempt would
+    slip past without this guard.
+    """
+    try:
+        payload = _json.loads(change.payload_json or "{}")
+    except Exception as exc:
+        return HandlerResult(success=False, error=f"Invalid payload JSON: {exc}")
+
+    cert_id = payload.get("certificate_id")
+    if not cert_id:
+        return HandlerResult(success=False,
+                             error="cert_request payload missing certificate_id")
+
+    try:
+        from shared.db import db
+        from webapp.models import ManagedCertificate, AcmeAccount
+        from webapp.letsencrypt_certbot import request_certificate
+        from webapp.letsencrypt_allowlist import is_fqdn_allowed_for_domain
+
+        cert = db.session.get(ManagedCertificate, int(cert_id))
+        if cert is None:
+            return HandlerResult(success=False,
+                                 error=f"ManagedCertificate #{cert_id} not found")
+
+        # Defensive re-check of the allowlist. If the row was created in
+        # one Domain and the change row's domain_id was tampered to
+        # point at another, this catches it before certbot fires.
+        if change.domain_id != cert.domain_id:
+            return HandlerResult(
+                success=False,
+                error=(f"domain mismatch: change.domain_id={change.domain_id} "
+                       f"vs cert.domain_id={cert.domain_id}"),
+            )
+        if cert.domain_id is not None:
+            allowed, reason = is_fqdn_allowed_for_domain(
+                cert.domain, cert.domain_id,
+            )
+            if not allowed:
+                cert.status = "failed"
+                cert.last_error = f"allowlist refused: {reason}"
+                db.session.commit()
+                return HandlerResult(
+                    success=False,
+                    error=f"allowlist refused {cert.domain!r}: {reason}",
+                )
+
+        account = db.session.get(AcmeAccount, cert.account_id) if cert.account_id else None
+        if account is None:
+            # Fall back to the singleton row if account_id wasn't stamped.
+            account = AcmeAccount.query.first()
+        if account is None:
+            cert.status = "failed"
+            cert.last_error = "no AcmeAccount configured — run /tls/letsencrypt setup first"
+            db.session.commit()
+            return HandlerResult(
+                success=False,
+                error="no AcmeAccount configured (run setup wizard at /tls/letsencrypt first)",
+            )
+
+        result = request_certificate(
+            fqdn=cert.domain,
+            email=account.email,
+            is_staging=bool(cert.is_staging or account.is_staging),
+        )
+
+        if result.success:
+            cert.status = "active"
+            cert.last_error = ""
+            cert.certbot_lineage = result.lineage or cert.certbot_lineage
+            cert.last_checked_at = _utcnow()
+            cert.next_renewal_after = result.next_renewal_after
+            db.session.commit()
+            return HandlerResult(
+                success=True, applied=True,
+                detail=(f"issued via {'staging' if cert.is_staging else 'production'} "
+                        f"in {result.duration_ms}ms; lineage={result.lineage}"),
+            )
+        else:
+            cert.status = "failed"
+            # Keep the tail short enough to fit in audit + UI without
+            # truncation drama.
+            cert.last_error = (result.error or "certbot failed")[:1500]
+            db.session.commit()
+            return HandlerResult(
+                success=False,
+                error=(f"{result.error}\n--- stderr tail ---\n"
+                       f"{result.stderr_tail}"),
+            )
+    except Exception as exc:
+        log.exception("cert_request handler raised")
+        return HandlerResult(success=False, error=str(exc))
+
+
+@register_handler("cert_renew")
+def _handle_cert_renew(change, cfg) -> HandlerResult:
+    """Renew an existing cert. Phase LE.3 wires the scheduler to enqueue
+    these automatically; for LE.2 the operator triggers via the "Force
+    renew" button on the cert detail page.
+    """
+    try:
+        payload = _json.loads(change.payload_json or "{}")
+    except Exception as exc:
+        return HandlerResult(success=False, error=f"Invalid payload JSON: {exc}")
+
+    cert_id = payload.get("certificate_id")
+    if not cert_id:
+        return HandlerResult(success=False,
+                             error="cert_renew payload missing certificate_id")
+
+    try:
+        from shared.db import db
+        from webapp.models import ManagedCertificate
+        from webapp.letsencrypt_certbot import renew_certificate
+
+        cert = db.session.get(ManagedCertificate, int(cert_id))
+        if cert is None:
+            return HandlerResult(success=False,
+                                 error=f"ManagedCertificate #{cert_id} not found")
+
+        result = renew_certificate(
+            fqdn=cert.domain,
+            is_staging=bool(cert.is_staging),
+        )
+
+        if result.success:
+            cert.status = "active"
+            cert.last_error = ""
+            cert.last_checked_at = _utcnow()
+            cert.next_renewal_after = result.next_renewal_after
+            db.session.commit()
+            return HandlerResult(
+                success=True, applied=True,
+                detail=f"renewed in {result.duration_ms}ms",
+            )
+        else:
+            cert.last_error = (result.error or "certbot renew failed")[:1500]
+            # Don't flip status to 'failed' on a renew miss — the cert
+            # is still valid until expiry, just the latest renew try
+            # didn't land. Operator retries.
+            db.session.commit()
+            return HandlerResult(
+                success=False,
+                error=(f"{result.error}\n--- stderr tail ---\n"
+                       f"{result.stderr_tail}"),
+            )
+    except Exception as exc:
+        log.exception("cert_renew handler raised")
+        return HandlerResult(success=False, error=str(exc))
+
+
+@register_handler("cert_revoke")
+def _handle_cert_revoke(change, cfg) -> HandlerResult:
+    """Revoke + delete a cert. UI for this lands in Phase LE.5; the
+    handler is registered now so the queue op exists and PendingChange
+    rows can carry it.
+    """
+    try:
+        payload = _json.loads(change.payload_json or "{}")
+    except Exception as exc:
+        return HandlerResult(success=False, error=f"Invalid payload JSON: {exc}")
+
+    cert_id = payload.get("certificate_id")
+    if not cert_id:
+        return HandlerResult(success=False,
+                             error="cert_revoke payload missing certificate_id")
+    reason = (payload.get("reason") or "unspecified").strip()
+
+    try:
+        from shared.db import db
+        from webapp.models import ManagedCertificate
+        from webapp.letsencrypt_certbot import revoke_certificate
+
+        cert = db.session.get(ManagedCertificate, int(cert_id))
+        if cert is None:
+            return HandlerResult(success=False,
+                                 error=f"ManagedCertificate #{cert_id} not found")
+
+        result = revoke_certificate(
+            fqdn=cert.domain,
+            is_staging=bool(cert.is_staging),
+            reason=reason,
+        )
+
+        if result.success:
+            cert.status = "revoked"
+            cert.last_error = ""
+            cert.last_checked_at = _utcnow()
+            db.session.commit()
+            return HandlerResult(
+                success=True, applied=True,
+                detail=f"revoked in {result.duration_ms}ms (reason={reason})",
+            )
+        else:
+            cert.last_error = (result.error or "certbot revoke failed")[:1500]
+            db.session.commit()
+            return HandlerResult(
+                success=False,
+                error=(f"{result.error}\n--- stderr tail ---\n"
+                       f"{result.stderr_tail}"),
+            )
+    except Exception as exc:
+        log.exception("cert_revoke handler raised")
         return HandlerResult(success=False, error=str(exc))
 
 

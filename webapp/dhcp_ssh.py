@@ -37,6 +37,32 @@ class SSHCredential:
     host_fingerprint: str = ""     # "SHA256:xxxxx" form
 
 
+def target_from_credential(cred, *, timeout: int = 10) -> "SSHTarget":
+    """Build an SSHTarget from a DhcpEngineCredential row, honoring the
+    `connect_ip_override` field (P1, 2026-05-12).
+
+    When the row carries a non-empty ``connect_ip_override`` (NAT exit
+    IP), FEA dials that address instead of ``cred.hostname``. The
+    hostname stays the engine's real interface IP because that's what
+    the SMC SSH-allow rule's destination Host needs to match — the
+    engine sees inbound packets on its real IP, not the public NAT IP.
+
+    Centralised here so every SSH call site (verify / bootstrap /
+    file-push / scope-scan / terminal / lease-read) picks up the
+    override identically, and a future change of the override
+    semantics needs to touch only this one place.
+    """
+    host = (getattr(cred, "connect_ip_override", "") or "").strip()
+    if not host:
+        host = cred.hostname
+    return SSHTarget(
+        hostname=host,
+        port=cred.ssh_port,
+        username=cred.ssh_username,
+        timeout=timeout,
+    )
+
+
 class FingerprintMismatch(Exception):
     """Raised when the server's host key doesn't match the stored fingerprint.
 
@@ -240,6 +266,69 @@ def is_auth_failure(error_message: str) -> bool:
     cases where rotating the password might fix it.
     """
     return "AUTH_FAIL" in (error_message or "")
+
+
+def probe_ssh_auth_methods(target: SSHTarget,
+                           timeout: int = 10) -> tuple[list, str]:
+    """Query the SSH server's allowed authentication methods *without*
+    authenticating.
+
+    Uses paramiko's well-known ``auth_none`` trick: every SSH server
+    rejects ``none`` authentication, but in doing so advertises which
+    methods it WILL accept (via the ``BadAuthenticationType.allowed_types``
+    list). We catch the exception, harvest the list, and disconnect.
+
+    Returns ``(allowed_methods, error)`` where ``allowed_methods`` is
+    a list like ``["password", "publickey"]`` or ``[]`` if probing
+    failed. ``error`` is empty on success, a short reason string on
+    failure (TCP unreachable, banner timeout, etc.).
+
+    Useful as a pre-flight before `change_ssh_pwd` — if "password"
+    isn't in the list, no amount of password rotation will let us in,
+    and we should abort with a clear engine-hardening error rather
+    than burning the rotation and confusing the operator.
+    """
+    import socket as _socket
+    sock = None
+    transport = None
+    try:
+        sock = _socket.create_connection(
+            (target.hostname, target.port), timeout=timeout,
+        )
+    except Exception as exc:
+        return [], f"TCP connect failed: {exc}"
+    try:
+        transport = paramiko.Transport(sock)
+        transport.banner_timeout = max(timeout, 30)
+        try:
+            transport.start_client(timeout=timeout)
+        except Exception as exc:
+            return [], f"SSH banner / kex failed: {exc}"
+        try:
+            transport.auth_none(target.username)
+        except paramiko.BadAuthenticationType as exc:
+            allowed = list(getattr(exc, "allowed_types", None) or [])
+            return allowed, ""
+        except paramiko.AuthenticationException:
+            # Some hardened servers respond with generic AuthenticationException
+            # to `auth_none` without advertising allowed types. We treat
+            # that as "unknown" rather than fabricating a list.
+            return [], "server did not advertise allowed_types"
+        # Reaching here is unusual (server actually accepted auth_none)
+        # but technically means "any method works" — treat as unknown
+        # rather than letting the wizard cache a misleading list.
+        return [], "server accepted auth_none (unexpected)"
+    finally:
+        try:
+            if transport is not None:
+                transport.close()
+        except Exception:
+            pass
+        try:
+            if sock is not None:
+                sock.close()
+        except Exception:
+            pass
 
 
 def tcp_probe(target: SSHTarget, timeout: int = 10) -> tuple[bool, str]:

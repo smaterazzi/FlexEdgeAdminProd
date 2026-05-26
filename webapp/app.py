@@ -65,7 +65,9 @@ import smc_client
 import project_manager
 import fgt_parser
 from auth import auth_bp, init_auth, login_required, profile_required
-from webapp.auth_roles import domain_admin_required
+from webapp.auth_roles import (
+    domain_admin_required, super_admin_required, is_super_admin,
+)
 import user_manager
 
 # ── App Setup ────────────────────────────────────────────────────────────
@@ -80,11 +82,32 @@ if not os.environ.get("FLASK_SECRET_KEY"):
         "Set this env var for production deployments."
     )
 
+def _session_cookie_secure_default() -> bool:
+    """Default for SESSION_COOKIE_SECURE.
+
+    Production deployments terminate TLS at nginx/traefik upstream of
+    gunicorn so the cookie must be marked Secure to keep the browser
+    from leaking it on plain-HTTP fallbacks. Local dev runs on plain
+    HTTP (`make dev`, port 8088) so the flag must be off there or the
+    operator gets blank sessions and 302 loops.
+
+    Heuristic: ON unless `FLASK_DEBUG=1` or `FLEXEDGE_INSECURE_COOKIES=1`.
+    Operators can force either way with the env var. Audit fix-up M1
+    (2026-05-09).
+    """
+    if os.environ.get("FLEXEDGE_INSECURE_COOKIES") == "1":
+        return False
+    if os.environ.get("FLASK_DEBUG") == "1":
+        return False
+    return True
+
+
 app.config.update(
     MAX_CONTENT_LENGTH=16 * 1024 * 1024,   # 16 MB upload limit
     PERMANENT_SESSION_LIFETIME=timedelta(hours=8),
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=_session_cookie_secure_default(),
     # CSRF — enabled app-wide via flask-wtf. Bearer-token webhooks
     # (TLS / DHCP renew endpoints) are explicitly exempted at the route.
     WTF_CSRF_TIME_LIMIT=None,                # token valid for the session lifetime
@@ -209,6 +232,13 @@ register_feature("admin",     "Admin Portal")
 register_feature("auth",      "Authentication")
 register_feature("changes",   "Change Management")
 register_feature("system",    "System")
+# Roadmap item 5 / Phase LE.2 (2026-05-11) — Let's Encrypt CRUD.
+register_feature("letsencrypt", "Let's Encrypt")
+# `tls_deploy` was already implicitly tracked via the `tls_deploy.<op>`
+# action namespace but never explicitly registered; do so now so the
+# per-feature toggle on /admin/log-settings can mute it independently
+# from the broader `tls` (TLS Manager) feature.
+register_feature("tls_deploy", "TLS — deploy pipeline")
 register_feature("engine_scan_history", "Engine Scan History")
 register_feature("engine_sginfo", "Engine sgInfo")
 
@@ -229,10 +259,29 @@ app.register_blueprint(admin_bp)
 
 from tls_manager import tls_bp, init_tls_manager
 app.config.setdefault("CONFIG_DIR", str(Path(__file__).resolve().parent.parent / "config"))
+# Roadmap item 5 / Phase LE.2 hotfix (2026-05-11): certbot writes under
+# `/config/letsencrypt/live/` now (the bind-mounted writable volume),
+# NOT `/etc/letsencrypt/live/` (read-only inside the container). The
+# legacy `CERTBOT_LIVE_DIR` config key still drives the certbot_reader
+# auto-discovery in TLS Manager, so we point it at the new location
+# unless the operator overrode it via env var. Existing host-mounted
+# certbot lineages (operators who ran certbot outside the container)
+# can still be picked up by setting `CERTBOT_LIVE_DIR=/etc/letsencrypt/live`
+# in .env.
 app.config.setdefault("CERTBOT_LIVE_DIR",
-                      os.environ.get("CERTBOT_LIVE_DIR", "/etc/letsencrypt/live"))
+                      os.environ.get("CERTBOT_LIVE_DIR",
+                                     "/config/letsencrypt/live"))
 init_tls_manager(app)
 app.register_blueprint(tls_bp)
+
+# Roadmap item 5 / Phase LE.2 (2026-05-11) — Let's Encrypt CRUD blueprint.
+# Mounts at /tls/letsencrypt/*; sibling of the existing TLS Manager.
+from webapp.letsencrypt_manager import letsencrypt_bp, acme_challenge_bp
+app.register_blueprint(letsencrypt_bp)
+# Public ACME challenge file server at `/.well-known/acme-challenge/*`.
+# nginx/Traefik in front MUST forward this path to FEA's gunicorn — a
+# one-line proxy rule. See docs/deployment-guide.md § Let's Encrypt.
+app.register_blueprint(acme_challenge_bp)
 
 # ── DHCP Manager ─────────────────────────────────────────────────────────
 
@@ -277,16 +326,24 @@ init_changes_blueprint(app)
 # ── Session-based SMC config ─────────────────────────────────────────────
 
 def get_user_cfg() -> dict:
-    """
-    Build the SMC config dict from the current user's session.
-    Raises ValueError if no profile/domain has been selected yet.
+    """Build the SMC config dict for the current request.
+
+    H2 (audit fix-up, 2026-05-09): the plaintext API key is no longer
+    cached in the session cookie. ``user_manager.active_api_key_plaintext``
+    resolves it from ``g.api_key_obj.decrypted_key`` (populated by the
+    `_resolve_active_domain` before-request hook from the session's
+    ``tenant`` slug), with a JSON-fallback to ``profile['api_key']`` for
+    legacy sessions. Server-level fields (smc_url / verify_ssl / timeout)
+    still ride on the session profile dict — they're not secret.
+
+    Raises ValueError if no profile has been selected yet.
     """
     profile = session.get("active_profile")
     if not profile:
         raise ValueError("No SMC profile selected. Please choose a profile first.")
     return {
         "smc_url":      profile["smc_url"],
-        "api_key":      profile["api_key"],
+        "api_key":      user_manager.active_api_key_plaintext(profile),
         "verify_ssl":   profile.get("verify_ssl", False),
         "timeout":      profile.get("timeout", 120),
         "domain":       session.get("active_domain"),
@@ -440,6 +497,14 @@ def inject_globals():
         "app_title":        os.environ.get("APP_TITLE", "FlexEdgeAdmin"),
         "setup_required":   app.config.get("SETUP_REQUIRED", False),
         "build_version":    _build_version,
+        # M11 (audit fix-up, 2026-05-09): short cache-bust token for
+        # vendored static assets. Templates reference it as `?v=...`
+        # on the bootstrap CSS/JS so a new release auto-busts the
+        # browser cache. Prefer commit (changes per deploy); fall back
+        # to version, then to literal "dev".
+        "app_version":      (_build_version.get("commit")
+                             or _build_version.get("version")
+                             or "dev"),
         # Phase E.1 (Q12) — to_be_deleted strikethrough lookup. Templates
         # call `is_smc_to_be_deleted(href_or_name)` and toggle the
         # `.smc-to-be-deleted` CSS class on listing rows. Lookup is
@@ -779,7 +844,7 @@ def select_domain():
     try:
         cfg = {
             "smc_url":    profile["smc_url"],
-            "api_key":    profile["api_key"],
+            "api_key":    user_manager.active_api_key_plaintext(profile),
             "verify_ssl": profile.get("verify_ssl", False),
             "timeout":    profile.get("timeout", 60),
         }
@@ -894,23 +959,20 @@ def detail(type_key, element_name):
 @app.route("/policies")
 @profile_required
 def policies():
-    """List all firewall policies.
+    """Legacy listing — preserves bookmarks; redirects to the canonical
+    Infrastructure → Firewall Policies surface.
 
-    Cached read-through via [domain_objects.policies()](webapp/domain_objects.py)
-    — section ``policy_list``, key ``(domain_id,)``, **Loose TTL** (24h).
+    Roadmap item 3 (Batch J, 2026-05-11): the operator confirmed the
+    Infrastructure listing is the canonical one. This route used to
+    render a separate cards-grid template (`policies.html`) which
+    duplicated `/browse/fw_policies` and forced the operator to choose
+    between two visually-different surfaces for the same data.
+    Bookmarks preserved via 302; querystring forwarded so a `?refresh=1`
+    operator action still busts the cache on the target.
     """
-    try:
-        from webapp import domain_objects
-        cfg = get_user_cfg()
-        domain_obj = getattr(g, "domain", None)
-        policy_list, cv = domain_objects.policies(
-            domain_obj, cfg,
-            refresh=(request.args.get("refresh") == "1"),
-        )
-    except Exception as e:
-        return render_template("error.html", message=str(e))
-    return render_template("policies.html", policies=policy_list,
-                           cache_meta=cv)
+    target = url_for("browse", type_key="fw_policies",
+                     **{k: v for k, v in request.args.items() if v})
+    return redirect(target)
 
 
 @app.route("/policy/<path:policy_name>")
@@ -1018,91 +1080,76 @@ def api_quick_search():
                 "type": "feature", "source": "menu",
             })
 
-    # 2. Cached SMC elements — best-effort walk. The cache is
-    # process-local so we hit no network. Each section's cached
-    # values are typed differently; we look for `name`-bearing items.
-    # Translation rules (Phase 0 short section names):
-    #   element_list.<type_key> → /browse/<type_key>
-    #   element.<type_key>      → /detail/<type_key>/<name>
-    #   engines                 → /engines/clusters
-    #   cluster                 → /engines/clusters/<name>
-    #   policy_list / policy    → /policy/<name>
+    # 2. Cached SMC elements — per-Domain exact-key lookups.
     #
-    # Audit C5 (landed 2026-05-20): the iteration filters by domain_id
-    # so operators only see their own Domain's SMC elements. Cache
-    # entries store their domain_id as a 3-tuple (data, cached_at,
-    # domain_id); entries without one (legacy 2-tuple form) are treated
-    # as cross-Domain and surfaced everywhere. Active Domain is taken
-    # from `g.domain`; absent → no SMC-element matches surface (operator
-    # has no scope yet).
-    active_domain_id = getattr(getattr(g, "domain", None), "id", None)
+    # C5 (audit fix-up, 2026-05-09): the previous implementation iterated
+    # `_section_caches.items()` directly, which surfaced element names
+    # cached by ANY Domain (cache keys are SHA-256 prefixes — you can't
+    # tell which Domain owns an entry by inspecting the key). Operators
+    # in Domain A could see hosts/networks/services from Domain B in
+    # quick-search results. Now we ONLY peek at the canonical (domain.id,
+    # ...) cache key for each list section and walk only what we own.
+    #
+    # Translation rules (Phase 0 short section names):
+    #   element_list.<type_key>  → /browse/<type_key>     (key: (domain.id, "", ""))
+    #   engines                  → /engines/clusters       (key: (domain.id,))
+    #   policy_list              → /policies               (key: (domain.id,))
+    #
+    # element.<type_key> / cluster / policy / dhcp_host (single-instance
+    # detail sections) are NOT walked here — operators usually find them
+    # via the list section, then drill in. Walking them safely would need
+    # the cache to expose key_parts on every entry (deferred).
     try:
-        from shared.smc_cache import _section_caches
-        # Iterate snapshot — concurrent eviction is fine, we just skip.
-        for section, tcache in list(_section_caches.items()):
-            try:
-                for _, cached_entry in list(tcache.items()):
-                    # Entries are 3-tuples since C5: (data, ts, domain_id).
-                    # Fall through for 2-tuple legacy entries that may
-                    # linger across a rolling restart.
-                    if isinstance(cached_entry, tuple):
-                        if len(cached_entry) == 3:
-                            data, _ts, entry_domain_id = cached_entry
-                        else:
-                            data = cached_entry[0]
-                            entry_domain_id = None
-                    else:
-                        data = getattr(cached_entry, "data", cached_entry)
-                        entry_domain_id = getattr(
-                            cached_entry, "domain_id", None)
-                    # Domain-Scoping filter: skip entries that belong to
-                    # OTHER Domains. ``None`` means "not Domain-scoped"
-                    # (e.g. a future static lookup) — those stay
-                    # visible. When the operator has no active Domain,
-                    # only None-stamped entries survive.
-                    if (entry_domain_id is not None
-                            and entry_domain_id != active_domain_id):
-                        continue
-                    items = data if isinstance(data, list) else []
-                    for item in items:
-                        if not isinstance(item, dict):
-                            continue
-                        name = item.get("name") or item.get("display_name") or ""
-                        if not name or q not in str(name).lower():
-                            continue
-                        href = ""
-                        kind = "smc"
-                        if section.startswith("element_list."):
-                            type_key = section.split(".", 1)[-1]
-                            href = f"/browse/{type_key}"
-                            kind = type_key
-                        elif section.startswith("element."):
-                            type_key = section.split(".", 1)[-1]
-                            href = f"/detail/{type_key}/{name}"
-                            kind = type_key
-                        elif section == "engines":
-                            href = url_for("engines.clusters")
-                            kind = "engine"
-                        elif section == "cluster":
-                            href = url_for("engines.cluster_detail",
-                                           engine_name=name)
-                            kind = "cluster"
-                        elif section == "policy_list" or section == "policy":
-                            href = url_for("policy_rules", policy_name=name)
-                            kind = "policy"
-                        out.append({
-                            "label": name,
-                            "href": href,
-                            "icon": "bi-box",
-                            "type": kind,
-                            "source": "cache",
-                        })
-                        if len(out) >= 60:
-                            break
-                    if len(out) >= 60:
-                        break
-            except Exception:
+        from shared.smc_cache import peek, list_sections
+        active_domain = getattr(g, "domain", None)
+        active_domain_id = getattr(active_domain, "id", None)
+        if active_domain_id is None:
+            raise RuntimeError("no active domain")  # caught below
+
+        # Build the list of (section, key_parts, href_resolver, kind)
+        # to peek at. Only sections keyed by (domain_id, …) with
+        # well-known shape — no opaque wildcard walks.
+        targets: list[tuple[str, tuple, callable, str]] = []
+        targets.append((
+            "engines", (active_domain_id,),
+            lambda _name: url_for("engines.clusters"),
+            "engine",
+        ))
+        targets.append((
+            "policy_list", (active_domain_id,),
+            lambda name: url_for("policy_rules", policy_name=name),
+            "policy",
+        ))
+        for section in list_sections():
+            if section.startswith("element_list."):
+                type_key = section.split(".", 1)[-1]
+
+                def _href_for(name, _tk=type_key):
+                    return f"/browse/{_tk}"
+                targets.append((
+                    section, (active_domain_id, "", ""),
+                    _href_for, type_key,
+                ))
+
+        for section, key_parts, href_for, kind in targets:
+            data = peek(section, key_parts)
+            if not isinstance(data, list):
                 continue
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                name = item.get("name") or item.get("display_name") or ""
+                if not name or q not in str(name).lower():
+                    continue
+                out.append({
+                    "label": name,
+                    "href": href_for(name),
+                    "icon": "bi-box",
+                    "type": kind,
+                    "source": "cache",
+                })
+                if len(out) >= 60:
+                    break
             if len(out) >= 60:
                 break
     except Exception as exc:
@@ -1154,19 +1201,15 @@ def api_policy_rules(policy_name):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  MIGRATION ROUTES
-#
-#  Per audit C2 (landed 2026-05-20): mutating routes are gated by
-#  @domain_admin_required and refuse cross-Domain access via
-#  _migration_project_for_domain(). Read-only routes stay @login_required
-#  but still go through the helper so a Viewer in Domain A cannot enumerate
-#  Domain B's projects by URL-typing the id.
-#
-#  Project manifests carry `domain_id` from creation onwards. Pre-C2
-#  manifests have no `domain_id` field — they're surfaced under "Legacy
-#  (no Domain)" in the list and auto-claim into the active Domain on the
-#  first mutation (the helper writes back `domain_id` then).
+#  MIGRATION ROUTES  (Domain-Admin gated, use project-stored target)
 # ═══════════════════════════════════════════════════════════════════════════
+#
+# C2 (audit fix-up): every migration route requires Domain Admin privileges
+# in the active Domain. Each project carries a `domain_id` stamp so a user
+# with admin privileges in Domain A cannot drive a SMC import in Domain B
+# by guessing project IDs. Legacy projects (no `domain_id`) stay visible
+# everywhere with a "no Domain" badge — the first mutating action claims
+# them for the operator's active Domain.
 
 def _migration_project_for_domain(project_id, *, mutating: bool = False):
     """Load a migration project + enforce Domain isolation.
@@ -1212,7 +1255,7 @@ def _migration_project_for_domain(project_id, *, mutating: bool = False):
 
 
 @app.route("/migration/")
-@login_required
+@domain_admin_required
 def migration_projects():
     """List migration projects scoped to the active Domain.
 
@@ -1220,10 +1263,6 @@ def migration_projects():
     hidden — operators only see their own Domain's work. Legacy
     manifests (no ``domain_id`` field) are surfaced for everyone with
     a "no Domain" badge so they can be claimed or cleaned up.
-
-    Super Admins on a Domain still see only that Domain's projects —
-    if they want a cross-Domain view, they can switch Domains via the
-    topbar (one Domain at a time matches the operator mental model).
     """
     active_did = getattr(getattr(g, "domain", None), "id", None)
     projects = project_manager.list_projects(domain_id=active_did)
@@ -1271,12 +1310,12 @@ def migration_new():
 
 
 @app.route("/migration/<project_id>/parsed")
-@login_required
+@domain_admin_required
 def migration_parsed(project_id):
     """View parsed objects from the FortiGate config."""
     project = _migration_project_for_domain(project_id, mutating=False)
     if not isinstance(project, dict):
-        return project  # redirect from the helper
+        return project
     parsed = project_manager.get_parsed_objects(project_id)
     if not parsed:
         flash("Config not yet parsed.", "warning")
@@ -1288,38 +1327,65 @@ def migration_parsed(project_id):
 @app.route("/migration/<project_id>/target", methods=["GET", "POST"])
 @domain_admin_required
 def migration_target(project_id):
-    """Configure SMC target for migration."""
-    project = _migration_project_for_domain(project_id, mutating=True)
+    """Configure SMC target for migration.
+
+    C1 (audit fix-up, 2026-05-09): the target SMC server / API key /
+    admin domain / verify_ssl are NO LONGER collected from the form.
+    Migration always runs against the operator's active Domain (gated
+    by `_migration_project_for_domain`'s domain_id check).
+    Only project-specific fields are persisted: ``policy_name`` and
+    ``object_prefix`` (and ``dhcp_mappings``, set by the dhcp-map route).
+    The plaintext API key never lands in the project file or DOM.
+    """
+    project = _migration_project_for_domain(
+        project_id, mutating=(request.method == "POST"))
     if not isinstance(project, dict):
         return project
 
     if request.method == "POST":
-        target = {
-            "smc_url":       request.form.get("smc_url", "").strip(),
-            "api_key":       request.form.get("api_key", "").strip(),
-            "domain":        request.form.get("domain", "").strip(),
-            "verify_ssl":    request.form.get("verify_ssl") == "on",
+        # Preserve existing project-only settings (e.g. dhcp_mappings); only
+        # rewrite the two fields the form still collects. ``smc_url`` is
+        # left empty in the persisted dict — downstream code reads SMC
+        # config from the active Domain via `get_user_cfg()`.
+        existing_target = project.get("target") or {}
+        new_target = {
+            **existing_target,
             "policy_name":   request.form.get("policy_name", "").strip(),
             "object_prefix": request.form.get("object_prefix", "FGT-").strip(),
+            # Drop legacy plaintext fields if a pre-C1 project file still
+            # carries them — never re-persist secrets.
+            "api_key": "",
         }
-        project_manager.update_project(project_id, {"target": target})
+        for legacy in ("smc_url", "domain", "verify_ssl"):
+            new_target.pop(legacy, None)
+        project_manager.update_project(project_id, {"target": new_target})
         flash("Target configuration saved.", "success")
         return redirect(url_for("migration_dedup", project_id=project_id))
 
-    # Pre-populate from saved target, then fall back to the session profile
-    target = project.get("target", {})
-    if not target.get("smc_url"):
-        profile = session.get("active_profile", {})
-        target = {
-            "smc_url":       profile.get("smc_url", ""),
-            "api_key":       profile.get("api_key", ""),
-            "domain":        session.get("active_domain", ""),
-            "verify_ssl":    profile.get("verify_ssl", False),
-            "policy_name":   "Migration from Fortinet",
-            "object_prefix": "FGT-",
-        }
+    target = project.get("target") or {}
+    # Display-only labels: show the operator which active Domain / SMC URL
+    # the migration will run against. Read from the active Domain row via
+    # `g.api_key_obj` (no plaintext involved).
+    active_domain_label = ""
+    active_smc_url = ""
+    try:
+        active = getattr(g, "domain", None)
+        if active is not None:
+            active_domain_label = (
+                active.display_name or active.smc_domain_name or active.slug or ""
+            )
+        ak = getattr(g, "api_key_obj", None)
+        if ak is not None:
+            active_smc_url = ak.smc_url or ""
+    except Exception:
+        pass
+
     return render_template(
-        "migration/target_config.html", project=project, target=target,
+        "migration/target_config.html",
+        project=project,
+        target=target,
+        active_domain_label=active_domain_label,
+        active_smc_url=active_smc_url,
     )
 
 
@@ -1339,7 +1405,8 @@ def migration_dhcp_map(project_id):
     """
     from webapp.dhcp_readiness import find_tenant_for_target, list_scope_options
 
-    project = _migration_project_for_domain(project_id, mutating=True)
+    project = _migration_project_for_domain(
+        project_id, mutating=(request.method == "POST"))
     if not isinstance(project, dict):
         return project
 
@@ -1379,18 +1446,22 @@ def migration_dhcp_map(project_id):
         # Continue to dedup — the migration wizard's natural next step
         return redirect(url_for("migration_dedup", project_id=project_id))
 
-    # GET: build the form data
-    tenant = find_tenant_for_target(target)
+    # GET: build the form data.
+    # C1 (audit fix-up, 2026-05-09): resolve the tenant from the active
+    # Domain row instead of from the project's stored target. Domain-match
+    # is enforced by `_migration_project_for_domain`, so the active
+    # Domain's tenant IS the project's tenant.
+    tenant = None
+    try:
+        ak = getattr(g, "api_key_obj", None)
+        if ak is not None and ak.tenant_id is not None:
+            from webapp.models import Tenant as _Tenant
+            tenant = db.session.get(_Tenant, ak.tenant_id)
+    except Exception:
+        tenant = None
+    # Legacy fallback: pre-C1 project files might still carry plaintext.
     if tenant is None and target.get("smc_url") and target.get("api_key"):
-        # Make the empty scope list explainable to the operator.
-        flash(
-            "Could not resolve this migration project's SMC URL + API key "
-            "to a single tenant. Check Admin Portal: either no tenant "
-            "exists for this SMC URL, or multiple tenants share it and "
-            "none owns the matching API key. Add or update the tenant "
-            "and re-open this page.",
-            "warning",
-        )
+        tenant = find_tenant_for_target(target)
     scope_options = list_scope_options(tenant) if tenant else []
     saved_mappings = (target.get("dhcp_mappings") or {})
 
@@ -1406,7 +1477,7 @@ def migration_dhcp_map(project_id):
 
 
 @app.route("/migration/<project_id>/dedup")
-@login_required
+@domain_admin_required
 def migration_dedup(project_id):
     """Run deduplication and show results."""
     project = _migration_project_for_domain(project_id, mutating=False)
@@ -1422,17 +1493,18 @@ def migration_dedup(project_id):
 
     if not dedup or force:
         target = project.get("target", {})
-        if not target.get("smc_url"):
-            flash("Configure SMC target first.", "warning")
+        # C1 (audit fix-up, 2026-05-09): SMC config resolved from the
+        # active Domain row, not from the project's stored target. The
+        # `_migration_project_for_domain` guard already ensured the
+        # project's `domain_id` matches the active Domain.
+        if not target.get("policy_name"):
+            flash("Configure target policy first.", "warning")
             return redirect(url_for("migration_target", project_id=project_id))
-        cfg = {
-            "smc_url":       target["smc_url"],
-            "api_key":       target["api_key"],
-            "domain":        target.get("domain"),
-            "verify_ssl":    target.get("verify_ssl", False),
-            "timeout":       120,
-            "retry_on_busy": True,
-        }
+        try:
+            cfg = get_user_cfg()
+        except ValueError:
+            flash("No SMC profile selected.", "warning")
+            return redirect(url_for("select_profile"))
         try:
             import dedup_engine
             dedup = dedup_engine.run_dedup(parsed, cfg, target_dict=target)
@@ -1556,7 +1628,7 @@ def migration_dhcp_update(project_id):
 
 
 @app.route("/migration/<project_id>/rules")
-@login_required
+@domain_admin_required
 def migration_rules(project_id):
     """View converted rules and select which to import."""
     project = _migration_project_for_domain(project_id, mutating=False)
@@ -1670,17 +1742,18 @@ def migration_import(project_id):
         # so the new rules become live without an extra trip to SMC GUI.
         auto_install_policy = request.form.get("auto_install_policy") == "on"
         target = project.get("target", {})
-        if not target.get("smc_url"):
-            flash("Configure SMC target first.", "warning")
+        # C1 (audit fix-up, 2026-05-09): SMC config resolved from the
+        # active Domain (`g.api_key_obj.decrypted_key`), not from a
+        # plaintext-stored target. Domain-match was already enforced by
+        # `_migration_project_for_domain`.
+        if not target.get("policy_name"):
+            flash("Configure target policy first.", "warning")
             return redirect(url_for("migration_target", project_id=project_id))
-        cfg = {
-            "smc_url":       target["smc_url"],
-            "api_key":       target["api_key"],
-            "domain":        target.get("domain"),
-            "verify_ssl":    target.get("verify_ssl", False),
-            "timeout":       120,
-            "retry_on_busy": True,
-        }
+        try:
+            cfg = get_user_cfg()
+        except ValueError:
+            flash("No SMC profile selected.", "warning")
+            return redirect(url_for("select_profile"))
         parsed    = project_manager.get_parsed_objects(project_id)
         dedup     = project_manager.get_dedup_results(project_id)
         converted = project_manager.get_converted_rules(project_id)

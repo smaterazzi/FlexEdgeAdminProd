@@ -4,7 +4,315 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-05-08
+## [2.2.0-dev] - 2026-04-29 → 2026-05-25
+
+### Branch reconciliation rebase (2026-05-25)
+
+Local May 25 work (Let's Encrypt CRUD, Batch G/H job runners, vendored Bootstrap assets, ~9.8k lines net) was developed in parallel with the May 20 remote commits (factory_reset feature, admin/api_keys.html, terminal/cache audit fixes). Reconciled by rebasing the May 25 commit on top of `origin/main` (May 20 commits). 22 conflict hunks across 9 files resolved; the rebased commit is `08b4c71`.
+
+**Reconciliation decisions**:
+
+- **Migration helper** unified on `_migration_project_for_domain(project_id, mutating=…)` (the helper that survived auto-merge and was used by 8 routes). The duplicate `_load_migration_project_or_redirect` helper from local was removed and its 6 call sites updated. Project manifests carry `domain_id` (int) — not `domain_slug` — so the unified helper's `domain_id != g.domain.id` check is the single source of truth.
+- **Browser SSH terminal C4 fix** kept the May 20 implementation (close code **4404** matching the "not found" code so credential existence in other Domains isn't leaked; `_active_domain_id_for_ws()` helper to resolve the active Domain reliably from the session profile because Flask-Sock handshakes don't reliably populate `g.domain`). The local May 25 variant used 4403 and read `g.domain` directly — superseded.
+- **SMC cache C5 fix** kept the May 25 implementation: cache entries stay 2-tuple `(data, cached_at)`; the new `peek(section, key_parts)` and `list_sections()` helpers replace the previous direct `_section_caches.items()` walk in the quick-search endpoint. Cross-Domain leaks are impossible by construction (only canonical `(active_domain.id, …)` keys get peeked). The May 20 3-tuple variant `(data, cached_at, domain_id)` was retired.
+- **SMC cache H12 — in-flight coalescing**: new module-level `_inflight: dict[cache_key, Future]` + `_inflight_lock` coalesces concurrent non-`refresh` misses on the same key. Leader runs the fetcher, followers block on `Future.result()` — eliminates the gunicorn thread starvation that used to occur on cold-cache fan-in (8/16 threads queueing behind one SMC fetch). New `coalesced` and `inflight_now` counters in `stats()`.
+- **Webhook bearer-token check (C6+M15)**: both `tls_manager.py` and `dhcp_manager.py` `require_api_token` decorators end up with the single 503-on-empty guard (no duplicate) + `hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))`.
+
+**Docs aligned to the rebased code state**:
+
+- [CLAUDE.md § SMC read cache] cache-tuple description corrected (2-tuple, not 3-tuple); H12 coalescing added; bogus `dhcp_hosts_by_subnet` accessor row removed (no such accessor exists in `webapp/domain_objects.py`).
+- [CLAUDE.md § Migration Manager § Domain isolation] route-decorator section rewritten — all routes are `@domain_admin_required` (none stay `@login_required`); both mutating and read-only routes go through `_migration_project_for_domain`.
+- [TODO.md C2] rewritten to reflect the unified `_migration_project_for_domain` + `domain_id` scheme.
+- [TODO.md C4] close code corrected to **4404** (not 4403) and the rationale documented; `_active_domain_id_for_ws()` helper noted.
+- [docs/CachingReview.md O1] quick-search row updated — `peek`/`list_sections` replace the old `walks _section_caches` description.
+
+### Roadmap item 5 — Let's Encrypt CRUD: Phases LE.1 + LE.2 + read-only-FS hotfix (2026-05-11)
+
+**Hotfix (same day, after operator first-run test):** the initial LE.2 build invoked certbot with its compiled-in defaults (`/etc/letsencrypt/`, `/var/lib/letsencrypt/`, `/var/log/letsencrypt/`), all of which are owned by root inside the Docker image and unwritable by the unprivileged gunicorn process. Operator's first `/tls/letsencrypt/account` submit failed instantly with `[Errno 30] Read-only file system: '/etc/letsencrypt/.certbot.lock'`. Fix: every certbot invocation in [webapp/letsencrypt_certbot.py](webapp/letsencrypt_certbot.py) now passes explicit `--config-dir /config/letsencrypt`, `--work-dir /config/letsencrypt-work`, `--logs-dir /config/letsencrypt-logs` (all overridable via env vars). The `/config/` bind-mount is the existing writable volume used by every FEA deployment and is what `/admin/backup` already includes, so the account key + cert lineage back up with the rest of FEA state automatically (Q12). The legacy `CERTBOT_LIVE_DIR` config in `app.py` now defaults to `/config/letsencrypt/live` to match (existing host-mounted certbot lineages from operators who ran certbot outside the container can be recovered by setting `CERTBOT_LIVE_DIR=/etc/letsencrypt/live` in `.env`). The default `CERTBOT_WEBROOT` also moved to `/config/letsencrypt-webroot` for the same reason. New helper `ensure_certbot_dirs()` creates the three directories lazily on first use.
+
+Web UI inside FEA that drives certbot end-to-end. Operator opens `/tls/letsencrypt`, accepts the Let's Encrypt ToS once (account-setup wizard), configures the per-Domain glob allowlist, then requests a cert by FQDN. The request flows through the change-management queue (Phase E.2 pattern); Domain Admins or operators with the new `letsencrypt` bypass feature get instant auto-push with a watcher card on the cert detail page. On success the cert lands at `/etc/letsencrypt/live/<fqdn>/` and the existing TLS Manager deploy pipeline picks it up unchanged — first-time issuance still requires a manual `/tls/deploy` step to bind the cert to engines (Q8 lean: only renewals auto-deploy).
+
+Design questionnaire ([docs/LetsEncryptDesign.md](docs/LetsEncryptDesign.md)) answered by operator on 2026-05-11; 16 decisions locked. Implementation followed the Phase E.2 + scan_jobs patterns established by Batches G–H.
+
+**New schema.** New `acme_accounts` (singleton — Q3) and `domain_cert_patterns` (per-FEA-Domain glob allowlist — Q6+Q6a) tables, both empty on fresh install. Extensions to `managed_certificates`: `domain_id`, `requested_by_user_id`, `status`, `last_error`, `is_staging`, `pending_change_id` FK, `next_renewal_after`, `account_id` FK, plus four `dns_challenge_*` columns preallocated for Phase LE.4 (manual DNS-01 wildcards). Migration `_phase_le_certs` in [webapp/db_init.py](webapp/db_init.py) is idempotent — `PRAGMA table_info` guard before each `ALTER TABLE ADD COLUMN`. Index `ix_managed_certificates_next_renewal` lands ahead of the Phase LE.3 scheduler so the "due soon" query is cheap from day one.
+
+**New modules.**
+
+- [webapp/letsencrypt_certbot.py](webapp/letsencrypt_certbot.py) — pure subprocess wrappers. `register_account()`, `request_certificate()`, `renew_certificate()`, `revoke_certificate()`. No Flask context, no DB; the queue handler and the scan_jobs runner both call into here so the actual `certbot` invocation lives in one tested place. `CertbotResult` dataclass captures success / lineage / next_renewal_after / stdout+stderr tails / duration / exit code. 5-minute default timeout; renewal window 60 days from issuance (90-day cert validity minus LE's 30-day recommended renewal lead).
+- [webapp/letsencrypt_allowlist.py](webapp/letsencrypt_allowlist.py) — pure glob-matcher. `is_valid_pattern()` refuses `*`, `*.com`, uppercase, whitespace, and any pattern with no `.` (too permissive). `matches_any_pattern()` uses `fnmatch.fnmatchcase` so operator mental model is shell-glob. `is_fqdn_allowed_for_domain()` enforces "no patterns configured = nothing allowed" safe default. Smoke-tested 9 cases pass.
+- [webapp/letsencrypt_jobs.py](webapp/letsencrypt_jobs.py) — scan_jobs runner. Mirrors `webapp/tls_deploy_jobs.py` exactly; captures `current_app`, spawns daemon thread, calls `push_one()` inside `app_context()`, handles bypass-cleanup with audit marker.
+- [webapp/letsencrypt_queue.py](webapp/letsencrypt_queue.py) — `enqueue_cert_request()` / `enqueue_cert_renew()` / `enqueue_cert_revoke()` + `try_auto_push_for_admins()` (returns `(spawned, scan_id)` for the watcher-redirect path).
+- [webapp/letsencrypt_manager.py](webapp/letsencrypt_manager.py) — Flask Blueprint at `/tls/letsencrypt/*` (Domain Admin or higher). Routes: `/` list, `/new` request form, `/<id>` detail with watcher card, `/<id>/renew` force-renew, `/<id>/delete` stop-tracking, `/<id>/status` JSON poll, `/account` setup wizard / edit, `/patterns` allowlist management. Also a separate public blueprint `acme_challenge_bp` serving `/.well-known/acme-challenge/<token>` for LE's HTTP-01 validation (alphanumeric-only token guard + resolve-inside-webroot check, no auth — LE's validators have no session).
+
+**New queue handlers** in [shared/queue_runner.py](shared/queue_runner.py): `cert_request`, `cert_renew`, `cert_revoke` (Q6c discrete-ops shape). The cert_request handler defensively re-checks the allowlist before invoking certbot (defence against payload tampering between enqueue and push). The SMC session opened by `push_one()` is unused — cert ops don't talk to SMC — but the handler shape stays uniform with other writers.
+
+**New templates** under [webapp/templates/tls/letsencrypt/](webapp/templates/tls/letsencrypt/): `account.html` (setup wizard / edit), `list.html` (cert list), `new.html` (request form with inline allowlist display), `detail.html` (cert detail + watcher card during cert ops + last-error display), `patterns.html` (allowlist add/remove UI).
+
+**Wiring.** Sidebar entry "Let's Encrypt" added under the TLS Manager section in [webapp/templates/base.html](webapp/templates/base.html). New `letsencrypt` bypass feature in [shared/queue_settings.py](shared/queue_settings.py) (operator-managed via Admin Portal → Bypass capability matrix). Feature `letsencrypt` registered for `platform_logs` filtering in [webapp/app.py](webapp/app.py). Certbot is already in the Docker image (`apt-get install certbot`).
+
+**HTTP-01 deployment.** nginx/Traefik in front of FEA MUST forward `/.well-known/acme-challenge/*` to FEA's gunicorn — a one-line `location` block. FEA serves the challenge file from `CERTBOT_WEBROOT` (default `/var/www/certbot`) which certbot writes to during the cert request. No shared volume between containers needed.
+
+**Pending phases** (operator will test LE.1+LE.2 then close session):
+
+- **LE.3** — renewal scheduler (background thread, hourly tick, enqueue `cert_renew` for any cert with `next_renewal_after < now+7days`); auto-redeploy via existing TLS Manager pipeline.
+- **LE.4** — manual DNS-01 via `acme` Python library (Q11); unlocks wildcards. The DNS challenge columns on `managed_certificates` and the `challenge_type` field already exist.
+- **LE.5** — revoke UI + `/admin/backup` includes `/etc/letsencrypt/accounts/`.
+
+### Roadmap item 3 — Policies dedupe + NAT policies surfaced (Batch J, 2026-05-11)
+
+Closes the operator's locked-in roadmap item from [TODO.md:96](TODO.md). Two surfaces had been competing for "the policies list" — a cards-grid at `/policies` (linked from Navigation sidebar + dashboard "Policy Viewer" card) and a table at `/browse/fw_policies` (linked from Infrastructure sidebar + dashboard element grid). Same SMC data, different rendering, no functional reason for both. Operator picked Infrastructure as canonical; this batch removes the duplicate and adds the NAT-policy visibility the operator was missing.
+
+**Dedupe — Infrastructure wins.**
+
+- [webapp/app.py](webapp/app.py) `policies()` now 302-redirects to `/browse/fw_policies`, preserving any querystring (so a `?refresh=1` operator action still hits the target). Bookmarks to `/policies` keep working; the old cards-grid template `webapp/templates/policies.html` was deleted as dead code.
+- [webapp/templates/base.html](webapp/templates/base.html) — Navigation → Policies sidebar entry removed. The Infrastructure → Firewall Policies entry stays put.
+- [webapp/templates/index.html](webapp/templates/index.html) — dashboard "Policy Viewer" special card removed; `fw_policies` is already in the dashboard element grid above (one row per element type) so the special card was always redundant.
+
+**NAT policies — surfaced via per-policy rule counts.**
+
+Forcepoint SMC has no standalone NATPolicy element type (confirmed against `fp-NGFW-SMC-python` SDK — only `FirewallPolicy` is exposed via `smc.policy.layer3`; NAT rules are an inner collection `fw_ipv4_nat_rules` on each FirewallPolicy). So the operator's "add NAT policies to the list" request maps to "show how many NAT rules each policy contains" alongside the access-rule count, exactly how the SMC Management Client surfaces them in its own policy listing.
+
+- [webapp/smc_client.py](webapp/smc_client.py) `list_policies()` and `list_elements("fw_policies", ...)` now return `fw_rule_count` + `nat_rule_count` per row. Counting iterates the lazy SMC rule collections (one round-trip each) so it's expensive on cold cache — but the result lands in the standard `policy_list` (Loose 24h) / `element_list.fw_policies` (Quick 1h) cache sections, so subsequent renders are free, and the queue runner's existing post-push invalidation hooks already drop both sections after any policy mutation. Per-policy count failures don't abort the listing — that row just gets `None` and the template renders a `?` badge.
+- [webapp/templates/browse.html](webapp/templates/browse.html) — new `fw_policies` branch with two new columns: **FW rules** (blue badge with count, grey for 0) and **NAT rules** (yellow badge when `>0`, grey for `0`, `?` when count unavailable). Row name + action button now link directly to `/policy/<name>` rules viewer (which already shows both FW + NAT rule lists in tabs) instead of the generic `/detail/fw_policies/<name>` element page — that detail page added no value over the rules viewer for policies.
+
+Operator now scans the policy list and sees at a glance which policies carry NAT translation work. One click reaches the existing rules viewer that already had both rule types side-by-side. No new top-level NAT route, no schema changes, no SDK dependency churn.
+
+### Security audit Batch I — N+1 queries, pagination, vendored Bootstrap (2026-05-09)
+
+Three Medium polish wins from [TODO.md § Security & efficiency audit](TODO.md) — M7, M11, M13. Operator-visible perf + offline-readiness wins; no security-criticality. Together they close the "is this page going to take 5 seconds to render once we have a year of data?" question for the three lists that grow unbounded over time, plus the "what happens if our customer site has no internet?" question for the UI.
+
+**M7 — N+1 query hotspots.** Three sites fixed with `joinedload` / `selectinload` / batched `IN`:
+
+- [webapp/dhcp_manager.py](webapp/dhcp_manager.py) `credentials_list` — `accesses` query now eager-loads `domain → api_key` via `joinedload(DhcpEngineSshAccess.domain).joinedload(Domain.api_key)`, killing the per-row source-IP-drift lazy SELECT loop.
+- [webapp/changes.py](webapp/changes.py) `index` — conflict-peer lookup now batched into one `IN` query (was one `db.session.get` per conflict row); 100-conflict queue drops from 100 round-trips to 1.
+- [webapp/admin.py](webapp/admin.py) `users` — `User.query` now `selectinload(User.domain_accesses).joinedload(UserDomainAccess.domain)` so the template's `{% for access in u.domain_accesses %}{{ access.domain.display_name }}` loop doesn't fire N×M SELECTs.
+
+**M13 — Pagination on the two heaviest-blast-radius lists.** Pattern lifted from `scan_history/routes.py:94-106` (50-row pages + `?page=` + `total_pages` for the pager):
+
+- [webapp/changes.py](webapp/changes.py) `index` was hard-capped at `limit(500)` with a "narrow your filter" footer that made older rows unreachable on busy queues. Now paginated end-to-end; [webapp/templates/changes/index.html](webapp/templates/changes/index.html) renders a Prev/Page X of Y/Next pager that carries every existing filter querystring through.
+- [webapp/dhcp_manager.py](webapp/dhcp_manager.py) `scope_detail` reservations now paginated (50/page). Big DHCP scopes (1000+ reservations) render instantly with operator-controllable page navigation. [webapp/templates/dhcp/scope_detail.html](webapp/templates/dhcp/scope_detail.html) gets a matching pager at the bottom of the reservations card.
+- The other two M13 candidates (scopes list — typically <50 per Domain; leases viewer — bounded by subnet size, sort-critical for diagnostics) were left intentionally; pagination would hurt more than help.
+
+**M11 — Vendor Bootstrap locally.** Bootstrap 5.3.3 (CSS + bundled JS) and bootstrap-icons 1.11.3 (CSS + woff + woff2) now under `webapp/static/vendor/bootstrap/` and `webapp/static/vendor/bootstrap-icons/`. [webapp/templates/base.html](webapp/templates/base.html) references each via `url_for('static', ...)?v={{ app_version }}` so a new release auto-busts the browser cache. New context-processor key `app_version` exposed from [webapp/app.py](webapp/app.py) `inject_globals` — derives from `_build_version["commit"]` so it changes every deploy. New helper [scripts/vendor-assets.sh](scripts/vendor-assets.sh) re-downloads from jsdelivr after a Bootstrap upgrade (version pins at top of the script) and asserts the CSS still uses `fonts/` relative paths so a future upstream layout change fails loud. Offline / air-gapped / firewalled customer deployments now render the UI without any internet round-trip at runtime — closing the "feedback_deployment_scenarios" standing rule.
+
+### Security audit Batch H — cache stampede + 5 medium-tier wins (2026-05-09)
+
+Six fixes resolved together — H12, M3, M4, M5, M8, M19 from [TODO.md § Security & efficiency audit](TODO.md). Independent surface-area changes; bundled because each is small.
+
+**H12 — Cache stampede coalescing.** [shared/smc_cache.py](shared/smc_cache.py) `cache_get_or_fetch` now coalesces concurrent non-refresh misses on the same key. New module-level `_inflight: dict[cache_key, Future]` + `_inflight_lock`: the first arrival claims a `concurrent.futures.Future`, runs the fetcher, sets the result, and clears the slot; followers block on `Future.result()` and pick up the same payload (or the same exception). On the cold-cache fan-in pattern that was burning 8/16 gunicorn threads behind one SMC fetch, the wasted threads drop to zero — only the leader does network I/O. `refresh=True` always does its own fetch (explicit invalidations should not wait on a possibly-stale leader's call). New `coalesced` + `inflight_now` counters in `stats()` for diagnostics. Followers re-check the section cache before blocking on the Future, so the case where the leader finishes between our two locks serves from cache instead of waiting unnecessarily.
+
+**M3 — TLS renewal hook script + token split.** [webapp/tls_scheduler.py](webapp/tls_scheduler.py) `install_deploy_hook` now writes TWO files: the hook script (`chmod 0700` — was 0755) and a sibling `flexedge-tls-renew.sh.token` (`chmod 0600`) the script `source`s at runtime to import `FLEXEDGE_TLS_API_TOKEN`. Atomic write order: token file `touch+chmod 0600` BEFORE write_text to avoid a brief 0644 window. New `generate_token_file()` helper + `DEFAULT_TOKEN_FILE` constant. The /tls/hook page ([webapp/templates/tls/hook.html](webapp/templates/tls/hook.html)) now shows BOTH files with separate Copy buttons + path labels — manual installers (operators on hosts where the auto-installer can't reach `/etc/letsencrypt/renewal-hooks/deploy/`) save each block to disk with the correct permissions.
+
+**M4 — Content-Disposition filename sanitiser.** New helper [shared/csv_safe.py](shared/csv_safe.py) `safe_filename(name, default)` strips CR / LF / TAB / `"` / `\\` / leading dot from any candidate filename, replaces `/` with `_`, and caps at 200 chars (falls back to `default` on empty). Wired into all three `Content-Disposition` interpolation sites: `tools_scan_csv`, the sgInfo file download (both in [webapp/engines_manager.py](webapp/engines_manager.py)), and `scan_history.export_csv` ([webapp/scan_history/routes.py](webapp/scan_history/routes.py)). Hostile SMC element names with embedded quotes / CRLF can no longer break the header structure or inject extra headers.
+
+**M5 — Audit-marker email sanitiser.** New helper [webapp/smc_audit_marker.py](webapp/smc_audit_marker.py) `_sanitize_user_email()` strips terminator characters (whitespace + `]`) and caps length at 256. `pack_audit_into_comment` now wraps `_resolve_user_email()` in the sanitiser. A weaponised email like `attacker@e ] [flexedge:audit user=admin]` can no longer plant a forged marker in adjacent comment text after passing through the SMC `comment` round-trip. Empty / sanitised-to-empty input falls back to `system` — same fallback as the original resolver.
+
+**M8 — Composite log index.** Composite index `ix_platform_logs_domain_ts` declared on the `PlatformLog` model ([webapp/models.py](webapp/models.py)) so `db.create_all()` picks it up on fresh installs; the redundant standalone `domain_id` index was dropped. New migration `_phase_audit_indexes` in [webapp/db_init.py](webapp/db_init.py) issues `CREATE INDEX IF NOT EXISTS` against existing DBs (idempotent — safe to run on every boot). The /logs viewer's `WHERE domain_id=? AND timestamp BETWEEN ? AND ? ORDER BY timestamp DESC` query now satisfies the predicate AND the order in one index scan.
+
+**M19 — Single grouped count on changes index.** [webapp/changes.py](webapp/changes.py) `index` route now consolidates all 7 per-state counts (queued / pushing / conflict / push_failed / pushed / applied / aborted) into a single `with_entities(state, func.count(id)).group_by(state)` query, then projects into the existing `stats` dict via `dict.get(state, 0)`. On a 5000-row queue accumulated over a quarter, the page render drops from 7 sequential round-trips to 1.
+
+### Security audit Batch G — async-ify the four blocking SMC operations (2026-05-09)
+
+Resolves audit items H4, H6, H7, H8 from [TODO.md § Security & efficiency audit](TODO.md). Each was burning 30s-2min of an HTTP request thread and (for H8) holding the SMC global lock, freezing every other operator on the box. All four now return instantly and run in a daemon thread; the originating page renders a watcher card that polls a JSON status endpoint and reloads when done. Same scan_jobs runtime that already powers the engine + DHCP scan tools — three new feature glue modules (`webapp/drift_jobs.py`, `webapp/dhcp_deploy_jobs.py`, `webapp/tls_deploy_jobs.py`) all follow the `dhcp_scan_jobs` / `engine_scan_jobs` pattern of: register-job → capture `current_app` → spawn daemon thread → run inside `app_context()` → mark_done.
+
+**H4 — DHCP lease viewer cache + parallel fetch.** [webapp/dhcp_manager.py](webapp/dhcp_manager.py) `scope_leases` now fans out per-node SSH reads via `ThreadPoolExecutor(max_workers=8)` and wraps each fetch in `cache_get_or_fetch(section="dhcp.leases", key_parts=(domain_id, engine_name, node_index), ttl=120)`. 4-node cluster on cold cache: 4 parallel SSH reads (≈ 2-4s wall-clock instead of 10-15s sequential); on warm cache: instant. `?refresh=1` query param drops the cache for forced re-read; the existing Refresh button now passes it. Freshness badge in [webapp/templates/dhcp/leases.html](webapp/templates/dhcp/leases.html) — green "fresh" when every node was just re-fetched, grey "cached · Ns ago" using the OLDEST cached_at across all nodes (worst-case staleness). Activity log only fires on cache misses.
+
+**H6 — Drift scan via scan_jobs.** [shared/smc_drift.py](shared/smc_drift.py) `scan_domain_drift` now accepts an optional `progress_cb(checked, total, smc_name, smc_type, state)` invoked after every row. New thin glue [webapp/drift_jobs.py](webapp/drift_jobs.py) registers a `feature="changes"` job, captures `current_app` for the worker thread, re-resolves the Domain inside an `app_context()`, and routes per-row events through `update_progress` / `increment_extra` / `append_log`. `POST /changes/drift/scan` now spawns the daemon thread and 302-redirects to `/changes/drift?scan_id=X` immediately; `drift_index` reads `?scan_id` and renders a watcher card with progress bar + per-state counters (clean / drifted / gone / errored / skipped) + 10-line live log. New JSON poll endpoint `GET /changes/drift/scan/status?id=X`. On done, the page reloads and consumes the report (flash with summary).
+
+**H7 — DHCP scope deploy via scan_jobs.** [webapp/dhcp_pusher.py](webapp/dhcp_pusher.py) `push_scope_to_engine` + `_push_scope_to_engine_locked` now accept an optional `progress_cb(*, phase, node_index, node_hostname, total_nodes, done_nodes, node_result=None)`. Phase=`start` fires when each node's SSH connection begins; `done` fires after the per-node write+verify with the full `NodeResult`. New thin glue [webapp/dhcp_deploy_jobs.py](webapp/dhcp_deploy_jobs.py) wraps the call in a daemon thread inside `app_context()`. `_run_push` (handles `/scopes/<id>/deploy` + `/resync`) spawns the job and 302-redirects to `scope_detail?deploy_scan_id=X`. `scope_detail` renders a watcher card with progress bar + log tail; new `GET /dhcp/scopes/<id>/deploy/status` is the JSON poll target. On done, page reloads (no `?deploy_scan_id`), consumes the report, and surfaces the same flashes + activity-log rows for ok / partial / failed / blocked + per-node reload-warning details — identical UX to before, just non-blocking. Per-node parallelism intentionally NOT changed (file write order matters within each engine; `engine_op_lock` already serialises per engine).
+
+**H8 — TLS deploy via scan_jobs.** Phase E.2's queue-row pattern was already in place — what was missing was offloading the auto-push from the request thread. New thin glue [webapp/tls_deploy_jobs.py](webapp/tls_deploy_jobs.py) wraps `shared.queue_runner.push_one(change_id)` in a daemon thread inside `app_context()`, captures `is_bypass` so the queue-row cleanup (delete on success + audit marker) lands together with the deploy. [webapp/tls_manager.py](webapp/tls_manager.py) `deploy_execute` POST now creates the queue row + spawns the worker via `tls_deploy_jobs.start_deploy()` and 302-redirects to `?tls_scan_id=X`; the GET handler consumes the report on `state=done` and renders the existing result panel + flashes. New `GET /tls/deploy/<id>/status` JSON poll target. Watcher card on [webapp/templates/tls/deploy_execute.html](webapp/templates/tls/deploy_execute.html) shows step 0 → 5 progress + log tail. The request thread no longer waits 30-60s holding the SMC global lock; concurrent deploys still serialise behind the lock IN THE WORKER but operator HTTP threads stay free for other work.
+
+### Security audit Batch F — SQLite pragmas, CSV-injection, setup race, cookie security (2026-05-09)
+
+Five wins resolved in one batch — H1, H3, H10, M1, M2 from [TODO.md § Security & efficiency audit](TODO.md). Independent fixes; bundled because each is small.
+
+**H1 — SQLite pragmas on every connection.** [webapp/db_init.py](webapp/db_init.py) `_enable_sqlite_foreign_keys` is renamed `_set_sqlite_pragmas` internally and now issues three pragmas instead of one: `PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000; PRAGMA synchronous=NORMAL`. Default `busy_timeout=0` was the silent killer behind sporadic `database is locked` errors during boot migrations / drift scans / push runner contention; 5s is enough to ride out the longest critical section we have. WAL-mode `synchronous=NORMAL` is ~3× faster than the FULL default and only sacrifices the last in-flight transaction on power loss — acceptable for an admin tool.
+
+**H3 — CSV-injection neutraliser.** New shared helper [shared/csv_safe.py](shared/csv_safe.py) `csv_safe(value)` prepends a `'` (Excel string-mode escape) to any string that begins with `=`, `+`, `-`, `@`, TAB, or CR — neutralising formula execution per OWASP CSV Injection guidance. Wired into both export sites: [webapp/engines_manager.py](webapp/engines_manager.py) `tools_scan_csv` and [webapp/scan_history/routes.py](webapp/scan_history/routes.py) `export_csv` wrap every string-typed cell (`ip`, `mac`, `hostname`, port lists). Hostile reverse-DNS records like `=cmd|'/c calc'!A1` no longer run when the CSV is opened in Excel.
+
+**H10 — Setup wizard race + AAD `tid` verification.** Three layers:
+
+1. [webapp/auth.py](webapp/auth.py) gains `aad_tenant_is_single()` (returns True iff `AZURE_TENANT_ID` is a concrete UUID — `common`/`organizations`/`consumers` placeholders return False) and `verify_aad_tid(userinfo)`. `callback()` now refuses any login whose token's `tid` claim doesn't match the configured tenant. Multi-tenant placeholders fail-closed: the verifier returns False because there's no UUID to match against.
+2. [webapp/setup.py](webapp/setup.py) re-gates the wizard on `aad_tenant_is_single()` and uses an atomic single-winner claim. Before creating the User, it inserts a sentinel `PlatformSetting(key="setup_completed", value="1")`; the PK uniqueness constraint gives single-winner semantics — the loser hits `IntegrityError`, rolls back gracefully, and gets bounced to the login page with a clear flash. Belt-and-suspenders re-check on `User.query.count() > 0` catches legacy migrated installs missing the sentinel.
+3. [webapp/db_init.py](webapp/db_init.py) `init_database` now also honours the sentinel — `SETUP_REQUIRED` is True iff `user_count == 0 AND sentinel is None`. Manually deleting User rows does NOT re-arm the wizard; recovery requires explicitly removing the `setup_completed` row.
+
+Closes the "first stranger to find /setup becomes Super Admin" hole on multi-tenant misconfigurations and the "two Azure AD users hit /setup simultaneously and both become Super Admin" race under multi-worker gunicorn.
+
+**M1 — `SESSION_COOKIE_SECURE` default ON.** New [webapp/app.py](webapp/app.py) `_session_cookie_secure_default()` returns True by default; off when `FLASK_DEBUG=1` (dev) or `FLEXEDGE_INSECURE_COOKIES=1` (operator override). Production deployments terminate TLS at nginx/traefik upstream of gunicorn so the cookie must be marked `Secure` to keep the browser from leaking it on plain-HTTP fallbacks; `make dev` on port 8088 stays unaffected because `FLASK_DEBUG=1` is set there.
+
+**M2 — Session regeneration on login.** [webapp/auth.py](webapp/auth.py) `callback()` now `session.clear()`s before setting `session["user"]`. The signed-cookie state is re-issued from scratch on every successful Entra ID login — any pre-login fixation attempt's snooped cookie state is worthless. Bonus: drops stale `active_profile` / `active_domain` keys from a previous user on the same browser (e.g. shared kiosks).
+
+### Security audit Batch E — queue runner concurrency (2026-05-09)
+
+Resolves audit items C7, H9, H11 from [TODO.md § Security & efficiency audit](TODO.md). All three are concentrated in [shared/queue_runner.py](shared/queue_runner.py) (with one supporting change to [shared/logging.py](shared/logging.py) and a small UI surface update in [webapp/changes.py](webapp/changes.py) + [webapp/templates/changes/index.html](webapp/templates/changes/index.html)).
+
+**C7 — Atomic state-claim + new transient `pushing` state.** The previous `push_one()` did a read-then-check on `change.state`, then dispatched the SMC handler. Two threads (or a double-clicked Push button, or `push_batch` racing a parallel `push_one` for the same id) both passed the check and both fired the handler. SMC `create` is NOT idempotent — duplicate calls produced duplicate Hosts and conflict errors.
+
+New helpers:
+
+- `_claim_for_push(change_id) -> Optional[str]` — issues `UPDATE pending_changes SET state='pushing' WHERE id=? AND state='queued'` and only proceeds when `rowcount==1`. Returns `None` on lost claim. The transient `'pushing'` state lives between `push_one()` entry and the terminal `_mark_pushed`/`_mark_push_failed` commit.
+- `_claim_for_abort(change_id) -> Optional[str]` — same shape for QUEUED|CONFLICT → ABORTED.
+
+`push_one()` now wins-or-skips via `_claim_for_push`. After a successful claim it calls `db.session.expire_all()` and re-reads the ORM row so subsequent commits aren't stale-writes from the pre-claim read. `abort_one()`, `confirm_to_be_deleted()`, and `revoke_to_be_deleted()` all use the same atomic-UPDATE-with-rowcount-check pattern. `_mark_aborted_via_claim` replaces the legacy `_mark_aborted` (which non-atomically read+wrote state) — the helper now expects the atomic claim already happened, and just stamps the row's audit metadata.
+
+**H9 — Audit emit inside the state-transition transaction.** Before this fix, every state-transition primitive did `db.session.commit()` for the state change, then called `_audit(...)` separately. A process kill between those two left a PUSHED row with no audit trail.
+
+[shared/logging.py](shared/logging.py) `audit()` and `op()` now accept a `commit=False` parameter that adds the row to the caller's existing `db.session` without committing. The `_write` exception handler skips its rollback when `commit=False` so it doesn't silently destroy the caller's pending state-change write.
+
+The queue runner's state-transition primitives (`_mark_pushed`, `_mark_push_failed`, `_mark_aborted_via_claim`, `revoke_to_be_deleted`) all use the new pattern: enrol the audit row via `_audit(..., commit=False)`, then `db.session.commit()` once. State change + audit land atomically.
+
+**H11 — Stale-read on `push_batch` (tied to C7).** Implicit fix from C7. With the atomic `UPDATE` claim, a stale ORM-cached row can no longer cause a double-push: either the UPDATE wins (rowcount=1) or it loses (rowcount=0, skip). The `expire_all()` call after each successful claim closes the secondary stale-write window for any subsequent commits in the same `push_one` invocation.
+
+**UI / model surface:** new `pushing` state added to:
+
+- [webapp/changes.py](webapp/changes.py) — included in the "Needs attention" filter (`state="active"`) and the sidebar pending-count badge so a stuck in-flight row from a killed worker is visible immediately. Stats dict gains a `pushing` count.
+- [webapp/templates/changes/index.html](webapp/templates/changes/index.html) — adds `Pushing (in flight)` option to the state-filter dropdown.
+
+No DB schema change required — `state` is stored as a string column.
+
+**Files modified (4):** `shared/queue_runner.py`, `shared/logging.py`, `webapp/changes.py`, `webapp/templates/changes/index.html`. All AST-parse clean.
+
+**Known limitation (deferred):** if a worker process is killed while a row is in `'pushing'` state, the row stays stuck. Recovery: an admin can manually flip it back via the UI (now visible in the Active / Pushing filter). A future enhancement could scan on app startup for `'pushing'` rows older than X seconds and either reclaim them (kick to QUEUED) or mark them PUSH_FAILED.
+
+### Security audit Batch D — cross-Domain leaks (2026-05-09)
+
+Resolves audit items C5 and C8 from [TODO.md § Security & efficiency audit](TODO.md). Both close paths where operator-visible content from one Domain could surface in another.
+
+**C5 — Quick-search cache walk leaks element names cross-Domain.** The previous `/api/quick-search` cache walk iterated `_section_caches.items()` directly. Cache keys are SHA-256 prefixes of `(domain.id, …)`, so you can't tell which Domain owns a given entry by inspecting its key — every operator was effectively browsing every Domain's cached element names through the search bar.
+
+Two new helpers in [shared/smc_cache.py](shared/smc_cache.py):
+
+- `peek(section, key_parts) -> Any | None` — return the cached payload for an exact `(section, key_parts)` tuple without triggering a fetch. Returns `None` on miss. Lets callers consume the cache only when they can prove they own the entry.
+- `list_sections() -> list[str]` — snapshot of the section names currently registered.
+
+The quick-search walk in [webapp/app.py](webapp/app.py) (`/api/quick-search`) was rewritten to:
+
+1. Resolve the active Domain from `g.domain` (refuse if missing).
+2. Build a list of `(section, exact_key, href_resolver, kind)` targets:
+   - `engines` keyed `(active.id,)` → results link to `/engines/clusters`.
+   - `policy_list` keyed `(active.id,)` → results link to `/policy/<name>`.
+   - Every `element_list.<type>` section (enumerated via `list_sections()`) keyed `(active.id, "", "")` → results link to `/browse/<type>`.
+3. `peek()` each target. Walk only what we own.
+
+Single-instance detail sections (`element.<type>` / `cluster` / `policy` / `dhcp_host`) are intentionally NOT walked here — their cache keys carry per-instance names we'd have to enumerate ahead of time. Operators usually drill into details from the list-section results anyway. Cross-Domain leaks are zero by construction now.
+
+**C8 — Stored XSS via `|safe` on flash messages.** Twelve templates (`admin/dashboard.html`, `admin/setup.html`, `admin/cache_settings.html`, `admin/log_settings.html`, `auth/login.html`, `optimize/report.html`, `changes/index.html`, `changes/drift.html`, `logs/index.html`, `engines/sginfo_view.html`, `engines/sginfo_history.html`, `engines/tools_scan.html`) rendered flashes as `{{ message|safe }}` / `{{ msg|safe }}`. Combined with f-string flashes that interpolate Domain `display_name`, tenant name, reservation name, etc., a Domain Admin who set `display_name=<img src=x onerror=...>` would land arbitrary JS in any operator's browser via any flash that mentioned the value.
+
+Fix:
+
+- All 12 templates now render `{{ message }}` / `{{ msg }}` — Jinja's default auto-escape kicks in for every dynamic flash interpolation. No code changes needed at the 100+ `flash(f"...")` call sites; auto-escape handles them transparently.
+- The one flash caller that legitimately wraps content in HTML — [webapp/auth.py](webapp/auth.py) `<strong>{email}</strong> is not authorised` — uses `Markup("<strong>") + escape(email) + Markup("</strong>") + " is not authorised. ..."`. The `<strong>` styling survives, the (Microsoft-validated but still defense-in-depth) `email` is properly escaped, and `flash()` accepts the resulting `Markup` object so Jinja knows not to re-escape it.
+
+**Files modified (15):** `shared/smc_cache.py`, `webapp/app.py`, `webapp/auth.py`, plus 12 flash-rendering templates. All AST-parse clean. Verification grep confirms no `{{ message|safe }}` / `{{ msg|safe }}` remains anywhere in `webapp/templates/`.
+
+### Security audit Batch C — webhook timing safety (2026-05-09)
+
+Resolves audit items C6 and M15 from [TODO.md § Security & efficiency audit](TODO.md). Both fixes apply to the same `require_api_token` decorator pattern in two network-facing webhook routes — `/tls/api/renew` (certbot deploy-hook) and `/dhcp/api/renew-dhcp` (reserved for future DHCP re-sync hook).
+
+**C6 — Constant-time bearer-token comparison.** Both `require_api_token` decorators ([webapp/tls_manager.py](webapp/tls_manager.py) + [webapp/dhcp_manager.py](webapp/dhcp_manager.py)) used plain `auth[7:] != current_app.config.get("..._API_TOKEN")`. Python string `!=` short-circuits on the first mismatching byte — measurable across enough remote requests to brute-force a token byte-by-byte. Both decorators now use `hmac.compare_digest(presented.encode("utf-8"), configured.encode("utf-8"))` — runtime independent of where the mismatch occurs.
+
+**M15 — Empty-token 503 guard (bundled).** A misconfigured deploy (token-file write failed, env var unset, file permissions blocked) leaves the corresponding `*_API_TOKEN` config as `None`. With the old code, `auth[7:] != None` evaluated true for every request — every webhook caller saw "Invalid token" (HTTP 403), indistinguishable from "wrong token from caller". Both decorators now check `configured = current_app.config.get("..._API_TOKEN") or ""` first; if empty, log an `error`-level message with a clear "Re-create /config/.{tls,dhcp}_api_token and restart" hint and refuse with HTTP 503. Misconfiguration is now unambiguous in operator logs and distinguishable from legitimate auth failures.
+
+**Files modified (2):** `webapp/tls_manager.py`, `webapp/dhcp_manager.py`. Both AST-parse clean.
+
+**Verification grep:** no other bearer-token comparisons in the codebase use plain `!=` — `tls_scheduler.py` references the token only inside the deploy-hook shell-script template (consumer side, not server side). Token storage / display call sites (boot-time `app.config[...] = ...` writes, the renewal-hook script generator) untouched.
+
+### Security audit Batch B — secrets/disclosure (2026-05-09)
+
+Resolves audit items C1 and H2 from [TODO.md § Security & efficiency audit](TODO.md). Both touch the same "where do we store/render API keys" code path — fixed together.
+
+**H2 — Plaintext API key in session cookie.** The Flask session cookie is signed but NOT encrypted; anyone who can read the cookie (XSS, browser extension, support shadowing) recovers the SMC API key. Fix: remove plaintext from the cookie entirely; resolve at runtime from the Domain row.
+
+- [webapp/user_manager.py](webapp/user_manager.py) `_get_profiles_from_db` no longer includes `api_key` in the profile dict it writes to `session["active_profile"]`. Only `tenant` (= `Domain.slug`) which the `_resolve_active_domain` before-request hook uses to populate `g.api_key_obj` per-request.
+- New resolver `user_manager.active_api_key_plaintext(profile)` returns plaintext from `g.api_key_obj.decrypted_key`. Falls back to `profile["api_key"]` only when running outside a Flask request context (CLI / JSON-fallback) or when the session predates the upgrade. Single Fernet decrypt per call.
+- `get_user_cfg()` (app.py), `_user_cfg()` (engines_manager.py), and the legacy `/select-domain` cfg builder all use the resolver. The DHCP / TLS feature `_smc_cfg(...)` already read from `api_key.decrypted_key` directly (DB row, not session) — already H2-safe.
+- `is_active_profile_valid` reworked: was hashing the cached plaintext + looking up `ApiKey.key_hash`. Now uses `Domain.slug → Domain.api_key.is_active` directly. Same revocation-detection behaviour, no plaintext required. Legacy hash check retained as a fallback for non-DB-mode JSON-fallback callers and for any pre-upgrade session that still carries plaintext.
+- Plaintext is no longer baked into the session cookie. New cookie size shrinks accordingly.
+
+**C1 — Plaintext API key in migration project files + DOM.** `webapp/project_manager.create_project` was writing the operator-typed SMC API key into `project.json` on disk; `target_config.html` rendered it as `<input value="...">` so anyone with `/migration/<id>/target` access could read it from page source. Fix: stop collecting the field. Migration always runs against the operator's active Domain (already enforced post-C2 by `_load_migration_project_or_redirect`'s `domain_slug` check); the SMC URL / API key / admin domain / verify_ssl all resolve from the active Domain row at runtime.
+
+- [webapp/templates/migration/target_config.html](webapp/templates/migration/target_config.html) — removed the `smc_url`, `api_key`, `domain`, `verify_ssl` inputs. Replaced with a read-only banner showing the active Domain label + SMC URL the migration will run against.
+- [webapp/project_manager.py](webapp/project_manager.py) `create_project` default target dict no longer carries `smc_url` / `api_key` / `domain` / `verify_ssl` — only `policy_name` and `object_prefix` (project-specific operator choices).
+- [webapp/app.py](webapp/app.py) `migration_target` POST handler stops capturing those fields from the form. Pre-C1 project files retain their existing fields until the operator re-saves; on re-save the legacy plaintext is stripped (`new_target.pop(...)` for each).
+- [webapp/app.py](webapp/app.py) `migration_dedup` and `migration_import` build their cfg dict from `get_user_cfg()` (post-H2: api_key from `g.api_key_obj.decrypted_key`) instead of from `target["api_key"]`.
+- [webapp/app.py](webapp/app.py) `migration_dhcp_map` resolves the project's Tenant from `g.api_key_obj.tenant_id` directly (no fuzzy `find_tenant_for_target(target)` lookup needed). Legacy plaintext-target fallback retained for pre-C1 project files.
+
+**Files modified (8):** `webapp/user_manager.py`, `webapp/app.py`, `webapp/engines_manager.py`, `webapp/project_manager.py`, `webapp/templates/migration/target_config.html`. All AST-parse clean.
+
+**Verification grep:** no template renders `target.api_key` or `profile.api_key` anywhere. The remaining `profile["api_key"]` reads in `user_manager.py` and `admin.py` are intentional legacy paths: `_resolve_profile_json` reads from a JSON file on disk; `migrate-json` admin route reads from a JSON file on disk; `is_active_profile_valid` retains the legacy fallback. None are session leaks.
+
+### Security audit Batch A — authorization tightening (2026-05-09)
+
+Resolves audit items C2, C3, C4, M14 from [TODO.md § Security & efficiency audit](TODO.md). All four are authorization-gating fixes that close cross-Domain privilege-escalation paths reachable by any authenticated Domain Admin.
+
+**C2 — Migration routes.** Every migration route (14 in total — `/migration/`, `/migration/new`, `/migration/<id>/parsed|target|dhcp-map|dedup|dedup/update|dhcp/update|rules|rules/update|nat-rules/update|vpn/update|import|delete`) was gated by `@login_required` only — any authenticated Azure user (even a Viewer) could drive a full SMC import. Now `@domain_admin_required` from [webapp/auth_roles.py](webapp/auth_roles.py).
+
+Each project carries a `domain_slug` stamp (added at creation in [webapp/project_manager.py](webapp/project_manager.py)). New helper `_load_migration_project_or_redirect()` in [webapp/app.py](webapp/app.py) enforces that the project's `domain_slug` matches `g.domain.slug` on every load. Legacy projects (no stamp) get stamped with the active Domain on first authenticated read — the constraint becomes enforceable going forward without breaking in-flight migrations. Cross-Domain access attempts are logged + return "Project not found" (don't leak existence). Project list filters to active-Domain-only + legacy.
+
+**C3 — Admin Portal infrastructure CRUD.** 18 routes flipped from `@admin_required` (= any Domain Admin) to `@super_admin_required` from [webapp/auth_roles.py](webapp/auth_roles.py):
+
+- 4 × `/admin/tenants*` — Tenant CRUD (cross-Domain infra)
+- 5 × `/admin/domains*` — Domain CRUD (cross-Domain infra)
+- 5 × `/admin/api-keys*` — API key CRUD (cross-Domain infra)
+- `/admin/backup` — downloads encrypted DB + decryption key
+- `/admin/migrate-json` — one-time JSON-to-DB import
+- `/admin/log-settings` — global log mode/retention (M14)
+- `/admin/cache-settings` — global cache TTL (bundled with M14, same shape)
+
+Without this fix, a Domain-A admin could create/delete tenants, API keys, or Domains across the whole platform, including ones they have no Domain Access for. The `/admin/backup` route in particular let any Domain Admin download a ZIP of `flexedge.db` + `encryption.key` — full credential disclosure across all Domains.
+
+The `/admin/users*` routes (5 total) and the dashboard intentionally stay on `@admin_required` per the audit's explicit scope. Follow-up flag: `/admin/users/<id>/edit` lets a Domain Admin assign users to OTHER Domains, which is technically cross-Domain — re-evaluate as part of the next audit pass.
+
+**C4 — Browser SSH terminal cross-Domain check.** Both layers (HTTP launcher in [webapp/engines_manager.py](webapp/engines_manager.py) `node_terminal` + WebSocket handshake in [webapp/engine_terminal.py](webapp/engine_terminal.py) `node_terminal_ws`) only checked `_is_admin(email)` + `last_verify_status == "ok"` — a Domain-A admin could open an SSH terminal on a Domain-B engine simply by guessing/probing `cred_id` URL values. Now both layers refuse (HTTP: redirect with "Credential not found"; WebSocket: close code 4403) when `cred.domain_id != g.domain.id` AND the caller is not Super Admin. Logged at WARN with `email`, `cred_id`, `cred.domain_id`, `active_domain_id` so brute-force attempts are visible.
+
+**M14 — `/admin/log-settings` Super-Admin gate.** Bundled into C3 above. `/admin/cache-settings` flipped along with it (same shape — global infrastructure setting that shouldn't be Domain-Admin-mutable).
+
+**Files modified:** `webapp/app.py`, `webapp/admin.py`, `webapp/engines_manager.py`, `webapp/engine_terminal.py`, `webapp/project_manager.py`. All 5 AST-parse clean.
+
+### Caching Phase 0 — domain-scoped object accessor (2026-05-09)
+
+Eliminates the cross-feature reuse gap: visiting `/engines/clusters` now primes the cache for DHCP credentials, TLS deploy, scan picker, and DHCP scope discovery. Same engine, three+ features, one SMC roundtrip per Domain per TTL.
+
+**New module:** [webapp/domain_objects.py](webapp/domain_objects.py) — single read entry point for SMC objects scoped by Domain. Eight accessors: `engines(domain, cfg)`, `cluster(domain, cfg, name)`, `scopes(domain, cfg, name)`, `policies(domain, cfg)`, `policy(domain, cfg, name)`, `elements(domain, cfg, type, filter, fgt)`, `element(domain, cfg, type, name)`, `dhcp_host(domain, cfg, name)`.
+
+**Storage shape:** cache holds JSON-serialisable dicts (raw SMC API response shape with light extraction). Projection helpers in `domain_objects.py` turn cached dicts back into `EngineSummary` / `ClusterDetail` / `DhcpHostView` instances. SMC version-tolerant (new fields just appear). Redis-swappable later (dicts are JSON-serialisable; dataclasses aren't).
+
+**Section names migrated** to short, object-type-keyed:
+
+| Old | New |
+| --- | --- |
+| `engines.list` | `engines` |
+| `engines.detail` | `cluster` |
+| `smc.policy.list` | `policy_list` |
+| `smc.policy.<name>` | `policy` (was uncached — Phase 0 wired it; resolves audit H5) |
+| `smc.explorer.<type>` | `element_list.<type>` |
+| `smc.element.<type>` | `element.<type>` |
+| (new) | `scopes` (DHCP scope discovery — resolves caching roadmap item) |
+| (new) | `dhcp_host` (single-Host pre-fill in reservation editor) |
+
+**Cross-feature reuse — what now hits the cache that didn't before:**
+
+- `/dhcp/api/.../engines` cascade — was calling `smc_tls_client.list_engines()` live; now reads from `engines` cache.
+- `/tls/api/.../engines` cascade — same fix, same section.
+- `/engines/api/clusters/<name>/interfaces` (scan picker JSON) — was calling `cluster_detail` live; now reads from `cluster` cache.
+- `tools_scan_start` interface lookup — same fix, same section.
+- `list_tcp_services_for_picker` / `resolve_port_services` — moved to `domain_objects.elements()`, sharing `element_list.tcp_services` / `element_list.udp_services` with `/browse/<type>`.
+- `/dhcp/api/.../engines/<n>/scopes` cascade — newly cached via `scopes` section. The `/dhcp/scopes/discover` POST passes `refresh=True` to warm the cache after a fresh walk.
+- `/dhcp/reservations/<id>/edit` — Host pre-fill via new `dhcp_host` section.
+- `/policy/<name>` — newly cached, resolves the audit's HIGHEST IMPACT GAP. Queue runner already targeted this section for invalidation; now there's a read wrapper.
+- `/api/elements/<type>` and `/api/policy/<name>/rules` — JSON twins now share the same sections as their HTML siblings.
+- `/optimize` — shares `policy_list` with `/policies`.
+
+**Queue runner invalidation map updated** ([shared/queue_runner.py:240-300](shared/queue_runner.py#L240)) to use the new short section names. `upload_policy` now also drops `scopes` for the affected engine. Plain element-type pushes drop `element_list.<type>` AND `element.<type>`; if the type is `host`, also drops `dhcp_host`.
+
+**Quick-search section walk** ([webapp/app.py:1042-1086](webapp/app.py#L1042)) updated to recognise the new short names so cached element names still surface in Cmd/Ctrl+K results.
+
+**`cluster_forget`** ([webapp/engines_manager.py](webapp/engines_manager.py)) drops `engines` + `cluster` + `scopes` for the engine — the canonical "I'm done" signal flushes everything keyed to it.
+
+**Files modified:** `webapp/engines_manager.py`, `webapp/dhcp_manager.py`, `webapp/tls_manager.py`, `webapp/app.py`, `shared/queue_runner.py`. **Files added:** `webapp/domain_objects.py`. No schema changes; no DB migrations. All 7 modified files AST-parse clean. Templates' `cache_meta.served_from_cache` / `age_minutes` continue to work — accessors return the same `CachedValue` from `cache_get_or_fetch`.
+
+Doc: [docs/CachingReview.md](docs/CachingReview.md) — updated to reflect Phase 0 landed (was a review/proposal doc; now the canonical reference for the cache architecture).
 
 ### Engines → Tools → Scan: MAC harvest fixed — BusyBox `ip` wants `neigh`, not `neighbor` (2026-05-09)
 

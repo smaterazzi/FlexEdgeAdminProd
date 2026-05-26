@@ -88,17 +88,14 @@ def create_project(name, config_file_path, config_filename, domain_id=None):
     """Create a new project from a FortiGate config file.
 
     Args:
-        name: Human-readable project name
-        config_file_path: Path to the uploaded .conf file (temporary)
-        config_filename: Original filename
-        domain_id: Active Domain's id (pinned into the manifest so
-            future routes can enforce Domain isolation per audit C2).
-            None is permitted for CLI-driven creates that have no
-            Domain context — those projects show up as "legacy" until
-            the first UI mutation claims them.
-
-    Returns:
-        Project manifest dict
+        name: Human-readable project name.
+        config_file_path: Path to the uploaded .conf file (temporary).
+        config_filename: Original filename.
+        domain_id: Active Domain's id (pinned into the manifest so future
+            routes can enforce Domain isolation per audit C2). None is
+            permitted for CLI-driven creates that have no Domain context —
+            those projects show up as "legacy" until the first UI mutation
+            claims them.
     """
     _ensure_projects_dir()
     project_id = str(uuid.uuid4())[:8]
@@ -119,11 +116,12 @@ def create_project(name, config_file_path, config_filename, domain_id=None):
         "status": "created",
         "source_file": config_filename,
         "source_hostname": "",
+        # C1 (audit fix-up, 2026-05-09): plaintext SMC credentials are
+        # NEVER persisted on the project file. The ``smc_url`` /
+        # ``api_key`` / ``domain`` / ``verify_ssl`` are resolved at run-
+        # time from the active Domain row (`g.api_key_obj`). The only
+        # fields persisted here are project-specific operator choices.
         "target": {
-            "smc_url": "",
-            "api_key": "",
-            "domain": "",
-            "verify_ssl": False,
             "policy_name": "",
             "object_prefix": "FGT-",
         },

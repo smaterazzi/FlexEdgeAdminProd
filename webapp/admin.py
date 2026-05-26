@@ -22,6 +22,7 @@ from shared.db import db
 from shared.encryption import KEY_FILE, hash_value
 from webapp.auth_roles import super_admin_required
 from webapp.models import Tenant, User, ApiKey, Domain, UserDomainAccess
+from webapp.auth_roles import super_admin_required
 
 
 def _friendly_db_error(exc: Exception, action: str) -> str:
@@ -278,7 +279,19 @@ def domain_reactivate(id):
 @admin_bp.route("/users")
 @admin_required
 def users():
-    items = User.query.order_by(User.email).all()
+    # M7 (audit fix-up, 2026-05-09): eager-load Domain on each user's
+    # `domain_accesses`. `User.domain_accesses` is already `lazy="joined"`,
+    # but `access.domain` is the default lazy-select — the template's
+    # `{% for access in u.domain_accesses %}{{ access.domain.display_name }}`
+    # loop fires one SELECT per access. selectinload batches all Domain
+    # PKs into a single IN query.
+    from sqlalchemy.orm import selectinload
+    from webapp.models import UserDomainAccess
+    items = (User.query
+             .options(selectinload(User.domain_accesses)
+                      .joinedload(UserDomainAccess.domain))
+             .order_by(User.email)
+             .all())
     return render_template("admin/users.html", users=items)
 
 

@@ -298,6 +298,7 @@ def refresh_engine_state(domain_id: int, engine_name: str) -> RefreshReport:
     # tests stub the SMC layer with monkeypatch on this module.
     from webapp.smc_dhcp_client import (
         SMCConfig, smc_session, find_active_policy, find_ssh_access_rule,
+        list_cluster_nodes,
     )
     from webapp.dhcp_bootstrap import rule_name_for
     from webapp.dhcp_ssh import (
@@ -343,10 +344,29 @@ def refresh_engine_state(domain_id: int, engine_name: str) -> RefreshReport:
     rule_name = rule_name_for(engine_name)
     rule_probe = RuleProbeResult(rule_name=rule_name, rule_present_in_smc=False,
                                  expected_destinations=expected_dst)
+    # P1 — contact-address drift map: {node_index: set(public_contacts)}.
+    # Populated inside the SMC session below; consumed after the per-node
+    # SSH loop to flag credentials whose persisted `connect_ip_override`
+    # no longer appears in SMC's contact-address list (e.g. operator
+    # changed the NAT exit IP in SMC out-of-band).
+    live_public_contacts: dict[int, set] = {}
     try:
         with smc_session(smc_cfg):
             policy_name = find_active_policy(engine_name)
             existing = find_ssh_access_rule(policy_name, rule_name)
+            # Walk the cluster's contact addresses while the session is
+            # open so we don't open a second one for the drift probe.
+            # Best-effort — a fetch error doesn't break the rule probe.
+            try:
+                for n in list_cluster_nodes(engine_name):
+                    pub_set: set = set()
+                    for a in n.addresses:
+                        for ca in (a.contact_addresses or []):
+                            if ca.get("is_public") and ca.get("address"):
+                                pub_set.add(ca["address"])
+                    live_public_contacts[n.node_index] = pub_set
+            except Exception as exc:
+                log.debug("contact-address drift probe failed: %s", exc)
             if existing:
                 rule_probe.rule_present_in_smc = True
                 rule_dst_names = existing.get("destination_names") or []
@@ -383,8 +403,12 @@ def refresh_engine_state(domain_id: int, engine_name: str) -> RefreshReport:
 
     # 2. Per-node SSH probe (outside SMC session — pure paramiko + TCP)
     for c in creds:
-        target = SSHTarget(hostname=c.hostname, port=c.ssh_port,
-                           username=c.ssh_username)
+        # P1 (2026-05-12): dial the override when set so freshness
+        # probes succeed for NAT'd nodes; the `hostname` field on the
+        # probe result still surfaces the engine's real interface IP
+        # for operator-readable drift messages.
+        from webapp.dhcp_ssh import target_from_credential
+        target = target_from_credential(c, timeout=8)
         payload = SSHCredential(password=c.encrypted_password,
                                 host_fingerprint=c.host_fingerprint)
         np = NodeProbeResult(node_index=c.node_index, hostname=c.hostname,
@@ -427,6 +451,40 @@ def refresh_engine_state(domain_id: int, engine_name: str) -> RefreshReport:
                     f"failed — {reason}"
                 )
         report.nodes.append(np)
+
+    # 2b. P1 — contact-address drift detection (2026-05-12). For each
+    # credential with a `connect_ip_override`, check whether the stored
+    # public IP still appears in SMC's live contact-address list for
+    # this node. If not, surface a drift banner — operator likely
+    # changed the NAT exit IP in SMC (or the contact address was
+    # removed). We don't auto-mutate the override; public-IP rotations
+    # are usually deliberate ops events worth a human pause.
+    if live_public_contacts:
+        for c in creds:
+            override = (getattr(c, "connect_ip_override", "") or "").strip()
+            if not override:
+                continue
+            live_set = live_public_contacts.get(c.node_index, set())
+            if not live_set:
+                # No public contacts visible on this node. Could be a
+                # transient SMC fetch failure or genuine removal; flag
+                # softly so the operator decides.
+                report.node_drift_messages.append(
+                    f"node {c.node_index} ({c.hostname}): persisted "
+                    f"connect IP {override!r} has no matching public "
+                    f"contact address in SMC anymore. FEA will keep "
+                    f"dialing it until you update or clear the override "
+                    f"on the Credentials page."
+                )
+            elif override not in live_set:
+                report.node_drift_messages.append(
+                    f"node {c.node_index} ({c.hostname}): persisted "
+                    f"connect IP {override!r} no longer matches any of "
+                    f"SMC's current public contact addresses "
+                    f"({', '.join(sorted(live_set))}). FEA still dials "
+                    f"{override!r}; pick a current address on the "
+                    f"Credentials page to update."
+                )
 
     # 3. Bump state_refreshed_at on what verified successfully.
     now = datetime.now(timezone.utc)

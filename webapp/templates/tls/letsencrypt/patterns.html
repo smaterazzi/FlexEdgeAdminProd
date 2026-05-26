@@ -1,0 +1,101 @@
+{% extends "base.html" %}
+{% block title %}Let's Encrypt — Allowlist{% endblock %}
+
+{% block content %}
+<div class="p-4">
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.dashboard') }}">TLS Manager</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('letsencrypt.list_certs') }}">Let's Encrypt</a></li>
+    <li class="breadcrumb-item active">Allowlist</li>
+  </ol>
+</nav>
+
+<h2 class="mb-3">
+  <i class="bi bi-list-check"></i> Cert allowlist for
+  <small class="text-muted"><code>{{ domain.display_name }}</code></small>
+</h2>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+{% for category, msg in messages %}
+<div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+{% endfor %}
+{% endwith %}
+
+<div class="alert alert-info small">
+  <i class="bi bi-info-circle"></i>
+  Cert requests in this Domain will be refused unless the FQDN matches
+  at least one pattern below. Patterns use shell-glob syntax —
+  <code>*.prod.example.com</code> matches any single-label prefix,
+  <code>api?.example.com</code> matches one wildcard character.
+  An empty list means <strong>nothing is allowed</strong> (safe default).
+</div>
+
+<div class="row">
+  <div class="col-md-6">
+    <div class="card mb-3">
+      <div class="card-header"><h5 class="mb-0">Add a pattern</h5></div>
+      <div class="card-body">
+        <form method="post">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+          <input type="hidden" name="action" value="add">
+          <div class="mb-3">
+            <label class="form-label">Pattern</label>
+            <input type="text" name="pattern" class="form-control" required
+                   placeholder="*.prod.example.com"
+                   pattern="^[a-z0-9*?.\[\]\-]+$"
+                   autocomplete="off">
+            <div class="form-text">
+              Lowercase ASCII, digits, dots, hyphens; wildcards <code>*</code>
+              and <code>?</code>; brackets <code>[…]</code>. Must contain
+              at least one <code>.</code>; bare <code>*</code> or
+              <code>*.com</code> are refused as too permissive.
+            </div>
+          </div>
+          <button class="btn btn-primary">
+            <i class="bi bi-plus-circle"></i> Add
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div class="col-md-6">
+    <div class="card mb-3">
+      <div class="card-header">
+        <h5 class="mb-0">Current patterns ({{ patterns|length }})</h5>
+      </div>
+      {% if patterns %}
+      <ul class="list-group list-group-flush">
+        {% for p in patterns %}
+        <li class="list-group-item d-flex justify-content-between align-items-center">
+          <div>
+            <code>{{ p.pattern }}</code>
+            <div class="small text-muted">
+              added {{ p.created_at.strftime("%Y-%m-%d %H:%M UTC") }}
+              {% if p.created_by %}by <code>{{ p.created_by.email }}</code>{% endif %}
+            </div>
+          </div>
+          <form method="post" class="d-inline"
+                onsubmit="return confirm('Remove pattern {{ p.pattern }}?');">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="action" value="remove">
+            <input type="hidden" name="pattern_id" value="{{ p.id }}">
+            <button class="btn btn-sm btn-outline-danger">
+              <i class="bi bi-x"></i>
+            </button>
+          </form>
+        </li>
+        {% endfor %}
+      </ul>
+      {% else %}
+      <div class="card-body text-muted small">
+        No patterns yet. Cert requests in this Domain will be refused.
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+</div>
+{% endblock %}

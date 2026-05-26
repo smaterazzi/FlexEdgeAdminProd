@@ -17,6 +17,7 @@ Phase 3 scope (this file):
   - AJAX cascade: tenant → api-key → engine → scopes
   - "Deploy" button is wired but hands off to a placeholder until Phase 4.
 """
+import hmac
 import logging
 import re
 import secrets
@@ -83,13 +84,33 @@ def admin_required(f):
 
 
 def require_api_token(f):
-    """Decorator for webhook endpoints: Bearer token auth."""
+    """Decorator for webhook endpoints: Bearer token auth.
+
+    C6 + M15 (audit fix-up, 2026-05-09):
+      * Use ``hmac.compare_digest`` to compare the presented token with
+        the configured one — constant-time comparison prevents byte-by-byte
+        timing-attack token recovery.
+      * Refuse with HTTP 503 when the configured token is empty / None.
+        Without this guard a misconfigured deploy (token-file write
+        failed, env var unset) would coerce ``None`` into the comparison
+        and reject everything as "Invalid token" — the failure mode is
+        indistinguishable from "wrong token from caller". 503 makes the
+        misconfiguration unambiguous in the logs.
+    """
+    import hmac
     @wraps(f)
     def decorated(*args, **kwargs):
+        configured = current_app.config.get("DHCP_API_TOKEN") or ""
+        if not configured:
+            # Unconfigured webhook MUST refuse outright — see tls_manager
+            # for the rationale (same guard pattern).
+            return jsonify({"error": "Webhook token not configured on server"}), 503
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Missing Authorization header"}), 401
-        if auth[7:] != current_app.config.get("DHCP_API_TOKEN"):
+        presented = auth[7:]
+        if not hmac.compare_digest(presented.encode("utf-8"),
+                                   configured.encode("utf-8")):
             return jsonify({"error": "Invalid token"}), 403
         return f(*args, **kwargs)
     return decorated
@@ -145,6 +166,50 @@ def _smc_cfg(tenant_or_domain, api_key: ApiKey | None = None) -> SMCConfig:
         verify_ssl=api_key.verify_ssl if api_key.verify_ssl is not None else tenant.verify_ssl,
         timeout=api_key.timeout or tenant.timeout,
     )
+
+
+def _smc_cfg_dict(tenant_or_domain, api_key: ApiKey | None = None) -> dict:
+    """Dict-shaped SMC config — matches `app.get_user_cfg()` shape.
+
+    Required by `engine_inquiry.list_clusters` and the rest of the
+    `webapp.smc_client.smc_session(cfg)` callers (top-level
+    `smc_client`, dict-keyed: `cfg["smc_url"]`, `cfg["api_key"]`, …).
+
+    `_smc_cfg(...)` above returns the `SMCConfig` dataclass used by
+    `webapp.smc_tls_client.smc_session(cfg)` (attribute-keyed:
+    `cfg.url`, `cfg.api_key`). The two are not interchangeable — passing
+    one where the other is expected raises
+    ``TypeError: 'SMCConfig' object is not subscriptable``, which is
+    what the user saw as "Error: 'SMCConfig' object" in the engines
+    cascade.
+
+    Returns the same dict shape every `domain_objects.*` cache fetcher
+    consumes (engines / cluster / scopes / policy / element / dhcp_host).
+    """
+    if isinstance(tenant_or_domain, Domain):
+        domain = tenant_or_domain
+        ak = domain.api_key
+        return {
+            "smc_url":      ak.smc_url,
+            "api_key":      ak.decrypted_key,
+            "verify_ssl":   bool(ak.verify_ssl),
+            "timeout":      ak.timeout or 120,
+            "domain":       domain.smc_domain_name or "",
+            "api_version":  ak.api_version or "",
+            "retry_on_busy": True,
+        }
+    tenant = tenant_or_domain
+    return {
+        "smc_url":      (api_key.smc_url or tenant.smc_url),
+        "api_key":      api_key.decrypted_key,
+        "verify_ssl":   bool(api_key.verify_ssl
+                             if api_key.verify_ssl is not None
+                             else tenant.verify_ssl),
+        "timeout":      api_key.timeout or tenant.timeout or 120,
+        "domain":       tenant.default_domain or "",
+        "api_version":  api_key.api_version or tenant.api_version or "",
+        "retry_on_busy": True,
+    }
 
 
 def _wants_json_response() -> bool:
@@ -286,11 +351,25 @@ def _lazy_backfill_subnet_cidr(scope: DhcpScope) -> bool:
     usable CIDR locally.
 
     Returns True iff a value was derived and persisted. No-op when
-    ``subnet_cidr`` is already set, or when there isn't enough data on
-    the row to produce at least a /30 (≥4 hosts) result.
+    ``subnet_cidr`` already holds a parseable network, or when there
+    isn't enough data on the row to produce at least a /30 (≥4 hosts).
+
+    A non-empty but unparseable ``subnet_cidr`` (e.g. a garbage value
+    persisted by an old discovery shape) is treated the same as empty
+    and overwritten — otherwise the leases filter and Full-subnet scan
+    stay broken forever.
     """
-    if scope.subnet_cidr:
-        return False
+    from ipaddress import ip_network
+    current = (scope.subnet_cidr or "").strip()
+    if current:
+        try:
+            ip_network(current, strict=False)
+            return False  # already parseable — leave alone
+        except (ValueError, TypeError):
+            log.info(
+                "Scope %s has unparseable subnet_cidr=%r — will overwrite "
+                "with derived value if possible.", scope.id, current,
+            )
     derived_cidr, _ = _derive_cidr_from_pool(
         {"default_gateway": scope.gateway or ""},
         scope.dhcp_pool_start or "",
@@ -302,7 +381,6 @@ def _lazy_backfill_subnet_cidr(scope: DhcpScope) -> bool:
     # only the gateway is known, or when pool_start == pool_end, and
     # would be useless for scanning or filtering anyway.
     try:
-        from ipaddress import ip_network
         net = ip_network(derived_cidr, strict=False)
         if net.prefixlen >= 31:
             return False
@@ -696,6 +774,9 @@ def scopes_discover():
         return redirect(url_for("dhcp.scopes_list"))
 
     cfg = _smc_cfg(tenant, api_key)
+    # `domain_objects.scopes` ultimately calls `smc_client.smc_session(cfg)`
+    # which expects a DICT-shaped cfg (not the SMCConfig dataclass).
+    cfg_dict = _smc_cfg_dict(tenant, api_key)
     target = f"{tenant.name}/{api_key.name}/{engine_name}"
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
     try:
@@ -706,7 +787,7 @@ def scopes_discover():
         domain_obj = getattr(g, "domain", None)
         from webapp import domain_objects
         scope_dicts, _cv = domain_objects.scopes(
-            domain_obj, cfg, engine_name, refresh=True)
+            domain_obj, cfg_dict, engine_name, refresh=True)
         # Project dicts back to the dataclass shape the upsert loop expects
         from webapp.smc_dhcp_client import DhcpScopeInfo
         found = [DhcpScopeInfo(**{
@@ -828,9 +909,80 @@ def scope_detail(scope_id):
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
 
-    reservations = (DhcpReservation.query
-                    .filter_by(scope_id=scope.id)
-                    .order_by(DhcpReservation.ip_address).all())
+    # H7 (audit fix-up, 2026-05-09): consume the post-deploy scan_jobs
+    # report when the page is reloaded after the watcher polls "done".
+    deploy_running = None
+    deploy_scan_id = (request.args.get("deploy_scan_id") or "").strip()
+    if deploy_scan_id:
+        from webapp import dhcp_deploy_jobs
+        user_email = (session.get("user") or {}).get("email", "")
+        status = dhcp_deploy_jobs.get_status(deploy_scan_id, user_email=user_email)
+        if status is None:
+            flash("Deploy job not found or expired.", "info")
+        elif status["state"] == "running":
+            deploy_running = status
+        elif status["state"] == "failed":
+            flash(f"Deploy worker failed: "
+                  f"{status.get('error') or 'unknown error'}", "danger")
+            dhcp_deploy_jobs.discard(deploy_scan_id, user_email=user_email)
+        else:  # done
+            result = dhcp_deploy_jobs.consume_report(
+                deploy_scan_id, user_email=user_email,
+            )
+            action = (status.get("action") or "push")
+            target = f"{scope.engine_name}/{scope.interface_id}"
+            if result is None:
+                flash("Deploy results expired.", "warning")
+            elif result.overall_status == "blocked":
+                flash(f"Deployment blocked: {result.blocked_reason}", "warning")
+                _log_activity("deploy", action, "blocked", target,
+                              f"Blocked: {result.blocked_reason}")
+            elif result.overall_status == "ok":
+                flash(f"Deploy succeeded on all {result.successful_nodes} "
+                      f"node(s). Pushed "
+                      f"{result.nodes[0].reservations_count if result.nodes else 0}"
+                      f" reservation(s).", "success")
+                _log_activity("deploy", action, "ok", target,
+                              f"OK on {result.successful_nodes}/"
+                              f"{len(result.nodes)} nodes.")
+            elif result.overall_status == "partial":
+                failed = ", ".join(f"node {n.node_index}: {n.error}"
+                                   for n in result.nodes if n.status != "ok")
+                flash(f"Partial success: {result.successful_nodes}/"
+                      f"{len(result.nodes)} nodes pushed. "
+                      f"Failures: {failed}", "warning")
+                _log_activity("deploy", action, "partial", target,
+                              f"Partial: {result.successful_nodes}/"
+                              f"{len(result.nodes)} OK. Failures: {failed}")
+            else:
+                failed = "; ".join(f"node {n.node_index}: {n.error}"
+                                   for n in result.nodes) or "no nodes attempted"
+                flash(f"Deploy failed on all nodes. {failed}", "danger")
+                _log_activity("deploy", action, "failed", target,
+                              f"Failed on all nodes: {failed}")
+            for n in (result.nodes if result else []):
+                if n.reload_warning:
+                    flash(f"Node {n.node_index}: dhcpd reload warning — "
+                          f"{n.reload_warning}", "warning")
+
+    # M13 (audit fix-up, 2026-05-09): paginate the reservation list.
+    # Big scopes can carry hundreds of reservations; the previous .all()
+    # rendered every row and a single template iteration on a 1000-row
+    # scope was a noticeable hang.
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    page_size = 50
+    res_qry = (DhcpReservation.query
+               .filter_by(scope_id=scope.id)
+               .order_by(DhcpReservation.ip_address))
+    total_reservations = res_qry.count()
+    reservations = (res_qry
+                    .limit(page_size)
+                    .offset((page - 1) * page_size)
+                    .all())
+    total_pages = max(1, (total_reservations + page_size - 1) // page_size)
     recent_deploys = (DhcpDeployment.query
                       .filter_by(scope_id=scope.id)
                       .order_by(DhcpDeployment.created_at.desc()).limit(10).all())
@@ -839,7 +991,27 @@ def scope_detail(scope_id):
         scope=scope,
         reservations=reservations,
         recent_deploys=recent_deploys,
+        deploy_running=deploy_running,
+        pagination={
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_reservations,
+            "total_pages": total_pages,
+        },
     )
+
+
+@dhcp_bp.route("/scopes/<int:scope_id>/deploy/status")
+@admin_required
+def scope_deploy_status(scope_id):
+    """JSON poll target for the deploy watcher card."""
+    from webapp import dhcp_deploy_jobs
+    scan_id = (request.args.get("id") or "").strip()
+    user_email = (session.get("user") or {}).get("email", "")
+    status = dhcp_deploy_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"state": "missing"}), 404
+    return jsonify(status)
 
 
 @dhcp_bp.route("/scopes/<int:scope_id>/sync", methods=["POST"])
@@ -1039,6 +1211,8 @@ def reservation_edit(reservation_id):
         flash("Scope has no Domain or ApiKey on file. Re-enroll via Admin Portal.", "danger")
         return redirect(url_for("dhcp.scopes_list"))
     cfg = _smc_cfg(domain)
+    # `domain_objects.dhcp_host` needs the DICT-shaped cfg (smc_client backend).
+    cfg_dict = _smc_cfg_dict(domain)
 
     # Read the live SMC Host (if it exists yet) so the form pre-fills with
     # current values. For 'queued' reservations the Host doesn't exist —
@@ -1050,7 +1224,7 @@ def reservation_edit(reservation_id):
         try:
             from webapp import domain_objects
             host_view, _cv = domain_objects.dhcp_host(
-                domain, cfg, res.smc_host_name)
+                domain, cfg_dict, res.smc_host_name)
         except Exception as exc:
             flash(f"Could not read Host from SMC: {exc}", "warning")
 
@@ -1546,11 +1720,16 @@ def scope_preview(scope_id):
 
 
 def _run_push(scope_id: int, action: str):
-    """Shared deploy/resync handler — orchestrates the SSH push and
-    surfaces results as flash messages + activity-log rows.
-    """
-    from webapp.dhcp_pusher import push_scope_to_engine
+    """Shared deploy/resync handler — spawns a background scan_jobs runner.
 
+    H7 (audit fix-up, 2026-05-09): the synchronous version blocked the
+    request thread for 30-60s on a 5-node cluster, with worst-case
+    2x-multiplied latency from the SMC global lock contention. Now
+    spawns a daemon thread via `webapp.dhcp_deploy_jobs.start_deploy`
+    and redirects to `scope_detail?deploy_scan_id=X`. The detail page
+    renders a watcher card that polls /dhcp/scopes/<id>/deploy/status
+    and reloads when the job is done.
+    """
     scope = _scope_with_creds_or_redirect(scope_id)
     if not scope:
         return redirect(url_for("dhcp.scopes_list"))
@@ -1558,50 +1737,47 @@ def _run_push(scope_id: int, action: str):
     target = f"{scope.engine_name}/{scope.interface_id}"
     operator = _operator_email()
 
+    creds = (DhcpEngineCredential.query
+             .filter_by(domain_id=scope.domain_id,
+                        engine_name=scope.engine_name)
+             .all())
+    if not creds:
+        flash("No SSH credentials enrolled — cannot deploy.", "warning")
+        _log_activity("deploy", action, "blocked", target,
+                      "No credentials enrolled")
+        return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+
     _log_activity("deploy", action, "info", target,
                   f"{action.capitalize()} starting for scope {scope.id}.")
 
-    result = push_scope_to_engine(scope.id, operator, action=action)
-
-    if result.overall_status == "blocked":
-        flash(f"Deployment blocked: {result.blocked_reason}", "warning")
-        _log_activity("deploy", action, "blocked", target,
-                      f"Blocked: {result.blocked_reason}")
-    elif result.overall_status == "ok":
-        flash(f"Deploy succeeded on all {result.successful_nodes} node(s). "
-              f"Pushed {result.nodes[0].reservations_count if result.nodes else 0} "
-              f"reservation(s).", "success")
-        _log_activity("deploy", action, "ok", target,
-                      f"OK on {result.successful_nodes}/{len(result.nodes)} nodes.")
-    elif result.overall_status == "partial":
-        failed = ", ".join(f"node {n.node_index}: {n.error}"
-                           for n in result.nodes if n.status != "ok")
-        flash(f"Partial success: {result.successful_nodes}/{len(result.nodes)} "
-              f"nodes pushed. Failures: {failed}", "warning")
-        _log_activity("deploy", action, "partial", target,
-                      f"Partial: {result.successful_nodes}/{len(result.nodes)} "
-                      f"OK. Failures: {failed}")
-    else:
-        failed = "; ".join(f"node {n.node_index}: {n.error}"
-                           for n in result.nodes) or "no nodes attempted"
-        flash(f"Deploy failed on all nodes. {failed}", "danger")
+    from webapp.dhcp_deploy_jobs import start_deploy
+    try:
+        scan_id = start_deploy(
+            scope_id=scope.id,
+            engine_name=scope.engine_name,
+            action=action,
+            operator_email=operator,
+            total_nodes=len(creds),
+        )
+    except Exception as exc:
+        log.exception("scope_deploy: failed to spawn job")
+        flash(f"Deploy failed to start: {exc}", "danger")
         _log_activity("deploy", action, "failed", target,
-                      f"Failed on all nodes: {failed}")
+                      f"Spawn failed: {exc}")
+        return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
 
-    # Surface any reload warnings as additional flashes.
-    for n in result.nodes:
-        if n.reload_warning:
-            flash(f"Node {n.node_index}: dhcpd reload warning — "
-                  f"{n.reload_warning}", "warning")
-
-    return redirect(url_for("dhcp.scope_detail", scope_id=scope.id))
+    return redirect(url_for("dhcp.scope_detail",
+                            scope_id=scope.id, deploy_scan_id=scan_id))
 
 
 # ── SSH credentials (Phase 1c — auto-enrollment via SMC API) ────────────
 
 def _cred_to_target(cred_row: DhcpEngineCredential) -> SSHTarget:
-    return SSHTarget(hostname=cred_row.hostname, port=cred_row.ssh_port,
-                     username=cred_row.ssh_username)
+    # P1: delegate to the centralised helper so the connect_ip_override
+    # is honored. `hostname` on the row stays the engine's real
+    # interface IP — what the SMC rule's destination Host matches.
+    from webapp.dhcp_ssh import target_from_credential
+    return target_from_credential(cred_row)
 
 
 def _cred_to_payload(cred_row: DhcpEngineCredential) -> SSHCredential:
@@ -1619,6 +1795,32 @@ def _audit_comment(action: str, engine_name: str = "") -> str:
     op = _operator_email() or "unknown"
     suffix = f" engine={engine_name}" if engine_name else ""
     return f"FlexEdgeAdmin {action} by {op}{suffix}"
+
+
+def _validate_connect_ip_override(raw) -> str:
+    """Return a clean IPv4 string, or "" if the input is missing/invalid.
+
+    P1 (2026-05-12). The credentials wizard submits this from a
+    dropdown of public contact addresses we ourselves discovered, but
+    the form value is operator-controlled so we re-validate
+    defensively before storing it. Empty / whitespace / bad shape →
+    "" (= no override; today's behavior).
+
+    IPv4 only for now. IPv6 NAT exit support can extend this later
+    by widening `ip_address` to `ip_address(...)` and accepting any
+    version, but the storage column is sized for IPv4.
+    """
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    try:
+        from ipaddress import IPv4Address
+        return str(IPv4Address(s))
+    except (ValueError, TypeError):
+        log.warning("connect_ip_override refused: not a valid IPv4: %r", s)
+        return ""
 
 
 def _bump_access_refreshed(tenant_id: int, engine_name: str,
@@ -1659,11 +1861,18 @@ def credentials_list():
     if domain_id is None:
         creds, accesses = [], []
     else:
+        # M7 (audit fix-up, 2026-05-09): eager-load Domain → ApiKey on
+        # accesses. Without this, the source-IP drift loop below does
+        # one lazy SELECT per access row for `access.domain.api_key` —
+        # N+1 on a multi-engine Domain.
+        from sqlalchemy.orm import joinedload
         creds = (DhcpEngineCredential.query
                  .filter_by(domain_id=domain_id)
                  .order_by(DhcpEngineCredential.engine_name,
                            DhcpEngineCredential.node_index).all())
         accesses = (DhcpEngineSshAccess.query
+                    .options(joinedload(DhcpEngineSshAccess.domain)
+                             .joinedload(Domain.api_key))
                     .filter_by(domain_id=domain_id)
                     .order_by(DhcpEngineSshAccess.engine_name).all())
     # Domain-Scoping fix: the credentials wizard only ever needs the ONE
@@ -1684,6 +1893,22 @@ def credentials_list():
                    .filter_by(id=bound_tenant_id, is_active=True)
                    .all())
     tenants_by_id = {t.id: t for t in tenants}
+    # Operator-facing label override — the dropdown / source-IP table
+    # show the active *Domain* identity instead of the bound Tenant
+    # name. Reason: when the admin form's "find-or-create on smc_url"
+    # reuses an existing Tenant (i.e. when several Domains live on one
+    # Forcepoint SMC instance), the dropdown otherwise renders the
+    # reused Tenant's name and operators mistake it for the wrong
+    # Domain — they expect the value to match the topbar selector.
+    # The form's hidden tenant_id value stays unchanged, so the AJAX
+    # cascade keeps working.
+    domain_label = ""
+    domain_smc = ""
+    if domain_obj is not None:
+        domain_label = (domain_obj.display_name
+                        or domain_obj.slug
+                        or f"domain#{domain_obj.id}")
+        domain_smc = domain_obj.smc_domain_name or ""
     # Phase B.3: group credentials by (domain_id, engine) — the canonical
     # scope FK on every feature row.
     creds_by_engine: dict[tuple[int, str], list] = {}
@@ -1723,6 +1948,8 @@ def credentials_list():
         source_drift_by_engine=source_drift_by_engine,
         cache_ttl_hours=CACHE_TTL_HOURS,
         tenants=tenants,
+        domain_label=domain_label,
+        domain_smc=domain_smc,
     )
 
 
@@ -1930,6 +2157,63 @@ def credentials_discover_nodes():
         with smc_session(cfg):
             nodes = list_cluster_nodes(engine_name)
             node_initiated = is_node_initiated_contact(engine_name)
+            # P1 pre-flight — SMC-side SSH state per node, queried in
+            # the same session so it's free. Wizard renders it as a
+            # badge BEFORE the operator clicks Auto-enroll.
+            from webapp.smc_dhcp_client import get_node_ssh_state
+            ssh_state_by_index: dict[int, dict] = {}
+            for n in nodes:
+                try:
+                    ssh_state_by_index[n.node_index] = get_node_ssh_state(
+                        engine_name, n.node_index,
+                    )
+                except Exception as exc:
+                    ssh_state_by_index[n.node_index] = {
+                        "state": "unknown", "source": "",
+                        "raw_signals": {},
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+            # Auth-method probe per node — tells the operator whether
+            # the engine accepts password auth BEFORE they click
+            # Auto-enroll. Dial host honors the NAT override; falls
+            # back to primary mgt IP otherwise. Probe is opportunistic
+            # (3s timeout) so a slow/offline node doesn't hang Discover.
+            from webapp.dhcp_ssh import (
+                SSHTarget as _SSHTarget, probe_ssh_auth_methods,
+            )
+            auth_methods_by_index: dict[int, dict] = {}
+            for n in nodes:
+                # Pick the most likely-reachable IP for the probe.
+                probe_ip = ""
+                for a in n.addresses:
+                    publics = [c["address"] for c in a.contact_addresses
+                               if c.get("is_public") and c.get("address")]
+                    if publics and a.is_primary_mgt:
+                        probe_ip = publics[0]
+                        break
+                if not probe_ip:
+                    probe_ip = n.primary_address or ""
+                if not probe_ip:
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": [], "error": "no candidate IP",
+                        "probe_host": "",
+                    }
+                    continue
+                try:
+                    methods, err = probe_ssh_auth_methods(
+                        _SSHTarget(hostname=probe_ip, port=22,
+                                   username="root"),
+                        timeout=3,
+                    )
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": methods, "error": err,
+                        "probe_host": probe_ip,
+                    }
+                except Exception as exc:
+                    auth_methods_by_index[n.node_index] = {
+                        "methods": [], "error": f"{type(exc).__name__}: {exc}",
+                        "probe_host": probe_ip,
+                    }
             try:
                 policy_name = find_active_policy(engine_name)
             except Exception as exc:
@@ -1980,9 +2264,40 @@ def credentials_discover_nodes():
                     "network_value": a.network_value,
                     "is_primary_mgt": a.is_primary_mgt,
                     "is_outgoing": a.is_outgoing,
+                    # P1 — surface per-interface contact addresses so the
+                    # UI can offer a connect-IP override when 1:1 NAT
+                    # exposes a public exit address on this NDI.
+                    "reverse_connection": a.reverse_connection,
+                    "contact_addresses": a.contact_addresses,
                 } for a in n.addresses if a.address
             ]
             suggested = "" if node_initiated else n.primary_address
+
+            # P1 — compute the suggested *connect IP override* per the
+            # A+C rule the operator picked (2026-05-12):
+            #   A) If the primary-mgt interface has a public contact
+            #      address, default to that public address.
+            #   C) Otherwise no auto-pick — the UI shows the picker and
+            #      the operator chooses, OR leaves it blank (= today's
+            #      behavior, dial the real interface IP).
+            #
+            # `reachable_via_nat` is the node-level summary: True iff at
+            # least one NDI has at least one public contact address.
+            # Drives the per-node banner regardless of cluster contact
+            # mode.
+            suggested_connect_ip = ""
+            reachable_via_nat = False
+            primary_public_contact = ""
+            for a in n.addresses:
+                publics = [c for c in a.contact_addresses if c.get("is_public")]
+                if publics:
+                    reachable_via_nat = True
+                    if a.is_primary_mgt and not primary_public_contact:
+                        primary_public_contact = publics[0]["address"]
+            # Rule A: only auto-pick when it's the primary-mgt interface's
+            # public contact address — that's what SMC itself dials.
+            if primary_public_contact:
+                suggested_connect_ip = primary_public_contact
 
             # Live cred test — drives the per-node UI in the wizard.
             # Status one of:
@@ -1996,9 +2311,7 @@ def credentials_discover_nodes():
                 cred_status = "not_enrolled"
                 cred_status_reason = ""
             else:
-                target = SSHTarget(hostname=enrolled.hostname,
-                                   port=enrolled.ssh_port,
-                                   username=enrolled.ssh_username)
+                target = _cred_to_target(enrolled)
                 payload = SSHCredential(
                     password=enrolled.encrypted_password,
                     host_fingerprint=enrolled.host_fingerprint,
@@ -2034,6 +2347,31 @@ def credentials_discover_nodes():
                 # Status-aware fields used by the new wizard:
                 "cred_status": cred_status,
                 "cred_status_reason": cred_status_reason,
+                # P1 — connect-IP override (NAT-aware).
+                "reachable_via_nat": reachable_via_nat,
+                "primary_public_contact": primary_public_contact,
+                "suggested_connect_ip": suggested_connect_ip,
+                # P1 — SMC-side SSH state (pre-flight). Wizard renders
+                # a badge so the operator can spot a disabled daemon
+                # BEFORE clicking Auto-enroll.
+                "ssh_state": ssh_state_by_index.get(n.node_index, {}).get("state", "unknown"),
+                "ssh_state_source": ssh_state_by_index.get(n.node_index, {}).get("source", ""),
+                "ssh_state_error": ssh_state_by_index.get(n.node_index, {}).get("error", ""),
+                # 2026-05-13 — auth-method probe. Catches engines
+                # hardened to publickey-only BEFORE we burn a password
+                # rotation. Empty list + non-empty error = probe couldn't
+                # talk to the daemon (TCP / banner failure).
+                "ssh_auth_methods": auth_methods_by_index.get(n.node_index, {}).get("methods", []),
+                "ssh_auth_methods_error": auth_methods_by_index.get(n.node_index, {}).get("error", ""),
+                "ssh_auth_methods_probe_host": auth_methods_by_index.get(n.node_index, {}).get("probe_host", ""),
+                # Echo the persisted override, if any. Phase 5 fills this
+                # when the operator confirms during enrollment; this read
+                # path lets the UI show the current override on a node
+                # the operator is re-visiting.
+                "connect_ip_override": (
+                    getattr(enrolled, "connect_ip_override", "") or ""
+                    if enrolled else ""
+                ),
             })
 
         # Aggregate destination-IP picker for the rule install:
@@ -2083,9 +2421,16 @@ def credentials_discover_nodes():
         else:
             source_drift_state = "sources_drift"
 
+        # P1 cluster-level summary: True iff ANY node has a public
+        # contact address. Drives the cluster banner ("Node-initiated
+        # but reachable via NAT for the nodes below").
+        cluster_reachable_via_nat = any(n.get("reachable_via_nat")
+                                        for n in out_nodes)
+
         return jsonify({
             "nodes": out_nodes,
             "node_initiated_contact": node_initiated,
+            "cluster_reachable_via_nat": cluster_reachable_via_nat,
             "rule_destinations": rule_destinations,
             "policy_name": policy_name,
             "policy_error": policy_error,
@@ -2714,6 +3059,12 @@ def credentials_bootstrap():
     hostname = request.form["hostname"].strip()
     ssh_port = int(request.form.get("ssh_port", "22"))
     ssh_username = request.form.get("ssh_username", "root").strip() or "root"
+    # P1: optional NAT-exit IP the wizard offers when the node is
+    # node-initiated but has a public contact address. Validated by
+    # `_validate_connect_ip_override` so the form can't smuggle in a
+    # bogus value.
+    connect_ip_override = _validate_connect_ip_override(
+        request.form.get("connect_ip_override", ""))
 
     wants_json = (
         request.headers.get("X-Requested-With") == "XMLHttpRequest"
@@ -2728,9 +3079,14 @@ def credentials_bootstrap():
         flash("Tenant or API key not found.", "danger")
         return redirect(url_for("dhcp.credentials_list"))
 
-    target = SSHTarget(hostname=hostname, port=ssh_port, username=ssh_username)
+    # P1: SSH dial uses the override when set; the SMC SSH-allow rule
+    # destination keeps using `hostname` (engine's real interface IP).
+    dial_host = connect_ip_override or hostname
+    target = SSHTarget(hostname=dial_host, port=ssh_port, username=ssh_username)
     cfg = _smc_cfg(tenant, api_key)
-    target_label = f"{engine_name}/node{node_index}@{hostname}"
+    target_label = f"{engine_name}/node{node_index}@{dial_host}"
+    if connect_ip_override:
+        target_label += f" (real={hostname})"
     audit = _audit_comment("auto-enrollment", engine_name)
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
 
@@ -2780,6 +3136,7 @@ def credentials_bootstrap():
             existing.last_verify_status = "ok"
             existing.last_error = ""
             existing.state_refreshed_at = now
+            existing.connect_ip_override = connect_ip_override
         else:
             db.session.add(DhcpEngineCredential(
                 domain_id=domain_id,
@@ -2791,6 +3148,7 @@ def credentials_bootstrap():
                 host_fingerprint=result.host_fingerprint,
                 last_verified_at=now, last_verify_status="ok",
                 state_refreshed_at=now,
+                connect_ip_override=connect_ip_override,
             ))
         # Enrollment proves both SSH (we connected to the node) and the
         # rule (it must have been in policy for the connect to work) —
@@ -2799,6 +3157,23 @@ def credentials_bootstrap():
         db.session.commit()
         _log_activity("ssh", "bootstrap", "ok", target_label,
                       f"fingerprint={result.host_fingerprint}")
+        # P1: dedicated audit row when a NAT override is in effect so
+        # operators can grep `/logs?feature=dhcp&action=credential.enrolled_via_nat`
+        # to see which nodes are being reached via 1:1 NAT.
+        if connect_ip_override:
+            try:
+                from shared.logging import audit
+                audit(
+                    feature="dhcp",
+                    action="credential.enrolled_via_nat",
+                    target=target_label,
+                    detail=(f"real_ip={hostname} "
+                            f"connect_ip={connect_ip_override} "
+                            f"node_index={node_index}"),
+                    domain_id=domain_id,
+                )
+            except Exception:
+                pass
         if wants_json:
             return jsonify(
                 ok=True,
@@ -2864,6 +3239,10 @@ def credentials_apply():
     except ValueError:
         new_port = 22
     new_username = (request.form.get("ssh_username") or "root").strip() or "root"
+    # P1: pick up the override from the wizard; empty / invalid → ""
+    # (= today's behavior, dial new_hostname).
+    new_connect_ip_override = _validate_connect_ip_override(
+        request.form.get("connect_ip_override", ""))
 
     # Phase B.3: tenant_id is going away on feature tables.
     _dids = _domain_ids_for_tenant(tenant_id)
@@ -2876,13 +3255,17 @@ def credentials_apply():
         return _err(f"No credential on record for {engine_name}/node_id={node_id}. "
                     f"Use Auto-enroll instead.", http=404)
 
-    target_label = f"{engine_name}/node{cred.node_index}@{new_hostname}"
+    # P1: SSH dial uses override; rule destination stays real IP.
+    dial_host = new_connect_ip_override or new_hostname
+    target_label = f"{engine_name}/node{cred.node_index}@{dial_host}"
+    if new_connect_ip_override:
+        target_label += f" (real={new_hostname})"
 
     # Live verify against the new target before committing. Apply must
     # never silently break a previously-working credential — if the
     # operator points us at an IP that doesn't actually accept this
     # credential, refuse and tell them to use Overwrite.
-    target = SSHTarget(hostname=new_hostname, port=new_port,
+    target = SSHTarget(hostname=dial_host, port=new_port,
                        username=new_username)
     payload = SSHCredential(password=cred.encrypted_password,
                             host_fingerprint=cred.host_fingerprint)
@@ -2906,10 +3289,12 @@ def credentials_apply():
     # All good — commit metadata.
     now = datetime.now(timezone.utc)
     old_summary = (f"hostname={cred.hostname!r} port={cred.ssh_port} "
-                   f"user={cred.ssh_username!r}")
+                   f"user={cred.ssh_username!r} "
+                   f"override={cred.connect_ip_override!r}")
     cred.hostname = new_hostname
     cred.ssh_port = new_port
     cred.ssh_username = new_username
+    cred.connect_ip_override = new_connect_ip_override
     cred.last_verified_at = now
     cred.last_verify_status = "ok"
     cred.last_error = ""
@@ -3005,6 +3390,11 @@ def credentials_bootstrap_batch():
                 "hostname":   host,
                 "port":       int(request.form.get(prefix + "ssh_port", "22")),
                 "username":   request.form.get(prefix + "ssh_username", "root").strip() or "root",
+                # P1: per-node override carried alongside the rest of
+                # the spec.  Validated defensively here so a bad value
+                # for one node doesn't poison the whole batch.
+                "connect_ip_override": _validate_connect_ip_override(
+                    request.form.get(prefix + "connect_ip_override", "")),
             })
         except (KeyError, ValueError) as exc:
             _log_activity("ssh", "bootstrap_batch", "failed",
@@ -3021,14 +3411,19 @@ def credentials_bootstrap_batch():
         with engine_bootstrap_lock(engine_name, timeout=180):
             with smc_session(cfg):
                 for spec in specs:
-                    target_label = f"{engine_name}/node{spec['node_index']}@{spec['hostname']}"
-                    target = SSHTarget(hostname=spec["hostname"], port=spec["port"],
+                    # P1: dial via override; rule destination stays real IP.
+                    dial_host = spec["connect_ip_override"] or spec["hostname"]
+                    target_label = f"{engine_name}/node{spec['node_index']}@{dial_host}"
+                    if spec["connect_ip_override"]:
+                        target_label += f" (real={spec['hostname']})"
+                    target = SSHTarget(hostname=dial_host, port=spec["port"],
                                        username=spec["username"])
                     res_entry: dict = {
                         "node_index": spec["node_index"],
                         "node_id":    spec["node_id"],
                         "node_name":  spec["node_name"],
                         "hostname":   spec["hostname"],
+                        "connect_ip_override": spec["connect_ip_override"],
                     }
                     try:
                         result = enroll_node(
@@ -3080,6 +3475,7 @@ def credentials_bootstrap_batch():
                         existing.last_verify_status = "ok"
                         existing.last_error = ""
                         existing.state_refreshed_at = now
+                        existing.connect_ip_override = spec["connect_ip_override"]
                     else:
                         db.session.add(DhcpEngineCredential(
                             domain_id=domain_id,
@@ -3093,6 +3489,7 @@ def credentials_bootstrap_batch():
                             host_fingerprint=result.host_fingerprint,
                             last_verified_at=now, last_verify_status="ok",
                             state_refreshed_at=now,
+                            connect_ip_override=spec["connect_ip_override"],
                         ))
                     db.session.commit()
                     successes += 1
@@ -3466,23 +3863,85 @@ def scope_leases(scope_id):
             subnet_size=subnet_size_running,
             creds_missing=creds_missing,
             other_domain_creds=other_domain_creds,
+            leases_cache_meta=None,
+        )
+
+    # H4 (audit fix-up, 2026-05-09): parallel + cached per-node fetch.
+    # Was: sequential SSH read per node × 2-4s = 10-15s on a 4-node cluster
+    # blocking the request thread. Now: fan out via ThreadPoolExecutor;
+    # each node's parsed leases cache for 120s in section `dhcp.leases`,
+    # key (domain_id, engine_name, node_index). Concurrent page loads
+    # across operators share the cache. ?refresh=1 forces re-fetch.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from shared.smc_cache import cache_get_or_fetch
+
+    refresh = (request.args.get("refresh") == "1")
+
+    def _fetch_node_leases_cached(cred):
+        """Fetch + parse one node's lease file, cached for 120s.
+
+        Cache TTL is intentionally tighter than the platform Quick (1h)
+        / Loose (24h) tiers — leases rotate as DHCP clients renew, and
+        operators visit this page WHILE diagnosing live network state.
+        Two minutes is enough to make rapid scope-pivot navigation feel
+        instant without serving genuinely stale data.
+        """
+        def _fetcher():
+            target = _cred_to_target(cred)
+            payload = _cred_to_payload(cred)
+            raw = ssh_get_file(target, payload, LEASE_FILE)
+            return parse_dhcpd_leases(raw.decode(errors="replace"))
+        return cache_get_or_fetch(
+            section="dhcp.leases",
+            key_parts=(cred.domain_id, cred.engine_name, cred.node_index),
+            fetcher=_fetcher,
+            ttl=120,
+            refresh=refresh,
         )
 
     per_node_results: dict[int, list] = {}
     fetch_errors: dict[int, str] = {}
-    for cred in creds:
-        target = _cred_to_target(cred)
-        payload = _cred_to_payload(cred)
-        try:
-            raw = ssh_get_file(target, payload, LEASE_FILE)
-            per_node_results[cred.node_index] = parse_dhcpd_leases(raw.decode(errors="replace"))
-            _log_activity("ssh", "read_leases", "ok",
-                          f"{cred.engine_name}/node{cred.node_index}",
-                          f"{len(per_node_results[cred.node_index])} lease blocks")
-        except Exception as exc:
-            fetch_errors[cred.node_index] = str(exc)
-            _log_activity("ssh", "read_leases", "failed",
-                          f"{cred.engine_name}/node{cred.node_index}", str(exc))
+    node_cache_meta: list = []  # CachedValue per successful node
+
+    if creds:
+        # max_workers=8 covers the largest cluster we've seen; on small
+        # clusters Python clamps to len(creds) automatically anyway.
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(creds))),
+                                thread_name_prefix="dhcp-leases") as pool:
+            futures = {pool.submit(_fetch_node_leases_cached, c): c
+                       for c in creds}
+            for fut in as_completed(futures):
+                cred = futures[fut]
+                try:
+                    cached = fut.result()
+                    per_node_results[cred.node_index] = cached.data
+                    node_cache_meta.append(cached)
+                    if not cached.served_from_cache:
+                        _log_activity(
+                            "ssh", "read_leases", "ok",
+                            f"{cred.engine_name}/node{cred.node_index}",
+                            f"{len(cached.data)} lease blocks"
+                            f"{' (refreshed)' if refresh else ''}",
+                        )
+                except Exception as exc:
+                    fetch_errors[cred.node_index] = str(exc)
+                    _log_activity(
+                        "ssh", "read_leases", "failed",
+                        f"{cred.engine_name}/node{cred.node_index}", str(exc),
+                    )
+
+    # Aggregate freshness for the badge — page is "fresh" only when EVERY
+    # node was just re-fetched; otherwise show the oldest cached_at so the
+    # operator sees the worst-case staleness.
+    if node_cache_meta:
+        oldest = min(node_cache_meta, key=lambda c: c.cached_at)
+        leases_cache_meta = {
+            "served_from_cache": all(m.served_from_cache for m in node_cache_meta),
+            "age_seconds": int(oldest.age_seconds),
+            "cached_at": oldest.cached_at,
+        }
+    else:
+        leases_cache_meta = None
 
     merged = merge_cluster_leases(per_node_results) if per_node_results else []
 
@@ -3703,6 +4162,7 @@ def scope_leases(scope_id):
         subnet_size=subnet_size,
         creds_missing=creds_missing,
         other_domain_creds=other_domain_creds,
+        leases_cache_meta=leases_cache_meta,
     )
 
 
@@ -4377,7 +4837,9 @@ def api_tenant_engines(tenant_id, key_id):
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
         return jsonify({"error": "Not found"}), 404
-    cfg = _smc_cfg(tenant, api_key)
+    # `domain_objects.engines` calls `smc_client.smc_session(cfg)` which
+    # expects a DICT-shaped cfg, not the SMCConfig dataclass.
+    cfg = _smc_cfg_dict(tenant, api_key)
     try:
         # Phase 0 cross-feature reuse: hit the same ``engines`` cache
         # section that /engines/clusters populates. Visiting Clusters
@@ -4421,6 +4883,224 @@ def api_engine_interfaces_debug(tenant_id, key_id, engine_name):
         return jsonify({"error": smc_error_detail(exc)}), 500
 
 
+@dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/contact-addresses/debug")
+@admin_required
+def api_engine_contact_addresses_debug(tenant_id, key_id, engine_name):
+    """P1 diagnostic — dump every contact address FEA sees for this engine.
+
+    Surfaces all three sources so the operator can pinpoint which one
+    SMC actually carries the public IP on:
+
+      * ``engine_level`` — what ``engine.contact_addresses`` returns,
+        keyed by ``(interface_id, interface_ip)``.
+      * ``inline_per_interface`` — what we extract from each
+        IPv4 / IPv6 interface's own ``contact_addresses`` block inside
+        the physical_interface payload.
+      * ``joined_nodes`` — the final per-node view after `list_cluster_nodes`
+        merges the two sources. This is what the credentials wizard
+        consumes.
+
+    Hit URL (substitute IDs):
+      ``/dhcp/api/tenants/<tid>/api-keys/<kid>/engines/<engine>/contact-addresses/debug``
+
+    Returns JSON only — paste it back so we can confirm SMC's payload
+    shape matches the parser without touching prod data.
+    """
+    guard = _assert_active_domain_match(tenant_id, key_id)
+    if guard is not None:
+        return guard
+    tenant = db.session.get(Tenant, tenant_id)
+    api_key = db.session.get(ApiKey, key_id)
+    if not tenant or not api_key:
+        return jsonify({"error": "Not found"}), 404
+    cfg = _smc_cfg(tenant, api_key)
+    try:
+        from smc.core.engine import Engine
+        from webapp.smc_dhcp_client import (
+            _build_contact_address_map, _parse_inline_contact_addresses,
+            list_cluster_nodes,
+        )
+        with smc_session(cfg):
+            engine = Engine(engine_name)
+
+            # 1) Engine-level map (the SDK's `engine.contact_addresses`).
+            # Capture EVERY attribute on each ContactAddressNode so we can
+            # see what SMC actually serializes regardless of SDK version.
+            try:
+                engine_level_raw = []
+                for ca in engine.contact_addresses:
+                    entry = {}
+                    # All public-ish attributes we recognize:
+                    for key in ("interface_id", "interface_ip", "location",
+                                "location_ref", "location_name", "dynamic",
+                                "addresses", "address"):
+                        try:
+                            v = getattr(ca, key, None)
+                            if v is None:
+                                continue
+                            if isinstance(v, (list, tuple, set)):
+                                entry[key] = [str(x) for x in v]
+                            else:
+                                entry[key] = str(v)
+                        except Exception as exc:
+                            entry[f"{key}__error"] = str(exc)
+                    # Materialise ca.data (the ElementCache) into a
+                    # real dict so the diagnostic shows the on-wire
+                    # JSON, not just `<ElementCache at 0x...>`.
+                    # Accessing ca.data triggers the lazy fetch the
+                    # first time round.
+                    try:
+                        raw = getattr(ca, "data", None)
+                        if raw is not None:
+                            if hasattr(raw, "data") and isinstance(raw.data, dict):
+                                entry["__raw_data"] = dict(raw.data)
+                            else:
+                                try:
+                                    entry["__raw_data"] = dict(raw)
+                                except (TypeError, ValueError):
+                                    entry["__raw_data_repr"] = str(raw)
+                    except Exception as exc:
+                        entry["__raw_data_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    entry["__class__"] = type(ca).__name__
+                    # Also surface the wrapper's public attributes so
+                    # we can see whether `addresses` etc. exist.
+                    try:
+                        entry["__public_attrs"] = sorted(
+                            a for a in dir(ca)
+                            if not a.startswith("_")
+                            and not callable(getattr(ca, a, None))
+                        )
+                    except Exception:
+                        pass
+                    engine_level_raw.append(entry)
+            except Exception as exc:
+                engine_level_raw = [{"error": str(exc),
+                                     "exc_type": type(exc).__name__}]
+            engine_level_parsed = _build_contact_address_map(engine)
+
+            # 1a) Raw engine payload — slice down to anything that might
+            # carry contact addresses, so we don't blast the operator
+            # with a 50 KB dump but still get a clear picture.
+            raw_engine_subset = {}
+            try:
+                eng_data = (engine.data.data if hasattr(engine.data, "data")
+                            else dict(engine.data))
+                # Look for any top-level key containing "contact" — that
+                # surfaces whatever SMC serialized regardless of how the
+                # SDK chose to expose it.
+                raw_engine_subset = {
+                    k: v for k, v in eng_data.items()
+                    if "contact" in k.lower()
+                }
+                # Also dump the link relations so we can see if there's
+                # a `contact_addresses` sub-resource the SDK should be
+                # fetching (and tell whether we're hitting it).
+                links = []
+                for ln in (eng_data.get("link") or []):
+                    rel = ln.get("rel") or ""
+                    if "contact" in rel.lower():
+                        links.append(ln)
+                if links:
+                    raw_engine_subset["__contact_links"] = links
+            except Exception as exc:
+                raw_engine_subset = {"error": str(exc),
+                                     "exc_type": type(exc).__name__}
+
+            # 2) Inline-per-interface — walk each physical_interface
+            # payload looking for inline `contact_addresses` blocks.
+            inline_per_interface = []
+            for phys in engine.physical_interface:
+                try:
+                    data = (phys.data.data if hasattr(phys.data, "data")
+                            else dict(phys.data))
+                except Exception:
+                    continue
+                _collect_inline_contacts(data, "", inline_per_interface,
+                                        _parse_inline_contact_addresses)
+
+            # 3) Joined view — what the wizard ends up seeing. Also
+            # includes the per-node SSH-daemon state probe with
+            # verbose=True so EVERY field SMC returns (not just those
+            # whose name contains "ssh") shows up in raw_signals. We
+            # need this dump to figure out which field SMC 7.1
+            # actually carries the daemon state in.
+            from webapp.smc_dhcp_client import get_node_ssh_state
+            joined_nodes = []
+            for n in list_cluster_nodes(engine_name):
+                joined_nodes.append({
+                    "node_index": n.node_index,
+                    "node_id": n.node_id,
+                    "name": n.name,
+                    "ssh_state": get_node_ssh_state(
+                        engine_name, n.node_index, verbose=True,
+                    ),
+                    "addresses": [
+                        {
+                            "interface_id": a.interface_id,
+                            "address": a.address,
+                            "is_primary_mgt": a.is_primary_mgt,
+                            "reverse_connection": a.reverse_connection,
+                            "contact_addresses": a.contact_addresses,
+                        }
+                        for a in n.addresses
+                    ],
+                })
+
+        return jsonify({
+            "engine_name": engine_name,
+            "engine_level": {
+                "raw_from_sdk": engine_level_raw,
+                "parsed_map": {
+                    f"{k[0]}@{k[1]}": v
+                    for k, v in engine_level_parsed.items()
+                },
+            },
+            "raw_engine_payload_contact_keys": raw_engine_subset,
+            "inline_per_interface": inline_per_interface,
+            "joined_nodes": joined_nodes,
+        })
+    except Exception as exc:
+        log.exception("contact-addresses debug failed")
+        return jsonify({"error": smc_error_detail(exc)}), 500
+
+
+def _collect_inline_contacts(level_payload: dict, parent_iface_id: str,
+                             out_list: list, parser) -> None:
+    """Recurse the physical_interface payload, append every inline-
+    contact-address occurrence with its interface_id path so the
+    diagnostic JSON shows exactly where SMC keeps the public IP.
+    """
+    iface_id = (parent_iface_id
+                or str(level_payload.get("interface_id") or ""))
+    for entry in level_payload.get("interfaces", []) or []:
+        for inner_kind, inner in entry.items():
+            if inner_kind not in ("single_node_interface", "node_interface"):
+                continue
+            if not isinstance(inner, dict):
+                continue
+            parsed = parser(inner)
+            if not parsed:
+                continue
+            out_list.append({
+                "interface_id": iface_id,
+                "inner_kind": inner_kind,
+                "real_ip": inner.get("address") or "",
+                "nodeid": inner.get("nodeid"),
+                "raw_inline": inner.get("contact_addresses")
+                              or inner.get("contact_address"),
+                "parsed": parsed,
+            })
+    vlans = (level_payload.get("vlanInterfaces")
+             or level_payload.get("vlan_interfaces") or [])
+    for vlan_wrap in vlans:
+        vlan = vlan_wrap.get("physical_interface") or vlan_wrap
+        vlan_raw_id = vlan.get("interface_id", "")
+        combined = f"{iface_id}.{vlan_raw_id}" if vlan_raw_id else iface_id
+        _collect_inline_contacts(vlan, combined, out_list, parser)
+
+
 @dhcp_bp.route("/api/tenants/<int:tenant_id>/api-keys/<int:key_id>/engines/<engine_name>/scopes")
 @admin_required
 def api_engine_scopes(tenant_id, key_id, engine_name):
@@ -4437,11 +5117,14 @@ def api_engine_scopes(tenant_id, key_id, engine_name):
     api_key = db.session.get(ApiKey, key_id)
     if not tenant or not api_key:
         return jsonify({"error": "Not found"}), 404
+    # Two cfg shapes: domain_objects.* takes a DICT (smc_client backend);
+    # smc_session below takes the SMCConfig DATACLASS (smc_tls_client backend).
     cfg = _smc_cfg(tenant, api_key)
+    cfg_dict = _smc_cfg_dict(tenant, api_key)
     try:
         from webapp import domain_objects
         domain = getattr(g, "domain", None)
-        scope_dicts, _cv = domain_objects.scopes(domain, cfg, engine_name)
+        scope_dicts, _cv = domain_objects.scopes(domain, cfg_dict, engine_name)
         # Cluster-node list isn't cache-shared yet (different shape than
         # cluster_detail's nodes — this one returns NDI primary addresses).
         # Keep live for now.

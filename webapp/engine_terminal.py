@@ -30,7 +30,7 @@ from flask import url_for, redirect, request, render_template, current_app
 
 from shared.db import db
 from webapp.models import (
-    DhcpEngineCredential, EngineTerminalSession, User,
+    DhcpEngineCredential, EngineTerminalSession, User, Domain,
 )
 
 log = logging.getLogger(__name__)
@@ -225,6 +225,28 @@ def _user_row(email: str) -> User | None:
     return User.query.filter_by(email=email.lower().strip()).first()
 
 
+def _active_domain_id_for_ws() -> int | None:
+    """Resolve the active Domain id from the Flask session.
+
+    The WebSocket handshake doesn't always carry the same request-scope
+    state as a normal HTTP route (Flask-Sock skips the app-level
+    ``before_request`` hooks in some configurations), so we resolve
+    ``Domain.slug`` from the session directly instead of relying on
+    ``g.domain``. Returns None when no active profile is set — callers
+    treat that as "no scope", which fails the Domain check unless the
+    user is Super Admin.
+    """
+    profile = flask_session.get("active_profile") or {}
+    slug = profile.get("tenant")
+    if not slug:
+        return None
+    try:
+        d = Domain.query.filter_by(slug=slug).first()
+        return d.id if d is not None else None
+    except Exception:
+        return None
+
+
 # ── Route registration ───────────────────────────────────────────────────
 
 def register_routes(app):
@@ -260,6 +282,31 @@ def register_routes(app):
             log.warning("[term-ws] cred %s not found — closing 4404", cred_id)
             ws.close(reason=4404, message="credential not found")
             return
+
+        # C4: Domain-Scoping — Domain Admin in Domain A must not SSH
+        # into Domain B's engines via a cred_id from another Domain.
+        # Super Admin is exempt (cross-Domain ops are their job). We
+        # close with the same 4404 "not found" code so we don't leak
+        # the existence of credentials in other Domains.
+        #
+        # WebSocket handshakes don't hit Flask's request lifecycle the
+        # same way HTTP routes do — `g.domain` isn't always populated
+        # by the time we land here. Resolve from the session profile
+        # slug ourselves so the gate fires reliably on every connect.
+        active_did = _active_domain_id_for_ws()
+        user_for_check = _user_row(email)
+        is_super = bool(user_for_check and user_for_check.is_super_admin)
+        if (cred.domain_id is not None
+                and cred.domain_id != active_did
+                and not is_super):
+            log.warning(
+                "[term-ws] cross-Domain access blocked — user=%s "
+                "active_domain=%s cred.domain_id=%s engine=%s — closing 4404",
+                email, active_did, cred.domain_id, cred.engine_name,
+            )
+            ws.close(reason=4404, message="credential not found")
+            return
+
         if cred.last_verify_status != "ok":
             log.warning("[term-ws] cred %s status=%s — closing 4424",
                         cred_id, cred.last_verify_status)

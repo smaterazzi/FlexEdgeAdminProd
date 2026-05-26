@@ -64,7 +64,8 @@ __all__ = [
     "host_get",
     "DhcpScopeInfo", "DhcpClusterNode", "DhcpHostView", "NodeAddress",
     "is_node_initiated_contact",
-    "set_node_ssh_enabled", "change_node_ssh_password",
+    "set_node_ssh_enabled", "change_node_ssh_password", "get_node_ssh_state",
+    "update_ssh_rule_destinations",
     "find_active_policy", "find_ssh_access_rule",
     "add_ssh_access_rule", "remove_ssh_access_rule",
     "policy_upload",
@@ -741,6 +742,15 @@ class NodeAddress:
     is_primary_mgt: bool = False
     is_outgoing: bool = False
     is_dynamic: bool = False      # True for DHCP-assigned (not a stable target)
+    # P1 — contact-address awareness. `reverse_connection=True` on the
+    # primary-mgt interface marks the cluster as node-initiated; that
+    # alone says nothing about whether FEA can reach this specific
+    # interface from outside. `contact_addresses` holds any per-location
+    # NAT exit IPs SMC has registered for this NDI — populated by
+    # `list_cluster_nodes` from `engine.contact_addresses`. Each entry:
+    #   {"address": str, "location": str, "is_public": bool, "dynamic": bool}
+    reverse_connection: bool = False
+    contact_addresses: list = field(default_factory=list)
 
 
 @dataclass
@@ -752,6 +762,128 @@ class DhcpClusterNode:
     status: str = ""
     addresses: list = field(default_factory=list)    # list[NodeAddress]
     primary_address: str = ""     # the SMC-managed primary mgmt IP (auto target)
+
+
+def _classify_public(addr: str) -> bool:
+    """True iff ``addr`` parses as a globally routable IP (IPv4 or IPv6).
+
+    Matches the engine-level classifier in `_build_contact_address_map`
+    so per-interface and engine-level contact addresses converge on the
+    same public/private rule.
+    """
+    try:
+        import ipaddress
+        return bool(ipaddress.ip_address((addr or "").strip()).is_global)
+    except (ValueError, TypeError):
+        return False
+
+
+def _parse_bool_loose(val) -> bool:
+    """Coerce SMC's JSON ``dynamic`` field to a real Python bool.
+
+    The Forcepoint API serializes this as the **string** ``"false"`` /
+    ``"true"`` (observed against SMC 7.1 on 2026-05-12), and bare
+    ``bool(some_string)`` returns True for any non-empty string. Recognise
+    the textual forms here; fall back to ``bool(val)`` for the few
+    legitimate non-string falsy / truthy values (None, 0, 1, real bool).
+    """
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        return val.strip().lower() in ("true", "1", "yes", "on")
+    return bool(val)
+
+
+def _prettify_location(raw) -> str:
+    """Turn a SMC ``location_ref`` href into a short, human-readable label.
+
+    Input shapes seen in the wild:
+      * ``"https://.../elements/location/-1"`` → ``"Default"`` (SMC's
+        sentinel ID for the implicit Default location).
+      * ``"https://.../elements/location/63"`` → ``"location#63"``
+        (named locations need a second API call to resolve; the ID is
+        enough for the operator to cross-reference in the SMC GUI).
+      * Plain string already (e.g. ``"Default"``) → returned as-is.
+      * Anything else → stringified verbatim.
+    """
+    if raw is None:
+        return ""
+    s = str(raw).strip()
+    if not s:
+        return ""
+    if "://" not in s and "/" not in s:
+        # Already a plain label.
+        return s
+    tail = s.rsplit("/", 1)[-1] or s
+    if tail == "-1":
+        return "Default"
+    return f"location#{tail}" if tail else s
+
+
+def _parse_inline_contact_addresses(inner: dict) -> list[dict]:
+    """Extract contact addresses defined inline on an IPv4/IPv6 interface.
+
+    P1 (2026-05-12). Forcepoint NGFW SMC keeps contact addresses in two
+    places — the engine's General tab AND inside each IPv4/IPv6
+    interface's own properties. This helper handles only the inline
+    case; the engine-level case is merged in by
+    ``_build_contact_address_map`` after the walk.
+
+    Returns a list of normalized dicts compatible with what the
+    credentials wizard's per-node ``contact_addresses`` field expects::
+
+        [{"address": str, "location": str, "is_public": bool, "dynamic": bool}, ...]
+
+    Robust to shape drift: accepts ``list[dict]`` (the SDK's canonical
+    form), ``list[str]`` (older payloads), and bare ``str`` (very old
+    SMC payloads). Alien shapes are silently skipped — we log at
+    ``logger.debug`` so it shows up in `make dev` console without
+    spamming production.
+    """
+    raw = inner.get("contact_addresses")
+    # Some payloads pluralise differently or use ContactAddressNode
+    # as a singular field; try the alternates so we don't miss data.
+    if raw is None:
+        raw = inner.get("contact_address")
+    if not raw:
+        return []
+
+    out: list[dict] = []
+    items = raw if isinstance(raw, list) else [raw]
+    for item in items:
+        if isinstance(item, dict):
+            addr = str(item.get("address") or item.get("addr") or "").strip()
+            if not addr:
+                continue
+            # SMC API can carry `location_ref` (an Element href) and/or
+            # `location` (a human name). Surface whichever's present;
+            # `_prettify_location` shortens hrefs to "Default" /
+            # "location#NN" so the UI dropdown is readable.
+            location_raw = ""
+            for key in ("location", "location_name", "location_ref"):
+                v = item.get(key)
+                if v:
+                    location_raw = str(v)
+                    break
+            out.append({
+                "address": addr,
+                "location": _prettify_location(location_raw),
+                "is_public": _classify_public(addr),
+                "dynamic": _parse_bool_loose(item.get("dynamic")),
+            })
+        elif isinstance(item, str):
+            addr = item.strip()
+            if not addr:
+                continue
+            out.append({
+                "address": addr,
+                "location": "",
+                "is_public": _classify_public(addr),
+                "dynamic": False,
+            })
+        else:
+            logger.debug("inline contact_address: unknown shape %r", item)
+    return out
 
 
 def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
@@ -777,6 +909,26 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
             is_dynamic = bool(inner.get("dynamic"))
             if not address and not is_dynamic:
                 continue
+            # P1 — inline contact addresses (2026-05-12). SMC stores
+            # contact addresses in TWO places:
+            #   (a) engine-level via `engine.contact_addresses` — the
+            #       Engine → General tab. Joined onto NodeAddress
+            #       downstream by `_build_contact_address_map`.
+            #   (b) per-interface inline — under the IPv4/IPv6
+            #       interface's own properties, this lands directly
+            #       inside the NodeInterface JSON payload as a
+            #       `contact_addresses` array. The SDK's
+            #       `engine.contact_addresses` does NOT always
+            #       surface these (depending on SMC version + SDK
+            #       version), so we extract them here too.
+            #
+            # Observed shapes for the inline field:
+            #   list[dict]   — [{"address": "1.2.3.4", "dynamic": false,
+            #                    "location_ref": "https://..."}]   ← most common
+            #   list[str]    — ["1.2.3.4"]
+            #   str          — "1.2.3.4"  (very old SMC payloads)
+            # Defensive to all three; alien shapes are skipped.
+            inline_cas = _parse_inline_contact_addresses(inner)
             out.append(NodeAddress(
                 interface_id=iface_id,
                 address=address,
@@ -785,6 +937,14 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                 is_primary_mgt=bool(inner.get("primary_mgt")),
                 is_outgoing=bool(inner.get("outgoing")),
                 is_dynamic=is_dynamic,
+                # `reverse_connection=True` lives per-interface on the
+                # NodeInterface payload. Today only the primary_mgt
+                # interface carries it (= cluster is node-initiated),
+                # but we surface the raw flag per-interface so the UI
+                # can show "this specific NDI is the node-initiated
+                # channel" without re-walking.
+                reverse_connection=bool(inner.get("reverse_connection")),
+                contact_addresses=inline_cas,
             ))
 
     # VLAN children
@@ -841,6 +1001,139 @@ def is_node_initiated_contact(engine_name: str) -> bool:
     return False
 
 
+def _build_contact_address_map(engine) -> dict:
+    """Return ``{(interface_id, interface_ip): [ {address, location, is_public,
+    dynamic}, ... ]}`` from ``engine.contact_addresses``.
+
+    Forcepoint SMC keeps contact addresses at the *engine* level, keyed by
+    `(interface_id, interface_ip)` — each entry can carry several
+    addresses (one per Location, typically one of which is "Default").
+    This map gets joined onto each ``NodeAddress`` by the same key in
+    ``list_cluster_nodes`` below.
+
+    Empty / failure → empty dict so the caller never has to None-check.
+    """
+    out: dict = {}
+    try:
+        cas = list(engine.contact_addresses)
+    except Exception as exc:
+        # WARN, not INFO: an empty engine-level map is a real
+        # diagnostic signal for the credentials wizard's NAT picker —
+        # we want this visible in `make dev` console + production logs
+        # so the operator can correlate against the SMC GUI.
+        logger.warning("_build_contact_address_map(%s): SDK call raised "
+                       "%s: %s — contact-address NAT picker will see "
+                       "engine-level map as empty",
+                       getattr(engine, "name", "?"),
+                       type(exc).__name__, exc)
+        return out
+
+    for ca in cas:
+        # The SDK exposes ContactAddressNode as a wrapper whose only
+        # eagerly-set attributes are `interface_id` and `interface_ip`.
+        # The actual contact-address strings live in an ElementCache
+        # fetched lazily from `<engine>/contact_addresses` — accessing
+        # `ca.data` triggers the fetch and returns a dict-like view.
+        # We treat ca.data as the source of truth and fall back to
+        # the bare SDK attributes only if the cache is empty (very
+        # old SMC, or fetch error).
+        try:
+            iface_id = str(getattr(ca, "interface_id", "") or "")
+            iface_ip = str(getattr(ca, "interface_ip", "") or "")
+        except Exception:
+            continue
+        # Materialize the lazy cache. `dict(ca.data)` forces the
+        # underlying HTTP fetch the first time it's called.
+        raw_data: dict = {}
+        try:
+            raw = ca.data
+            # ElementCache → dict via .data attribute or dict() coercion.
+            if hasattr(raw, "data") and isinstance(raw.data, dict):
+                raw_data = dict(raw.data)
+            else:
+                try:
+                    raw_data = dict(raw)
+                except (TypeError, ValueError):
+                    raw_data = {}
+        except Exception as exc:
+            logger.warning(
+                "_build_contact_address_map(%s): could not materialise "
+                "ContactAddressNode.data for (%s, %s): %s",
+                getattr(engine, "name", "?"), iface_id, iface_ip, exc,
+            )
+            raw_data = {}
+
+        # iface_id / iface_ip may also live inside ca.data — prefer
+        # whichever is populated (lets us key correctly even if the
+        # SDK wrapper attributes are blank).
+        iface_id = iface_id or str(raw_data.get("interface_id") or "")
+        iface_ip = iface_ip or str(raw_data.get("interface_ip") or "")
+        if not iface_id and not iface_ip:
+            continue
+
+        bucket = out.setdefault((iface_id, iface_ip), [])
+
+        # Inner contact-address list — each entry typically looks like
+        # ``{"address": "20.250.134.1", "location_ref": "...", "dynamic": false}``.
+        # The key may be ``contact_addresses`` (plural, list) or
+        # ``contact_address`` (singular, dict) depending on SMC version.
+        inner_list = raw_data.get("contact_addresses")
+        if inner_list is None:
+            singular = raw_data.get("contact_address")
+            inner_list = [singular] if isinstance(singular, dict) else []
+        if not isinstance(inner_list, list):
+            inner_list = []
+
+        for entry in inner_list:
+            if isinstance(entry, dict):
+                addr_s = str(entry.get("address") or
+                             entry.get("addr") or "").strip()
+                if not addr_s:
+                    continue
+                location_raw = ""
+                for key in ("location", "location_name", "location_ref"):
+                    v = entry.get(key)
+                    if v:
+                        location_raw = str(v)
+                        break
+                bucket.append({
+                    "address": addr_s,
+                    "location": _prettify_location(location_raw),
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": _parse_bool_loose(entry.get("dynamic")),
+                })
+            elif isinstance(entry, str):
+                addr_s = entry.strip()
+                if not addr_s:
+                    continue
+                bucket.append({
+                    "address": addr_s,
+                    "location": "",
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": False,
+                })
+
+        # Last-resort fallback: very old SMC payloads expose an
+        # `addresses` list directly on the wrapper. Only consult it
+        # if ca.data was empty AND the wrapper actually has it.
+        if not bucket:
+            try:
+                fallback = list(getattr(ca, "addresses", None) or [])
+            except Exception:
+                fallback = []
+            for addr in fallback:
+                addr_s = str(addr or "").strip()
+                if not addr_s:
+                    continue
+                bucket.append({
+                    "address": addr_s,
+                    "location": "",
+                    "is_public": _classify_public(addr_s),
+                    "dynamic": False,
+                })
+    return out
+
+
 def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
     """Return one record per cluster node with **all** static NDI addresses
     (per-node).
@@ -855,6 +1148,10 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
       4. The "primary address" for each node is the one tagged `primary_mgt`
          (the IP SMC uses to reach the node). For node-initiated clusters
          this may not be reachable from FEA — the operator picks instead.
+      5. Join per-interface contact addresses from `engine.contact_addresses`
+         onto each NodeAddress. With 1:1 NAT a node-initiated node may
+         still expose a public NAT exit IP here, which is what FEA can
+         then dial (P1 — contact-address awareness, 2026-05-12).
     """
     engine = Engine(engine_name)
 
@@ -866,6 +1163,27 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
         except Exception:
             continue
         all_addresses.extend(_walk_node_interfaces(data))
+
+    # Build the engine-level contact-address map ONCE; MERGE (not
+    # replace) onto each matching NDI. The inline-per-interface
+    # contact addresses are already on `na.contact_addresses` from
+    # `_walk_node_interfaces`; this loop adds any engine-level
+    # entries SMC keeps on the General tab that weren't already
+    # surfaced inline. Deduped by `address` so the UI never shows
+    # the same IP twice.
+    contact_map = _build_contact_address_map(engine)
+    if contact_map:
+        for na in all_addresses:
+            key = (na.interface_id, na.address)
+            engine_level = contact_map.get(key) or []
+            if not engine_level:
+                continue
+            seen = {ca.get("address") for ca in na.contact_addresses
+                    if ca.get("address")}
+            for ca in engine_level:
+                if ca.get("address") and ca["address"] not in seen:
+                    na.contact_addresses.append(ca)
+                    seen.add(ca["address"])
 
     # Group by nodeid (1-based in SMC). Single-node engines may not assign
     # a nodeid; treat unset as 1.
@@ -1130,6 +1448,357 @@ def set_node_ssh_enabled(engine_name: str, node_index: int,
     nodes[node_index].ssh(enable=enabled, comment=comment or None)
 
 
+# Substrings used to recognize an "SSH is on" reading regardless of how
+# SMC labels the daemon state across versions. Operator-extensible via
+# `FEA_SSH_ENABLED_TOKENS` env var (comma-separated) if a future SMC
+# release adds a new label.
+_SSH_ENABLED_TOKENS = ("running", "enabled", "active", "started", "on",
+                       "yes", "true")
+_SSH_DISABLED_TOKENS = ("disabled", "stopped", "inactive", "off",
+                        "no", "false", "not running")
+
+
+def _matches_ssh_token(value, tokens: tuple) -> bool:
+    """True iff ``value`` stringified contains any of the substrings."""
+    if value is None:
+        return False
+    s = str(value).strip().lower()
+    if not s:
+        return False
+    return any(tok in s for tok in tokens)
+
+
+def _scan_name_value_pair(prefix: str, d: dict, raw_signals: dict,
+                          verbose: bool) -> None:
+    """Specialised scanner for SMC's ``{"name": "...", "value": "..."}``
+    diagnostic entries.
+
+    The Forcepoint 7.1 diagnostic endpoint returns ssh state as a list
+    of entries shaped like ``{"name": "SSH daemon", "value": "Running",
+    "status": "Ok"}`` (and sometimes nested under ``{"diagnostic": ...}``
+    — handled by the caller). Each entry's name/value pair is what we
+    want to classify, NOT the dict's own keys.
+
+    Also handles generic dicts where the ssh field is a top-level key.
+    """
+    name = d.get("name") or d.get("Name") or ""
+    val_keys = ("value", "current_value", "status", "state", "running")
+    value = None
+    for k in val_keys:
+        if k in d and d[k] is not None:
+            value = d[k]
+            break
+
+    name_l = str(name).strip().lower()
+    if name_l and value is not None:
+        # Synthetic flat key so the verbose dump groups cleanly.
+        key = f"{prefix}.{name_l.replace(' ', '_')}"
+        if verbose or "ssh" in name_l:
+            raw_signals[key] = (
+                value if isinstance(value, (str, int, bool, float))
+                else str(value)
+            )
+    # ALSO scan any straight key/value pairs (some endpoints don't use
+    # the name/value envelope).
+    for k, v in d.items():
+        if k in ("name", "Name", "value", "current_value", "status",
+                 "state", "running", "diagnostic"):
+            continue
+        if "ssh" in str(k).lower():
+            raw_signals[f"{prefix}.{k}"] = (
+                v if isinstance(v, (str, int, bool, float))
+                else str(v)[:160]
+            )
+        elif verbose:
+            raw_signals[f"{prefix}.{k}"] = (
+                v if isinstance(v, (str, int, bool, float))
+                else str(v)[:160]
+            )
+
+
+def get_node_ssh_state(engine_name: str, node_index: int,
+                       *, verbose: bool = False) -> dict:
+    """Query SMC for the current SSH-daemon state of a cluster node.
+
+    Returns ``{"state": "enabled"|"disabled"|"unknown", "source": str,
+    "raw_signals": dict, "error": str}``. With ``verbose=True``
+    additionally populates ``raw_signals`` with a FULL dump of every
+    field SMC returned (status / appliance_status / node.data /
+    sub-resource links) — this is what the 🐛 debug endpoint uses to
+    surface fields we haven't yet recognised. Normal callers pass
+    ``verbose=False`` (default) so the discover-nodes payload stays
+    small.
+    """
+    raw_signals: dict = {}
+    state = "unknown"
+    source = ""
+    error = ""
+
+    def _scan_dict(prefix: str, d: dict) -> None:
+        """Walk a dict and (a) record every key/value in `raw_signals`
+        when verbose, (b) classify any key containing "ssh" against
+        the token lists to set state/source. Stops at the first
+        recognisable enabled/disabled match."""
+        nonlocal state, source
+        if not isinstance(d, dict):
+            return
+        for k, v in d.items():
+            kl = str(k).lower()
+            # In verbose mode, capture every top-level field so we can
+            # eyeball SMC's actual payload shape.
+            if verbose:
+                val_repr = (v if isinstance(v, (str, int, bool, float))
+                            else (str(v)[:160] + "…" if len(str(v)) > 160
+                                  else str(v)))
+                raw_signals[f"{prefix}.{k}"] = val_repr
+            elif "ssh" in kl:
+                raw_signals[f"{prefix}.{k}"] = (
+                    v if isinstance(v, (str, int, bool, float))
+                    else str(v)
+                )
+            # Classify by name + value.
+            if "ssh" in kl and state == "unknown":
+                if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
+                    state, source = "enabled", f"{prefix}.{k}"
+                elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
+                    state, source = "disabled", f"{prefix}.{k}"
+
+    try:
+        engine = Engine(engine_name)
+        nodes = list(getattr(engine, "nodes", []) or [])
+        if node_index >= len(nodes):
+            return {
+                "state": "unknown", "source": "", "raw_signals": {},
+                "error": (f"node_index {node_index} out of range "
+                          f"(engine has {len(nodes)} node(s))"),
+            }
+        node = nodes[node_index]
+
+        # 1) node.status() — ApplianceStatus.
+        try:
+            st = node.status()
+            for key in ("ssh_daemon", "ssh", "ssh_status",
+                        "ssh_enabled", "sshd_running"):
+                v = getattr(st, key, None)
+                if v is not None:
+                    raw_signals[f"status.{key}"] = str(v)
+                    if state == "unknown":
+                        if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
+                            state, source = "enabled", f"status.{key}"
+                        elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
+                            state, source = "disabled", f"status.{key}"
+            if verbose:
+                # Dump ALL public attributes (not just SSH-keyed) so we
+                # can spot the right field on an unfamiliar SMC version.
+                for attr in dir(st):
+                    if attr.startswith("_"):
+                        continue
+                    try:
+                        val = getattr(st, attr, None)
+                        if callable(val):
+                            continue
+                        raw_signals[f"status.@{attr}"] = (
+                            val if isinstance(val, (str, int, bool, float))
+                            else str(val)[:160]
+                        )
+                    except Exception:
+                        pass
+            try:
+                sd = getattr(st, "data", None)
+                if hasattr(sd, "data"):
+                    sd = sd.data
+                _scan_dict("status.data", sd if isinstance(sd, dict) else {})
+            except Exception as exc:
+                raw_signals["status.data.__error"] = f"{type(exc).__name__}: {exc}"
+        except Exception as exc:
+            raw_signals["status.__error"] = f"{type(exc).__name__}: {exc}"
+
+        # 2) node.appliance_status (newer SDK property).
+        try:
+            ast = getattr(node, "appliance_status", None)
+            if callable(ast):
+                ast = ast()
+            if ast is not None:
+                for key in ("ssh_daemon", "ssh", "ssh_status",
+                            "ssh_enabled", "sshd_running"):
+                    v = getattr(ast, key, None)
+                    if v is not None:
+                        raw_signals[f"appliance_status.{key}"] = str(v)
+                        if state == "unknown":
+                            if _matches_ssh_token(v, _SSH_ENABLED_TOKENS):
+                                state, source = "enabled", f"appliance_status.{key}"
+                            elif _matches_ssh_token(v, _SSH_DISABLED_TOKENS):
+                                state, source = "disabled", f"appliance_status.{key}"
+                try:
+                    sd = getattr(ast, "data", ast)
+                    if hasattr(sd, "data"):
+                        sd = sd.data
+                    _scan_dict("appliance_status.data",
+                               sd if isinstance(sd, dict) else {})
+                except Exception as exc:
+                    raw_signals["appliance_status.data.__error"] = (
+                        f"{type(exc).__name__}: {exc}"
+                    )
+        except Exception as exc:
+            raw_signals["appliance_status.__error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # 3) node.data.data — raw Node element JSON.
+        try:
+            nd = getattr(node, "data", None)
+            if hasattr(nd, "data"):
+                nd = nd.data
+            if isinstance(nd, dict):
+                _scan_dict("node.data", nd)
+                # Sub-resource links — interesting on its own.
+                if verbose:
+                    for ln in (nd.get("link") or []):
+                        rel = str(ln.get("rel", "") or "")
+                        href = str(ln.get("href", "") or "")
+                        if rel:
+                            raw_signals[f"node.link[{rel}]"] = href
+        except Exception as exc:
+            raw_signals["node.data.__error"] = f"{type(exc).__name__}: {exc}"
+
+        # 4) Direct sub-resource fetch — Forcepoint 7.1 keeps daemon
+        # state on separate URLs (`diagnostic`, `appliance_status`),
+        # NOT inside `node.status()`. We harvest the URLs from
+        # `node.data.link[*]` and fetch them via the SDK's HTTP layer.
+        # This is the only path that returns ssh_daemon state on the
+        # SDK version we've observed against SMC 7.1.
+        links_by_rel: dict[str, str] = {}
+        try:
+            nd = getattr(node, "data", None)
+            if hasattr(nd, "data"):
+                nd = nd.data
+            if isinstance(nd, dict):
+                for ln in (nd.get("link") or []):
+                    rel = str(ln.get("rel", "") or "")
+                    href = str(ln.get("href", "") or "")
+                    if rel and href:
+                        links_by_rel[rel] = href
+        except Exception as exc:
+            raw_signals["link_parse.__error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # P1 — *FETCH-PROBE-V2* sentinel so the operator can confirm
+        # via the 🐛 endpoint that this code path actually loaded.
+        # If you don't see this key in raw_signals after redeploying,
+        # the container didn't pick up the new code → hard-restart
+        # (gunicorn --preload doesn't auto-reload).
+        raw_signals["__fetch_probe_version"] = "v2-2026-05-12"
+
+        for rel in ("diagnostic", "appliance_status"):
+            href = links_by_rel.get(rel)
+            raw_signals[f"fetch[{rel}].__href"] = href or "(missing from link table)"
+            if not href:
+                continue
+            result = None
+            try:
+                # smc-python's HTTP helper. Some SDK versions return
+                # a parsed dict, others return (json, etag) tuples or
+                # an Element wrapper. Handle each.
+                from smc.api.common import SMCRequest
+                result = SMCRequest(href=href).read()
+            except Exception as exc:
+                raw_signals[f"fetch[{rel}].__error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+                continue
+
+            # ALWAYS record what came back, regardless of shape. This
+            # closes the silent-skip hole: even if `result` is a tuple
+            # / Element / None, we surface enough to figure out what
+            # the SDK contract actually is on this build.
+            raw_signals[f"fetch[{rel}].__type"] = type(result).__name__
+            if result is None:
+                raw_signals[f"fetch[{rel}].__none"] = True
+                continue
+
+            # Unwrap common (json, etag) / (json, etag, headers) tuples.
+            if isinstance(result, tuple):
+                raw_signals[f"fetch[{rel}].__tuple_len"] = len(result)
+                if len(result) >= 1:
+                    result = result[0]
+                    raw_signals[f"fetch[{rel}].__unwrapped_type"] = (
+                        type(result).__name__
+                    )
+
+            # SMCResult wrapper — has .json / .data attribute on some SDK builds.
+            if not isinstance(result, (dict, list)):
+                for attr in ("json", "data", "payload"):
+                    candidate = getattr(result, attr, None)
+                    if isinstance(candidate, (dict, list)):
+                        result = candidate
+                        raw_signals[f"fetch[{rel}].__via_attr"] = attr
+                        break
+
+            # Last-resort dump for unrecognised shape — at least the
+            # operator can paste it back to me.
+            if not isinstance(result, (dict, list)):
+                raw_signals[f"fetch[{rel}].__repr"] = str(result)[:400]
+                continue
+
+            # SMC returns diagnostic in a {"diagnostics": [{"diagnostic": {...}}, ...]}
+            # shape on 7.1 (observed). The "name/value" pairs we want
+            # are inside each inner object. Be defensive about both
+            # dict-of-list and list-of-dict variants.
+            if isinstance(result, dict):
+                raw_signals[f"fetch[{rel}].__dict_keys"] = sorted(result.keys())
+                if verbose:
+                    _scan_dict(f"fetch[{rel}]", result)
+                # Walk anything that looks like a {name, value} list.
+                for k, v in result.items():
+                    if isinstance(v, list):
+                        raw_signals[f"fetch[{rel}].{k}.__list_len"] = len(v)
+                        for item in v:
+                            if isinstance(item, dict):
+                                # Unwrap nested {"diagnostic": {...}} envelopes.
+                                inner = item.get("diagnostic", item)
+                                if isinstance(inner, dict):
+                                    _scan_name_value_pair(
+                                        f"fetch[{rel}].{k}", inner,
+                                        raw_signals, verbose,
+                                    )
+            elif isinstance(result, list):
+                raw_signals[f"fetch[{rel}].__len"] = len(result)
+                for i, item in enumerate(result):
+                    if isinstance(item, dict):
+                        inner = item.get("diagnostic", item)
+                        if isinstance(inner, dict):
+                            _scan_name_value_pair(
+                                f"fetch[{rel}][{i}]", inner,
+                                raw_signals, verbose,
+                            )
+
+            # Re-run classifier on the harvested fields.
+            for sk, sv in list(raw_signals.items()):
+                if not sk.startswith(f"fetch[{rel}]"):
+                    continue
+                if "ssh" not in sk.lower():
+                    continue
+                if state != "unknown":
+                    break
+                if _matches_ssh_token(sv, _SSH_ENABLED_TOKENS):
+                    state, source = "enabled", sk
+                    break
+                if _matches_ssh_token(sv, _SSH_DISABLED_TOKENS):
+                    state, source = "disabled", sk
+                    break
+
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+
+    return {
+        "state": state,
+        "source": source,
+        "raw_signals": raw_signals,
+        "error": error,
+    }
+
+
 def change_node_ssh_password(engine_name: str, node_index: int,
                              new_password: str, comment: str = "") -> None:
     """Set the root SSH password on a single cluster node via SMC API.
@@ -1240,6 +1909,115 @@ def _ensure_host_for_ip(name: str, ip: str) -> Host:
     except Exception:
         Host.create(name=name, address=ip)
         return Host(name)
+
+
+def _ensure_host_for_ip_force(name: str, ip: str) -> Host:
+    """Get-or-create + sync the IP. Unlike ``_ensure_host_for_ip`` this
+    UPDATES the Host element's ``address`` field when it already exists
+    with a different IP. Needed by ``update_ssh_rule_destinations``
+    when reusing the canonical ``{rule_name}-dst-<i>`` slot names for
+    a different set of IPs.
+    """
+    try:
+        host = Host(name)
+        # Force load — triggers a fetch that populates `.address`.
+        current = ""
+        try:
+            current = str(getattr(host, "address", "") or "")
+        except Exception:
+            current = ""
+        if current != ip:
+            try:
+                host.update(address=ip)
+            except Exception as exc:
+                logger.warning("_ensure_host_for_ip_force: could not update "
+                               "%s from %s → %s: %s", name, current, ip, exc)
+        return host
+    except Exception:
+        Host.create(name=name, address=ip)
+        return Host(name)
+
+
+def update_ssh_rule_destinations(policy_name: str, rule_name: str,
+                                 destination_ips: list[str]) -> str:
+    """Rewrite an existing SSH-allow rule's destination set.
+
+    Idempotent. When the rule's current destinations exactly match the
+    requested list (by IP), this is a no-op and returns the rule's
+    existing href. Otherwise:
+
+      1. Ensure / update Host elements at the canonical
+         ``{rule_name}-dst-<i>`` slot names so they carry the requested
+         IPs (handles "same slot, new IP" with
+         ``_ensure_host_for_ip_force``).
+      2. Delete the existing rule and re-create it with the new dst
+         list (same source, same comment, top-of-policy position).
+         Delete-then-create is used because smc-python's rule.update()
+         for the destinations collection varies across SDK builds;
+         this path is shape-independent.
+
+    The Host elements for unused old indices (when the new list is
+    shorter than the old one) are intentionally NOT deleted — they
+    might be referenced by other rules an operator has added.
+
+    Returns the (new) rule href.
+    """
+    existing = find_ssh_access_rule(policy_name, rule_name)
+    if not existing:
+        raise RuntimeError(
+            f"update_ssh_rule_destinations: rule {rule_name!r} not "
+            f"found in policy {policy_name!r}"
+        )
+
+    # Capture source IP (from the existing rule) + comment so we can
+    # re-create without losing them.
+    sources_info = existing.get("sources") or []
+    if not sources_info:
+        raise RuntimeError(
+            f"existing rule {rule_name!r} has no source — refusing to "
+            f"re-create from incomplete state. Remove + reinstall via "
+            f"the wizard."
+        )
+    source_ip = ""
+    for s in sources_info:
+        addr = (s.get("address") or "").strip()
+        if addr:
+            source_ip = addr
+            break
+    if not source_ip:
+        raise RuntimeError(
+            f"existing rule {rule_name!r}: could not read source Host's "
+            f"IP — refusing to re-create."
+        )
+    old_comment = existing.get("comment") or ""
+
+    # Update / create Host elements in-place. After this loop, the
+    # `{rule_name}-dst-<i>` Hosts carry the requested IPs at the
+    # requested indices.
+    for i, ip in enumerate(destination_ips):
+        _ensure_host_for_ip_force(f"{rule_name}-dst-{i}", ip)
+
+    # Delete + recreate. The brief window where the rule is absent
+    # only affects new SMC state — the engine doesn't know about it
+    # until the caller pushes the policy.
+    try:
+        existing["rule_obj"].delete()
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not delete existing rule {rule_name!r} before "
+            f"re-create: {exc}"
+        )
+
+    # Re-create via the existing helper (which will pick up the now-
+    # updated Host elements).
+    new_href = add_ssh_access_rule(
+        policy_name=policy_name,
+        rule_name=rule_name,
+        source_ip=source_ip,
+        destination_ips=destination_ips,
+        comment=old_comment,
+    )
+    return new_href
 
 
 def add_ssh_access_rule(policy_name: str, rule_name: str,

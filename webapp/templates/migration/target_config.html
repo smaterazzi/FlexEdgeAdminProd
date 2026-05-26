@@ -33,34 +33,21 @@
                 <div class="card-body">
                     <form method="POST">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-                        <div class="mb-3">
-                            <label for="smc_url" class="form-label">SMC URL</label>
-                            <input type="text" class="form-control bg-dark border-secondary text-light"
-                                   id="smc_url" name="smc_url" required
-                                   value="{{ target.smc_url }}"
-                                   placeholder="https://smc.example.com:8082">
-                        </div>
-
-                        <div class="mb-3">
-                            <label for="api_key" class="form-label">API Key</label>
-                            <input type="password" class="form-control bg-dark border-secondary text-light"
-                                   id="api_key" name="api_key" required
-                                   value="{{ target.api_key }}">
-                        </div>
-
-                        <div class="mb-3">
-                            <label for="domain" class="form-label">Admin Domain</label>
-                            <input type="text" class="form-control bg-dark border-secondary text-light"
-                                   id="domain" name="domain"
-                                   value="{{ target.domain }}"
-                                   placeholder="Shared Domain">
-                            <div class="form-text">Leave empty for default Shared Domain.</div>
-                        </div>
-
-                        <div class="mb-3 form-check">
-                            <input type="checkbox" class="form-check-input" id="verify_ssl"
-                                   name="verify_ssl" {% if target.verify_ssl %}checked{% endif %}>
-                            <label class="form-check-label" for="verify_ssl">Verify SSL certificate</label>
+                        {# C1 (audit fix-up, 2026-05-09): the target SMC server,
+                           API key, admin domain and verify-SSL flag are no longer
+                           collected here. The migration runs against the operator's
+                           ACTIVE Domain (set via the topbar Domain switcher); the
+                           project is stamped with that Domain's slug at creation
+                           and refused if the active Domain doesn't match on later
+                           visits. The plaintext API key never gets written to the
+                           project file or rendered into the DOM. #}
+                        <div class="alert alert-info" role="alert">
+                            <i class="bi bi-info-circle"></i>
+                            <strong>SMC target:</strong> the active Domain
+                            <code>{{ active_domain_label }}</code>
+                            ({{ active_smc_url }}).
+                            Switch Domain in the topbar before opening this
+                            project to target a different SMC server.
                         </div>
 
                         <hr class="border-secondary">

@@ -10,6 +10,7 @@ NGFW engines. Bridges Let's Encrypt (certbot) with the SMC API:
 
 Routes mounted at /tls/*
 """
+import hmac
 import logging
 import secrets
 from datetime import datetime, timezone
@@ -34,8 +35,8 @@ from webapp.smc_tls_client import (
 )
 from webapp.tls_deployer import run_deployment
 from webapp.tls_scheduler import (
-    check_all_certificates, generate_deploy_hook,
-    handle_renewal_webhook, install_deploy_hook,
+    check_all_certificates, generate_deploy_hook, generate_token_file,
+    handle_renewal_webhook, install_deploy_hook, DEFAULT_TOKEN_FILE,
 )
 
 log = logging.getLogger(__name__)
@@ -61,13 +62,35 @@ def admin_required(f):
 
 
 def require_api_token(f):
-    """Decorator for webhook endpoints: Bearer token auth."""
+    """Decorator for webhook endpoints: Bearer token auth.
+
+    C6 + M15 (audit fix-up, 2026-05-09):
+      * Use ``hmac.compare_digest`` to compare the presented token with
+        the configured one — constant-time comparison prevents byte-by-byte
+        timing-attack token recovery.
+      * Refuse with HTTP 503 when the configured token is empty / None.
+        Without this guard a misconfigured deploy (token-file write
+        failed, env var unset) would coerce ``None`` into the comparison
+        and reject everything as "Invalid token" — the failure mode is
+        indistinguishable from "wrong token from caller". 503 makes the
+        misconfiguration unambiguous in the logs.
+    """
+    import hmac
     @wraps(f)
     def decorated(*args, **kwargs):
+        configured = current_app.config.get("TLS_API_TOKEN") or ""
+        if not configured:
+            # An unconfigured webhook MUST refuse outright — `!=` against
+            # an empty string would let any non-empty Bearer through if
+            # the token was misconfigured to "". Surface 503 so the
+            # operator's deploy-hook test fails loudly.
+            return jsonify({"error": "Webhook token not configured on server"}), 503
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Missing Authorization header"}), 401
-        if auth[7:] != current_app.config.get("TLS_API_TOKEN"):
+        presented = auth[7:]
+        if not hmac.compare_digest(presented.encode("utf-8"),
+                                   configured.encode("utf-8")):
             return jsonify({"error": "Invalid token"}), 403
         return f(*args, **kwargs)
     return decorated
@@ -318,12 +341,61 @@ def deploy_execute(deployment_id):
         return redirect(url_for("tls.dashboard"))
 
     result = None
+    tls_running = None
+
+    # H8 (audit fix-up, 2026-05-09): consume the post-deploy scan_jobs
+    # report when the page reloads after the watcher polled "done".
+    tls_scan_id = (request.args.get("tls_scan_id") or "").strip()
+    if tls_scan_id and request.method == "GET":
+        from webapp import tls_deploy_jobs
+        user_email = (session.get("user") or {}).get("email", "")
+        status = tls_deploy_jobs.get_status(tls_scan_id, user_email=user_email)
+        if status is None:
+            flash("TLS deploy job not found or expired.", "info")
+        elif status["state"] == "running":
+            tls_running = status
+        elif status["state"] == "failed":
+            flash(f"TLS deploy worker failed: "
+                  f"{status.get('error') or 'unknown error'}", "danger")
+            tls_deploy_jobs.discard(tls_scan_id, user_email=user_email)
+        else:  # done
+            push_result = tls_deploy_jobs.consume_report(
+                tls_scan_id, user_email=user_email,
+            )
+            change_id = (status.get("change_id") if status else None) or 0
+            is_bypass_done = bool(status.get("is_bypass") if status else False)
+            db.session.refresh(dep)
+            from webapp.smc_tls_client import DeployResult
+            result = DeployResult(
+                success=(dep.last_status == "deployed"),
+                error=dep.last_error or "",
+                tls_credential_name=dep.tls_credential_name or "",
+                host_public_name=dep.host_public_name or "",
+                host_private_name=dep.host_private_name or "",
+                policy_rule_name=dep.policy_rule_name or "",
+                policy_section_name=dep.policy_section_name or "",
+            )
+            if push_result is not None and getattr(push_result, "success", False):
+                _log_activity("deploy", "execute", "ok", dep.service_name,
+                              f"via_queue=True bypass={is_bypass_done} "
+                              f"engine={dep.engine_name} change_id={change_id}")
+                flash(f"Deployment successful (queue change #{change_id}).",
+                      "success")
+            else:
+                err = (getattr(push_result, "error", "")
+                       or dep.last_error
+                       or "Unknown")
+                _log_activity("deploy", "execute", "error", dep.service_name,
+                              f"via_queue=True bypass={is_bypass_done} "
+                              f"engine={dep.engine_name} — {err}")
+                flash(f"Deployment failed (queue change #{change_id}): "
+                      f"{err}. Retry from the Change Queue.", "danger")
+
     if request.method == "POST":
         # Phase E.2 — enqueue + auto-push for admins (Q15/a + Q19/b).
         # ONE queue row carries the whole 5-step pipeline; the queue UI
         # surfaces the per-step status in the expanded detail panel.
         from webapp.models import PendingChange
-        from shared.queue_runner import push_one
         import json as _json
 
         if dep.domain_id is None:
@@ -372,74 +444,28 @@ def deploy_execute(deployment_id):
             is_bypass = False
 
         if is_domain_admin() or is_bypass:
-            push_result = push_one(change.id)
-            db.session.refresh(dep)
-            db.session.refresh(change)
-
-            # Capture identifiers + payload BEFORE the bypass cleanup
-            # may delete the row out from under us.
-            change_id = change.id
-            change_payload_json = change.payload_json or "{}"
-            change_op = change.operation
-            change_corr = change.source_correlation_id
-            change_domain_id = change.domain_id
-
-            if push_result.success:
-                # Bypass cleanup: delete the queue row (transient) and
-                # emit a `tls_deploy.deploy_tls.bypass_queue` audit
-                # marker so log queries can find bypassed runs.
-                if is_bypass:
-                    try:
-                        from shared.logging import audit
-                        audit(
-                            feature="tls_deploy",
-                            action=f"{change_op}.bypass_queue",
-                            target=f"deployment#{dep.id} ({dep.service_name})",
-                            detail=("bypass_queue=True; queue row deleted "
-                                    f"on success (was change_id={change_id})"),
-                            source_correlation_id=change_corr,
-                            domain_id=change_domain_id,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        db.session.delete(change)
-                        db.session.commit()
-                    except Exception:
-                        db.session.rollback()
-                _log_activity("deploy", "execute", "ok", dep.service_name,
-                              f"via_queue=True bypass={is_bypass} "
-                              f"engine={dep.engine_name} change_id={change_id}")
-                flash(f"Deployment successful (queue change #{change_id}).",
-                      "success")
-            else:
-                err = (push_result.error
-                       or (change.push_error_text if change in db.session
-                           else "")
-                       or "Unknown")
-                _log_activity("deploy", "execute", "error", dep.service_name,
-                              f"via_queue=True bypass={is_bypass} "
-                              f"engine={dep.engine_name} — {err}")
-                flash(f"Deployment failed (queue change #{change_id}): {err}. "
-                      f"Retry from the Change Queue.", "danger")
-
-            # Build a render-ready result from the deployment's persisted state.
-            from webapp.smc_tls_client import DeployResult
+            # H8 (audit fix-up, 2026-05-09): spawn the queue push in a
+            # daemon thread so the request returns instantly. The watcher
+            # card on deploy_execute.html polls /tls/deploy/<id>/status
+            # and reloads when the worker calls mark_done.
+            from webapp.tls_deploy_jobs import start_deploy
+            user_email = ((session.get("user") or {}).get("email") or "").strip()
             try:
-                payload = _json.loads(change_payload_json)
-                steps = payload.get("steps") or []
-            except Exception:
-                steps = []
-            result = DeployResult(
-                success=(dep.last_status == "deployed"),
-                error=dep.last_error or "",
-                tls_credential_name=dep.tls_credential_name or "",
-                host_public_name=dep.host_public_name or "",
-                host_private_name=dep.host_private_name or "",
-                policy_rule_name=dep.policy_rule_name or "",
-                policy_section_name=dep.policy_section_name or "",
-            )
-            result.steps = steps
+                scan_id = start_deploy(
+                    change_id=change.id,
+                    deployment_id=dep.id,
+                    service_name=dep.service_name,
+                    user_email=user_email,
+                    is_bypass=is_bypass,
+                )
+            except Exception as exc:
+                log.exception("deploy_execute: failed to spawn job")
+                flash(f"Deploy failed to start: {exc}", "danger")
+                return redirect(url_for("tls.deploy_execute",
+                                        deployment_id=dep.id))
+            return redirect(url_for("tls.deploy_execute",
+                                    deployment_id=dep.id,
+                                    tls_scan_id=scan_id))
         else:
             _log_activity("deploy", "execute.queued", "ok", dep.service_name,
                           f"engine={dep.engine_name} change_id={change.id}")
@@ -448,7 +474,22 @@ def deploy_execute(deployment_id):
             return redirect(url_for("changes.index",
                                     source=f"tls_deployment:{dep.id}"))
 
-    return render_template("tls/deploy_execute.html", deployment=dep, result=result)
+    return render_template("tls/deploy_execute.html",
+                           deployment=dep, result=result,
+                           tls_running=tls_running)
+
+
+@tls_bp.route("/deploy/<int:deployment_id>/status")
+@admin_required
+def deploy_status(deployment_id):
+    """JSON poll target for the TLS deploy watcher card."""
+    from webapp import tls_deploy_jobs
+    scan_id = (request.args.get("id") or "").strip()
+    user_email = (session.get("user") or {}).get("email", "")
+    status = tls_deploy_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"state": "missing"}), 404
+    return jsonify(status)
 
 
 @tls_bp.route("/deploy/<int:deployment_id>/delete", methods=["POST"])
@@ -591,10 +632,18 @@ def api_check_renewals():
 def hook_view():
     api_url = request.host_url.rstrip("/")
     api_token = current_app.config.get("TLS_API_TOKEN", "")
-    hook_script = generate_deploy_hook(api_url, api_token)
+    # M3 (audit fix-up, 2026-05-09): script no longer carries the token
+    # inline. The view shows TWO files now: the hook script (chmod 0700)
+    # and a sibling token file (chmod 0600) the script sources. The
+    # auto-installer at /tls/hook/install renders both with the right
+    # permissions; manual installers copy each block to the path shown.
+    hook_script = generate_deploy_hook(api_url, DEFAULT_TOKEN_FILE)
+    token_file_content = generate_token_file(api_token)
     return render_template("tls/hook.html",
                            api_url=api_url, api_token=api_token,
-                           hook_script=hook_script)
+                           hook_script=hook_script,
+                           token_file_content=token_file_content,
+                           token_file_path=DEFAULT_TOKEN_FILE)
 
 
 @tls_bp.route("/hook/install", methods=["POST"])

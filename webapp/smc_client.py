@@ -186,6 +186,29 @@ def list_elements(type_key, filter_text=None, fgt_only=False):
                 row["max_dst_port"] = data.get("max_dst_port", "")
             elif type_key == "domain_names":
                 row["value"] = data.get("value", name)
+            elif type_key == "fw_policies":
+                # Roadmap item 3 (Batch J, 2026-05-11): surface FW + NAT
+                # rule counts so the listing answers "does this policy
+                # have NAT rules?" at a glance. Forcepoint SMC has no
+                # standalone NATPolicy element; NAT rules live inside
+                # each FirewallPolicy. Counting iterates the rule
+                # collections — expensive on cold cache but the result
+                # is cached at section `element_list.fw_policies`
+                # (Quick TTL 1h) so subsequent renders are free.
+                row["fw_rule_count"] = None
+                row["nat_rule_count"] = None
+                try:
+                    row["fw_rule_count"] = sum(
+                        1 for _ in elem.fw_ipv4_access_rules.all()
+                    )
+                except Exception as e:
+                    log.debug(f"fw rule count for {name} failed: {e}")
+                try:
+                    row["nat_rule_count"] = sum(
+                        1 for _ in elem.fw_ipv4_nat_rules.all()
+                    )
+                except Exception as e:
+                    log.debug(f"nat rule count for {name} failed: {e}")
 
             # Resolve group members to names
             if type_key in ("groups", "service_groups"):
@@ -288,11 +311,47 @@ def _resolve_data_hrefs(data):
 # ── Policy Rules (read-only) ─────────────────────────────────────────────
 
 def list_policies():
-    """List all firewall policies."""
+    """List all firewall policies with FW + NAT rule counts.
+
+    Roadmap item 3 (Batch J, 2026-05-11): each result row carries
+    `fw_rule_count` and `nat_rule_count` so the canonical listing at
+    `/browse/fw_policies` can surface "policies with NAT" without
+    forcing the operator to click into each policy.
+
+    Forcepoint SMC has no standalone NATPolicy element — NAT rules live
+    inside each FirewallPolicy via `fw_ipv4_nat_rules`. The operator's
+    "add NAT policies to the list" request maps to "show how many NAT
+    rules each policy contains" alongside the access-rule count.
+
+    Rule counts iterate the rule collections lazily; on the cold-cache
+    path that's the cost of `len(list(...))`. The result is cached at
+    the `policy_list` section (Loose 24h) so subsequent renders are
+    free. Errors counting one policy's rules don't abort the listing —
+    that policy just gets `fw_rule_count=None` / `nat_rule_count=None`
+    and the template renders a `?` badge.
+    """
     results = []
     try:
         for p in FirewallPolicy.objects.all():
-            results.append({"name": p.name, "href": getattr(p, "href", "")})
+            row = {
+                "name": p.name,
+                "href": getattr(p, "href", ""),
+                "fw_rule_count": None,
+                "nat_rule_count": None,
+            }
+            try:
+                row["fw_rule_count"] = sum(
+                    1 for _ in p.fw_ipv4_access_rules.all()
+                )
+            except Exception as e:
+                log.debug(f"fw rule count for {p.name} failed: {e}")
+            try:
+                row["nat_rule_count"] = sum(
+                    1 for _ in p.fw_ipv4_nat_rules.all()
+                )
+            except Exception as e:
+                log.debug(f"nat rule count for {p.name} failed: {e}")
+            results.append(row)
     except Exception as e:
         log.error(f"Error listing policies: {e}")
     return sorted(results, key=lambda r: r["name"].lower())

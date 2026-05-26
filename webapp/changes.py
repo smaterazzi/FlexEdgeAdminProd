@@ -167,8 +167,12 @@ def index():
         qry = qry.filter(PendingChange.scope == scope)
 
     if state == "active":
-        # Default — show what needs operator attention.
-        qry = qry.filter(PendingChange.state.in_(("queued", "conflict", "push_failed")))
+        # Default — show what needs operator attention. ``pushing`` rows
+        # are in-flight (atomic claim won, handler running); they're
+        # included here so a stuck row from a killed worker is visible
+        # even before any operator action is required.
+        qry = qry.filter(PendingChange.state.in_(
+            ("queued", "pushing", "conflict", "push_failed")))
     elif state and state != "all":
         qry = qry.filter(PendingChange.state == state)
 
@@ -183,7 +187,22 @@ def index():
             (PendingChange.feature_source.ilike(like))
         )
 
-    rows = qry.order_by(PendingChange.created_at.desc()).limit(500).all()
+    # M13 (audit fix-up, 2026-05-09): real pagination — was a hard
+    # `limit(500)` with a "narrow your filter" footer banner when hit.
+    # On a 5000-row queue accumulated over a quarter the older rows
+    # were simply unreachable. Now `?page=` with 50/page, total count
+    # for the footer pager.
+    try:
+        page = max(1, int(request.args.get("page") or "1"))
+    except ValueError:
+        page = 1
+    page_size = 50
+    total_rows = qry.count()
+    rows = (qry.order_by(PendingChange.created_at.desc())
+            .limit(page_size)
+            .offset((page - 1) * page_size)
+            .all())
+    total_pages = max(1, (total_rows + page_size - 1) // page_size)
 
     # Object view: group by smc_object_id (None bucket for create-new ops)
     grouped = {}
@@ -192,25 +211,43 @@ def index():
             key = r.smc_object_id or 0
             grouped.setdefault(key, []).append(r)
 
-    # Conflict pairs — for each conflict row, fetch its peer for side-by-side rendering.
+    # Conflict pairs — for each conflict row, fetch its peer for
+    # side-by-side rendering.
+    # M7 (audit fix-up, 2026-05-09): batched into one IN query (was one
+    # SELECT per conflict row). On a 100-conflict queue this drops 100
+    # round-trips to 1.
     peer_by_id = {}
-    for r in rows:
-        if r.state == "conflict" and r.conflict_with_id:
-            peer = db.session.get(PendingChange, r.conflict_with_id)
-            if peer is not None:
-                peer_by_id[r.id] = peer
+    peer_ids = [r.conflict_with_id for r in rows
+                if r.state == "conflict" and r.conflict_with_id]
+    if peer_ids:
+        peers = (PendingChange.query
+                 .filter(PendingChange.id.in_(peer_ids))
+                 .all())
+        peer_by_pk = {p.id: p for p in peers}
+        for r in rows:
+            if r.state == "conflict" and r.conflict_with_id:
+                peer = peer_by_pk.get(r.conflict_with_id)
+                if peer is not None:
+                    peer_by_id[r.id] = peer
 
     # Stats — counts by state for the active scope/Domain.
+    # M19 (audit fix-up, 2026-05-09): replaced 7 separate `.count()`
+    # queries with one GROUP BY state. On a busy queue (5000+ rows
+    # accumulated over a quarter) this drops the index page render
+    # from ~7 sequential round-trips to one.
+    from sqlalchemy import func
     stats_qry = _scope_query()
     if scope and scope != "all":
         stats_qry = stats_qry.filter(PendingChange.scope == scope)
+    state_counts = dict(
+        stats_qry.with_entities(
+            PendingChange.state, func.count(PendingChange.id),
+        ).group_by(PendingChange.state).all()
+    )
     stats = {
-        "queued":      stats_qry.filter(PendingChange.state == "queued").count(),
-        "conflict":    stats_qry.filter(PendingChange.state == "conflict").count(),
-        "push_failed": stats_qry.filter(PendingChange.state == "push_failed").count(),
-        "pushed":      stats_qry.filter(PendingChange.state == "pushed").count(),
-        "applied":     stats_qry.filter(PendingChange.state == "applied").count(),
-        "aborted":     stats_qry.filter(PendingChange.state == "aborted").count(),
+        state: state_counts.get(state, 0)
+        for state in ("queued", "pushing", "conflict", "push_failed",
+                      "pushed", "applied", "aborted")
     }
 
     # Source-correlation buckets (for the filter dropdown).
@@ -252,6 +289,12 @@ def index():
             "source": correlation, "q": q, "view": view,
         },
         correlation_buckets=correlation_buckets,
+        pagination={
+            "page": page,
+            "page_size": page_size,
+            "total_rows": total_rows,
+            "total_pages": total_pages,
+        },
         # Action visibility flags for the template — pre-computed once
         # so we don't re-resolve roles per row.
         can_push_global=is_domain_admin(),
@@ -405,6 +448,11 @@ def drift_index():
 
     Filterable by drift_state. Default shows non-clean rows (drifted +
     gone) so the operator sees the actionable list first.
+
+    H6 (audit fix-up, 2026-05-09): when called with `?scan_id=X`, render
+    the in-progress watcher (state='running'), consume the report and
+    flash a summary (state='done'), or flash the error and fall through
+    (state='failed') — same UX pattern as the engine + DHCP scan jobs.
     """
     domain = getattr(g, "domain", None)
     state_filter = (request.args.get("state") or "active").strip()
@@ -412,10 +460,46 @@ def drift_index():
     from webapp.models import SmcObject
     from shared.smc_drift import drift_summary
 
+    # Watcher / consume — `?scan_id=X` is the post-spawn redirect target.
+    scan_running = None
+    scan_id = (request.args.get("scan_id") or "").strip()
+    if scan_id:
+        from webapp import drift_jobs
+        user_email = (session.get("user") or {}).get("email", "")
+        status = drift_jobs.get_status(scan_id, user_email=user_email)
+        if status is None:
+            flash("Drift scan job not found or expired — start a new one.",
+                  "info")
+        elif status["state"] == "running":
+            scan_running = status
+        elif status["state"] == "failed":
+            flash(f"Drift scan failed: {status.get('error') or 'unknown error'}",
+                  "danger")
+            drift_jobs.discard(scan_id, user_email=user_email)
+        else:  # done
+            report = drift_jobs.consume_report(scan_id, user_email=user_email)
+            if report is None:
+                flash("Drift scan results expired before they could be loaded.",
+                      "warning")
+            else:
+                bits = []
+                if report.clean:    bits.append(f"{report.clean} clean")
+                if report.drifted:  bits.append(f"{report.drifted} drifted")
+                if report.gone:     bits.append(f"{report.gone} gone")
+                if report.errored:  bits.append(f"{report.errored} errored")
+                if report.skipped:  bits.append(f"{report.skipped} skipped")
+                cat = "info"
+                if report.drifted or report.gone:
+                    cat = "warning"
+                if report.errored:
+                    cat = "danger"
+                flash(f"Drift scan complete — "
+                      f"{', '.join(bits) or 'no rows to scan'}.", cat)
+
     rows = []
     summary = {"total": 0, "clean": 0, "drifted": 0,
                "gone": 0, "unknown": 0, "last_check_at": None}
-    if domain is not None:
+    if domain is not None and scan_running is None:
         qry = SmcObject.query.filter_by(domain_id=domain.id)
         if state_filter == "active":
             qry = qry.filter(SmcObject.drift_state.in_(("drifted", "gone")))
@@ -434,45 +518,52 @@ def drift_index():
         filters={"state": state_filter},
         can_scan=is_domain_admin(),
         can_reconcile=is_domain_admin(),
+        scan_running=scan_running,
     )
+
+
+@changes_bp.route("/drift/scan/status")
+@domain_operator_required
+def drift_scan_status():
+    """JSON poll target for the drift watcher card."""
+    from webapp import drift_jobs
+    scan_id = (request.args.get("id") or "").strip()
+    user_email = (session.get("user") or {}).get("email", "")
+    status = drift_jobs.get_status(scan_id, user_email=user_email)
+    if status is None:
+        return jsonify({"state": "missing"}), 404
+    return jsonify(status)
 
 
 @changes_bp.route("/drift/scan", methods=["POST"])
 @domain_admin_required
 def drift_scan():
-    """Run a fresh drift scan against the active Domain. Synchronous —
-    blocks the request until the scan finishes. Domains with thousands
-    of tracked objects may take a while; defer to a background task in
-    a follow-up if that becomes a problem.
+    """Spawn a background drift scan against the active Domain.
+
+    H6 (audit fix-up, 2026-05-09): the scan was previously synchronous
+    and blocked the request thread for minutes on Domains with thousands
+    of tracked objects (gunicorn timeout territory). Now goes via
+    `webapp.drift_jobs.start_scan` which mirrors the engine / DHCP scan
+    pattern: register-job → daemon thread → watcher card on the drift
+    index polls for completion.
     """
     domain = getattr(g, "domain", None)
     if domain is None:
         flash("No active Domain — pick one first.", "warning")
         return redirect(url_for("changes.drift_index"))
 
+    from webapp import drift_jobs
+    user_email = (session.get("user") or {}).get("email", "")
     try:
-        from shared.smc_drift import scan_domain_drift
-        report = scan_domain_drift(domain)
+        scan_id = drift_jobs.start_scan(domain=domain, user_email=user_email)
     except Exception as exc:
-        log.exception("drift_scan failed")
-        flash(f"Drift scan failed: {exc}", "danger")
+        log.exception("drift_scan: failed to spawn job")
+        flash(f"Drift scan failed to start: {exc}", "danger")
         return redirect(url_for("changes.drift_index"))
 
-    bits = []
-    if report.clean:    bits.append(f"{report.clean} clean")
-    if report.drifted:  bits.append(f"{report.drifted} drifted")
-    if report.gone:     bits.append(f"{report.gone} gone")
-    if report.errored:  bits.append(f"{report.errored} errored")
-    if report.skipped:  bits.append(f"{report.skipped} skipped")
-
-    cat = "info"
-    if report.drifted or report.gone:
-        cat = "warning"
-    if report.errored:
-        cat = "danger"
-    summary = ", ".join(bits) or "no rows to scan"
-    flash(f"Drift scan complete — {summary}.", cat)
-    return redirect(url_for("changes.drift_index"))
+    # Redirect to the watcher view — the index reads ?scan_id=X and
+    # renders a progress card until the job's `done` / `failed`.
+    return redirect(url_for("changes.drift_index", scan_id=scan_id))
 
 
 @changes_bp.route("/drift/<int:smc_object_id>/reconcile", methods=["POST"])
@@ -518,7 +609,7 @@ def api_pending_count():
     """
     qry = _scope_query().filter(
         PendingChange.scope == "main",
-        PendingChange.state.in_(("queued", "conflict", "push_failed")),
+        PendingChange.state.in_(("queued", "pushing", "conflict", "push_failed")),
     )
     return jsonify({"pending_count": qry.count()})
 
@@ -541,7 +632,7 @@ def init_changes_blueprint(app):
                 return {"pending_changes_count": 0}
             qry = _scope_query().filter(
                 PendingChange.scope == "main",
-                PendingChange.state.in_(("queued", "conflict", "push_failed")),
+                PendingChange.state.in_(("queued", "pushing", "conflict", "push_failed")),
             )
             return {"pending_changes_count": qry.count()}
         except Exception:

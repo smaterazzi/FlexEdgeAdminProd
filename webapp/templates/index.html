@@ -65,16 +65,11 @@
         </div>
         {% endfor %}
 
-        <!-- Special cards -->
-        <div class="col-sm-6 col-md-4 col-lg-3">
-            <a href="/policies" class="card text-decoration-none h-100 border-info">
-                <div class="card-body text-center">
-                    <i class="bi bi-shield-check fs-2 text-info"></i>
-                    <div class="mt-2 fw-semibold">Policy Viewer</div>
-                    <div class="text-muted" style="font-size:0.75rem;">View rules by policy</div>
-                </div>
-            </a>
-        </div>
+        {# Roadmap item 3 (Batch J, 2026-05-11): "Policy Viewer" special
+           card removed — `fw_policies` is already in the element_types
+           grid above, and the canonical listing at /browse/fw_policies
+           now shows FW + NAT rule counts per policy with direct links
+           to the rules viewer. #}
     </div>
 </div>
 {% endblock %}
