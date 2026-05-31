@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-31
 
+### Engine SSH Credentials — action-completion flash (2026-05-31)
+
+Operator-requested visual feedback: after any AJAX action in the credentials wizard, the relevant block briefly flashes a **soft green** background on success / **soft red** on failure, so completion is obvious at a glance. The tint holds ~1.4 s then fades over ~1 s and is self-clearing (the class is also stripped in JS so it never bleeds into the wizard's inline re-renders). Pure CSS keyframes — no library, no layout shift.
+
+Wired at every AJAX action point through a single `flashAction(el, ok)` helper:
+
+- **SSH allow rule actions** (Install rule / Push policy / Overwrite source / Add source) — flashes the rule block (wizard) or the Card-3 engine block. For wizard actions the flash fires *after* the silent re-Discover so the freshly-repainted block is the one that lights up; for Card-3 actions the engine block is re-found by its `data-engine-key` after `refreshCard3()` swaps the DOM, then flashed.
+- **Per-node enrollment** (Auto-enroll / Apply / Overwrite credential) — flashes the node panel, driven from `renderNodeResult` so it covers both single-node clicks and the bulk "Enroll all" loop (each node lights up green/red as its turn completes). The network-error catch path flashes red too.
+- Respects `prefers-reduced-motion` — collapses the fade to a brief steady tint.
+
+Template-only change: [webapp/templates/dhcp/credentials.html](webapp/templates/dhcp/credentials.html) (`<style>` keyframes + `flashAction()` + call sites in the rule-action delegator, `renderNodeResult`, and the per-node submit handler).
+
 ### Engine SSH Credentials — SSH allow rule source-Host publish bug + UX (2026-05-31)
 
 Follow-up to the per-engine source-IP override, fixing the publish process itself. Operator report: when an SMC Host with the rule's canonical name already exists, the install path didn't reconcile its IP — so changing the source produced no actual change on the engine.
