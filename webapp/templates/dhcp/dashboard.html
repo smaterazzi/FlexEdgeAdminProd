@@ -148,23 +148,37 @@
     <table class="table table-sm table-hover mb-0">
       <thead>
         <tr>
-          <th>Engine</th><th>Tenant</th><th>Nodes</th><th>Status</th>
+          <th>Engine</th><th>API key</th><th>Nodes</th><th>Status</th>
           <th>SSH rule</th><th>Last verified</th>
         </tr>
       </thead>
       <tbody>
+        {# Group + label by the canonical domain_id, NOT the legacy
+           tenant_id. The dashboard query already scopes every cred to the
+           active Domain, so the column should show the API key actually
+           used to reach SMC (domain.api_key) — the legacy `c.tenant.name`
+           showed the key's *owning tenant*, which in a multi-domain key is
+           a different name from the active Domain and read as "wrong key".
+           (2026-05-31 fix.) #}
         {% set seen_engines = [] %}
         {% for c in creds %}
-          {% set key = c.tenant_id|string + '/' + c.engine_name %}
+          {% set key = c.domain_id|string + '/' + c.engine_name %}
           {% if key not in seen_engines %}
             {% set _ = seen_engines.append(key) %}
-            {% set sibling_creds = creds|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('tenant_id', 'equalto', c.tenant_id)|list %}
-            {% set rule = (accesses|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('tenant_id', 'equalto', c.tenant_id)|list|first) %}
+            {% set sibling_creds = creds|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('domain_id', 'equalto', c.domain_id)|list %}
+            {% set rule = (accesses|selectattr('engine_name', 'equalto', c.engine_name)|selectattr('domain_id', 'equalto', c.domain_id)|list|first) %}
             {% set healthy = sibling_creds|selectattr('last_verify_status', 'equalto', 'ok')|list|length %}
             {% set failing = sibling_creds|selectattr('last_verify_status', 'equalto', 'failed')|list|length %}
             <tr>
               <td><strong>{{ c.engine_name }}</strong></td>
-              <td>{{ c.tenant.name if c.tenant else '—' }}</td>
+              <td>
+                {% if c.domain and c.domain.api_key %}
+                  {{ c.domain.api_key.name }}
+                  {% if c.domain.smc_domain_name %}
+                    <small class="text-muted d-block">SMC domain: {{ c.domain.smc_domain_name }}</small>
+                  {% endif %}
+                {% else %}—{% endif %}
+              </td>
               <td>
                 {{ sibling_creds|length }}
                 <small class="text-muted">
