@@ -314,6 +314,7 @@
           </th>
           <th class="sortable" data-sort-key="ip"        data-sort-type="ip">IP            <span class="sort-indicator"></span></th>
           <th class="sortable" data-sort-key="mac"       data-sort-type="text">MAC         <span class="sort-indicator"></span></th>
+          <th class="sortable" data-sort-key="vendor"    data-sort-type="text">Vendor      <span class="sort-indicator"></span></th>
           <th class="sortable" data-sort-key="host"      data-sort-type="text">Hostname    <span class="sort-indicator"></span></th>
           <th class="sortable" data-sort-key="state"     data-sort-type="text">State       <span class="sort-indicator"></span></th>
           <th class="sortable" data-sort-key="ends"      data-sort-type="text">Ends        <span class="sort-indicator"></span></th>
@@ -335,6 +336,7 @@
                cache had it; without MAC the row stays informational
                (checkbox disabled with a tooltip). #}
         {% for l in leases %}
+        {% set _vendor = oui_vendor(l.mac) if l.mac else '' %}
         <tr class="lease-row"
             data-state="{{ l.binding_state }}"
             data-reserved="{{ '1' if l.reservation_id else '0' }}"
@@ -342,6 +344,7 @@
             data-fromscan="{{ '1' if l.from_scan else '0' }}"
             data-ip="{{ l.ip }}"
             data-mac="{{ l.mac or '' }}"
+            data-vendor="{{ _vendor|lower }}"
             data-host="{{ (l.client_hostname or '')|lower }}"
             data-ends="{{ l.ends.isoformat() if l.ends else '' }}"
             data-seen="{{ (l.seen_on_nodes|join(',')) if l.seen_on_nodes else '' }}"
@@ -366,6 +369,15 @@
           <td><code>{{ l.ip }}</code></td>
           <td>
             {% if l.mac %}<code>{{ l.mac }}</code>{% else %}<span class="text-muted">—</span>{% endif %}
+          </td>
+          <td class="small">
+            {% if _vendor %}
+              <span title="NIC vendor resolved from the OUI database">{{ _vendor }}</span>
+            {% elif l.mac %}
+              <span class="text-muted" title="MAC prefix not in the OUI database — refresh it from Engines → Tools → Scan">unknown</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
           </td>
           <td>{{ l.client_hostname or '—' }}</td>
           <td>
@@ -449,16 +461,27 @@
         <tr>
           <th>IP</th>
           <th>MAC (from ARP)</th>
+          <th>Vendor</th>
           <th>Discovery</th>
           <th>Reservation</th>
         </tr>
       </thead>
       <tbody>
         {% for r in untracked_rows %}
+        {% set _vendor = oui_vendor(r.mac) if r.mac else '' %}
         <tr class="discovery-row"
             data-discovery="{{ r.scan_state or '' }}">
           <td><code>{{ r.ip }}</code></td>
           <td><code>{{ r.mac or '—' }}</code></td>
+          <td class="small">
+            {% if _vendor %}
+              <span title="NIC vendor resolved from the OUI database">{{ _vendor }}</span>
+            {% elif r.mac %}
+              <span class="text-muted" title="MAC prefix not in the OUI database">unknown</span>
+            {% else %}
+              <span class="text-muted">—</span>
+            {% endif %}
+          </td>
           <td class="small">{{ scan_badge(r.scan_state, r.scan_icmp, r.scan_arp) }}</td>
           <td class="small">
             {% if r.reservation_id %}
