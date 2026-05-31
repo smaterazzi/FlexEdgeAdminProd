@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-31
 
+### Engine SSH Credentials — SSH allow rule source-Host publish bug + UX (2026-05-31)
+
+Follow-up to the per-engine source-IP override, fixing the publish process itself. Operator report: when an SMC Host with the rule's canonical name already exists, the install path didn't reconcile its IP — so changing the source produced no actual change on the engine.
+
+**Root-cause bug — stale Host reuse on install.** `add_ssh_access_rule` built its source / destination Host elements via `_ensure_host_for_ip`, which returns a pre-existing Host **as-is, without inspecting or updating its `address`**. When `<rule_name>-src` (or a `-dst-<i>` slot) lingered in SMC from a prior install — the rule removed but its Host surviving, or a name collision with an unrelated Host — the new rule was created pointing at the **stale IP**; the operator's intended source was silently ignored. Fixed by switching install to `_ensure_host_for_ip_force`, which syncs the Host's `address` to the requested IP when it already exists.
+
+**Latent bug in the force helper — phantom on missing Host.** `_ensure_host_for_ip_force` itself was only ever exercised against already-existing Hosts (its sole caller, `update_ssh_rule_destinations`, runs after install). When pointed at a *missing* Host it tried `update()` (which fails on real SMC), logged a warning, and returned a Host that was **never created** — a rule referencing it would then fail. Rewrote the helper to probe existence via `.href` (forcing a fetch, like the non-force variant) and `Host.create()` when that raises; only read `.address` + `update()` on mismatch when the element actually exists. Verified across all four states: stale→update, missing→create, same→no-op, and the old non-force behavior documented as the broken baseline.
+
+**UX — the install-form source field is install-only now.** When the rule already exists, `add_ssh_access_rule` early-returns and never consumes the install form's source IP — so the "FEA source IP for this rule" field was dead weight in that case (exactly the operator's observation). The field is now rendered **only when no rule exists yet**. When the rule exists, the credentials wizard always surfaces a **"Change rule source IP"** card with editable **Overwrite** (cutover — replace the source Host's IP in place) and **Add** (transition — keep both old + new sources) controls, regardless of whether the source currently drifts. Those go through `update_source_host_address` / `add_source_host_to_rule`, which do mutate the Host's `address` correctly. The Overwrite field pre-fills with the rule's *live* current source (read from SMC), the Add field with the domain default. Net effect: there's now exactly one correct way to change an existing rule's source, and the wizard points the operator straight at it instead of offering a field that silently did nothing.
+
+Module: [webapp/smc_dhcp_client.py](webapp/smc_dhcp_client.py) (`add_ssh_access_rule`, `_ensure_host_for_ip_force`); template: [webapp/templates/dhcp/credentials.html](webapp/templates/dhcp/credentials.html) (`renderRuleSection`).
+
 ### Engine SSH Credentials — per-engine FEA source-IP override (2026-05-31)
 
 The SSH allow rule's **source** (the FEA address the engine sees on inbound TCP/22) was previously always the domain-wide `flexedge_source_ip` — one IP for every engine in the domain. Operators behind 1:1 NAT, where FEA reaches different engines from different egress addresses, had no way to set a per-engine source. Now the SSH-allow-rule block carries an editable **"FEA source IP for this rule"** field, pre-filled with the domain default but overridable per engine.

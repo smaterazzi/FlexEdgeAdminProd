@@ -1914,28 +1914,39 @@ def _ensure_host_for_ip(name: str, ip: str) -> Host:
 def _ensure_host_for_ip_force(name: str, ip: str) -> Host:
     """Get-or-create + sync the IP. Unlike ``_ensure_host_for_ip`` this
     UPDATES the Host element's ``address`` field when it already exists
-    with a different IP. Needed by ``update_ssh_rule_destinations``
-    when reusing the canonical ``{rule_name}-dst-<i>`` slot names for
-    a different set of IPs.
+    with a different IP. Used by ``update_ssh_rule_destinations`` (reusing
+    canonical ``{rule_name}-dst-<i>`` slots for a new IP set) and by
+    ``add_ssh_access_rule`` (so a fresh rule created over a lingering
+    Host element with a stale IP still ends up allowing the requested IP).
+
+    Existence is probed via ``.href`` (forces a fetch) exactly like the
+    non-force variant — if that raises, the element doesn't exist and we
+    CREATE it. Only when it exists do we read ``.address`` and update on
+    mismatch. (2026-05-31 fix — the prior implementation tried
+    ``update()`` on a missing element, which fails on real SMC, logs a
+    warning, and returns a phantom Host that was never created. That was
+    harmless only because the single original caller always ran against
+    already-existing Hosts.)
     """
+    host = Host(name)
     try:
-        host = Host(name)
-        # Force load — triggers a fetch that populates `.address`.
-        current = ""
-        try:
-            current = str(getattr(host, "address", "") or "")
-        except Exception:
-            current = ""
-        if current != ip:
-            try:
-                host.update(address=ip)
-            except Exception as exc:
-                logger.warning("_ensure_host_for_ip_force: could not update "
-                               "%s from %s → %s: %s", name, current, ip, exc)
-        return host
+        host.href      # force load — raises if the element doesn't exist
     except Exception:
         Host.create(name=name, address=ip)
         return Host(name)
+    # Exists — read its current address and sync if it drifted.
+    current = ""
+    try:
+        current = str(getattr(host, "address", "") or "")
+    except Exception:
+        current = ""
+    if current != ip:
+        try:
+            host.update(address=ip)
+        except Exception as exc:
+            logger.warning("_ensure_host_for_ip_force: could not update "
+                           "%s from %s → %s: %s", name, current, ip, exc)
+    return host
 
 
 def update_ssh_rule_destinations(policy_name: str, rule_name: str,
@@ -2076,11 +2087,19 @@ def add_ssh_access_rule(policy_name: str, rule_name: str,
             )
         return existing["href"]
 
-    src_host = _ensure_host_for_ip(f"{rule_name}-src", source_ip)
+    # Use the *force* variant so a pre-existing Host element at the
+    # canonical name gets its IP synced to what the operator requested.
+    # The non-force variant silently reused a stale Host, so a rule
+    # created over a lingering `<rule_name>-src` (e.g. from a prior
+    # install whose rule was removed but whose Host survived, or a name
+    # collision) would point at the OLD IP — the rule then allowed the
+    # wrong source and the operator's intended IP was never applied.
+    # (2026-05-31 fix — see Engine SSH Credentials publish-process audit.)
+    src_host = _ensure_host_for_ip_force(f"{rule_name}-src", source_ip)
     dst_hosts: list[Host] = []
     for i, ip in enumerate(destination_ips):
         host_name = f"{rule_name}-dst-{i}"
-        dst_hosts.append(_ensure_host_for_ip(host_name, ip))
+        dst_hosts.append(_ensure_host_for_ip_force(host_name, ip))
 
     policy = FirewallPolicy(policy_name)
     action = Action()
