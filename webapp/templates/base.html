@@ -130,6 +130,25 @@
         /* Quick-search dropdown row hover state */
         .quick-search-row { transition: background .1s; }
         .quick-search-row:hover { background: #2d3238; }
+        /* Draggable sidebar sections (2026-05-31). */
+        .sidebar-section { cursor: grab; }
+        .sidebar-section:active { cursor: grabbing; }
+        .sidebar-section.dragging {
+            opacity: 0.4;
+            outline: 1px dashed #6c757d;
+        }
+        .sidebar-section.drop-target-top { box-shadow: 0 -2px 0 0 #0d6efd inset; }
+        .sidebar-section.drop-target-bottom { box-shadow: 0 2px 0 0 #0d6efd inset; }
+        .sidebar-section .drag-handle {
+            color: #6c757d; margin-right: .25rem;
+            font-size: 0.85rem; opacity: 0.5;
+            transition: opacity .15s;
+        }
+        .sidebar-section:hover .drag-handle { opacity: 1; }
+        /* Anchors inside a draggable section must not initiate the drag
+           themselves — without this the browser tries to drag the link's
+           href instead of the section. */
+        .sidebar-section a, .sidebar-section .nav-link { -webkit-user-drag: none; }
         /* Topbar search input — make it visually integrated with the
            dark theme without losing the focus ring. */
         #quick-search-input::placeholder { color: #6c757d; }
@@ -151,245 +170,316 @@
                 <div class="text-muted" style="font-size:0.7rem;">Forcepoint SMC Administration</div>
             </a>
 
-            <div class="section-label">Navigation</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">
-                        <i class="bi bi-speedometer2"></i> Dashboard
-                    </a>
-                </li>
-                {# Roadmap item 3 (Batch J, 2026-05-11): "Policies" entry
-                   removed — duplicate of Infrastructure → Firewall
-                   Policies. `/policies` route 302-redirects to
-                   `/browse/fw_policies` to preserve bookmarks. #}
-            </ul>
+            {# Draggable sidebar sections (2026-05-31). Each .sidebar-section
+               wraps a section-label + its <ul>; HTML5 drag-and-drop reorders
+               them and persists per-user via POST /api/sidebar-order. The
+               server-rendered order honors user_sidebar_order — sections in
+               the saved list render first in the saved order, then any
+               sections not in the saved list render in their default
+               position. New sections (added later) are never hidden. #}
+            <div id="sidebar-sortable" class="d-flex flex-column flex-grow-1">
+                {%- macro section_navigation() %}
+                <div class="sidebar-section" data-section-id="navigation" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Navigation</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/' %}active{% endif %}" href="/">
+                                <i class="bi bi-speedometer2"></i> Dashboard
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_network_objects() %}
+                <div class="sidebar-section" data-section-id="network_objects" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Network Objects</div>
+                    <ul class="nav flex-column mb-2">
+                        {% for key, info in element_types.items() if key in ('zones','hosts','networks','address_ranges','domain_names','groups') %}
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
+                               href="/browse/{{ key }}">
+                                <i class="bi bi-{% if key == 'zones' %}layers{% elif key == 'hosts' %}pc-display{% elif key == 'networks' %}diagram-3{% elif key == 'groups' %}collection{% elif key == 'domain_names' %}globe{% else %}arrows-angle-expand{% endif %}"></i>
+                                {{ info.label }}
+                            </a>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_services() %}
+                <div class="sidebar-section" data-section-id="services" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Services</div>
+                    <ul class="nav flex-column mb-2">
+                        {% for key, info in element_types.items() if key in ('tcp_services','udp_services','ip_services','icmp_services','service_groups') %}
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
+                               href="/browse/{{ key }}">
+                                <i class="bi bi-{% if 'group' in key %}folder{% else %}plug{% endif %}"></i>
+                                {{ info.label }}
+                            </a>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_infrastructure() %}
+                <div class="sidebar-section" data-section-id="infrastructure" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Infrastructure</div>
+                    <ul class="nav flex-column mb-2">
+                        {% for key, info in element_types.items() if key in ('fw_policies','l3_firewalls') %}
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
+                               href="/browse/{{ key }}">
+                                <i class="bi bi-{% if 'firewall' in key %}bricks{% else %}file-earmark-ruled{% endif %}"></i>
+                                {{ info.label }}
+                            </a>
+                        </li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_migration() %}
+                <div class="sidebar-section" data-section-id="migration" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Migration</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/migration' in request.path %}active{% endif %}" href="/migration/">
+                                <i class="bi bi-arrow-left-right"></i> Import Projects
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_optimizer() %}
+                <div class="sidebar-section" data-section-id="optimizer" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Optimizer</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/optimize' or request.path.startswith('/optimize/') and '/submissions' not in request.path %}active{% endif %}"
+                               href="{{ url_for('optimize_list') }}">
+                                <i class="bi bi-magic"></i> Rule Optimizer
+                            </a>
+                        </li>
+                        {% if is_domain_admin %}
+                        <li class="nav-item">
+                            <a class="nav-link d-flex justify-content-between align-items-center
+                                      {% if '/optimize/submissions' in request.path %}active{% endif %}"
+                               href="{{ url_for('optimize_submissions') }}">
+                                <span><i class="bi bi-inbox"></i> Review Queue</span>
+                                {% if optimizer_pending_count %}
+                                <span class="badge bg-warning text-dark">{{ optimizer_pending_count }}</span>
+                                {% endif %}
+                            </a>
+                        </li>
+                        {% endif %}
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_change_queue() %}
+                <div class="sidebar-section" data-section-id="change_queue" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Change Queue</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link d-flex justify-content-between align-items-center
+                                      {% if request.path == url_for('changes.index') %}active{% endif %}"
+                               href="{{ url_for('changes.index') }}">
+                                <span><i class="bi bi-stack"></i> Pending changes</span>
+                                {% if pending_changes_count %}
+                                <span class="badge bg-warning text-dark">{{ pending_changes_count }}</span>
+                                {% endif %}
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link
+                                      {% if '/changes/drift' in request.path %}active{% endif %}"
+                               href="{{ url_for('changes.drift_index') }}">
+                                <i class="bi bi-binoculars"></i> Drift detector
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_tls() %}
+                <div class="sidebar-section" data-section-id="tls" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> TLS Manager</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/tls/' %}active{% endif %}" href="/tls/">
+                                <i class="bi bi-shield-check"></i> Dashboard
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/certificates' in request.path %}active{% endif %}" href="/tls/certificates">
+                                <i class="bi bi-file-earmark-lock"></i> Certificates
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/deploy' in request.path %}active{% endif %}" href="/tls/deploy">
+                                <i class="bi bi-rocket-takeoff"></i> Deploy
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/hook' in request.path %}active{% endif %}" href="/tls/hook">
+                                <i class="bi bi-arrow-repeat"></i> Renewal Hook
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/letsencrypt' in request.path %}active{% endif %}"
+                               href="{{ url_for('letsencrypt.list_certs') }}">
+                                <i class="bi bi-shield-lock"></i> Let's Encrypt
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/expirations' in request.path or '/tls/smtp' in request.path %}active{% endif %}"
+                               href="{{ url_for('tls.expirations_dashboard') }}">
+                                <i class="bi bi-calendar-event"></i> Expirations
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_engines() %}
+                <div class="sidebar-section" data-section-id="engines" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Engines</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/engines/clusters' in request.path %}active{% endif %}"
+                               href="{{ url_for('engines.clusters') }}">
+                                <i class="bi bi-bricks"></i> Clusters
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}"
+                               href="/dhcp/credentials">
+                                <i class="bi bi-key"></i> Credentials
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/engines/tools' in request.path %}active{% endif %}"
+                               href="{{ url_for('engines.tools') }}">
+                                <i class="bi bi-tools"></i> Tools
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path.startswith('/engines/scans') and '/graph' not in request.path %}active{% endif %}"
+                               href="{{ url_for('scan_history.history') }}">
+                                <i class="bi bi-clock-history"></i> Scan history
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/engines/scans/graph' in request.path %}active{% endif %}"
+                               href="{{ url_for('scan_history.graph') }}">
+                                <i class="bi bi-graph-up"></i> Time graph
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_dhcp() %}
+                <div class="sidebar-section" data-section-id="dhcp" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> DHCP Manager</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/dhcp/' %}active{% endif %}" href="/dhcp/">
+                                <i class="bi bi-router"></i> Dashboard
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/dhcp/scopes' in request.path %}active{% endif %}" href="/dhcp/scopes">
+                                <i class="bi bi-diagram-3"></i> Scopes
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_logs() %}
+                <div class="sidebar-section" data-section-id="logs" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Logs</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if request.path == '/logs' %}active{% endif %}"
+                               href="{{ url_for('logs_index') }}">
+                                <i class="bi bi-journal-text"></i> Activity Logs
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/dhcp/history' in request.path %}active{% endif %}" href="/dhcp/history">
+                                <i class="bi bi-clock-history"></i> DHCP Deployments
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/tls/history' in request.path %}active{% endif %}" href="/tls/history">
+                                <i class="bi bi-shield-check"></i> TLS Deployments
+                            </a>
+                        </li>
+                        {% if is_super_admin %}
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/admin/log-settings' in request.path %}active{% endif %}"
+                               href="{{ url_for('admin.log_settings') }}">
+                                <i class="bi bi-gear"></i> Log Settings
+                            </a>
+                        </li>
+                        {% endif %}
+                    </ul>
+                </div>
+                {%- endmacro %}
+                {%- macro section_administration() %}
+                <div class="sidebar-section" data-section-id="administration" draggable="true">
+                    <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Administration</div>
+                    <ul class="nav flex-column mb-2">
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/admin' in request.path %}active{% endif %}" href="/admin/">
+                                <i class="bi bi-gear"></i> Admin Portal
+                            </a>
+                        </li>
+                    </ul>
+                </div>
+                {%- endmacro %}
 
-            <div class="section-label">Network Objects</div>
-            <ul class="nav flex-column mb-2">
-                {% for key, info in element_types.items() if key in ('zones','hosts','networks','address_ranges','domain_names','groups') %}
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
-                       href="/browse/{{ key }}">
-                        <i class="bi bi-{% if key == 'zones' %}layers{% elif key == 'hosts' %}pc-display{% elif key == 'networks' %}diagram-3{% elif key == 'groups' %}collection{% elif key == 'domain_names' %}globe{% else %}arrows-angle-expand{% endif %}"></i>
-                        {{ info.label }}
-                    </a>
-                </li>
-                {% endfor %}
-            </ul>
-
-            <div class="section-label">Services</div>
-            <ul class="nav flex-column mb-2">
-                {% for key, info in element_types.items() if key in ('tcp_services','udp_services','ip_services','icmp_services','service_groups') %}
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
-                       href="/browse/{{ key }}">
-                        <i class="bi bi-{% if 'group' in key %}folder{% else %}plug{% endif %}"></i>
-                        {{ info.label }}
-                    </a>
-                </li>
-                {% endfor %}
-            </ul>
-
-            <div class="section-label">Infrastructure</div>
-            <ul class="nav flex-column mb-2">
-                {% for key, info in element_types.items() if key in ('fw_policies','l3_firewalls') %}
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/browse/' + key %}active{% endif %}"
-                       href="/browse/{{ key }}">
-                        <i class="bi bi-{% if 'firewall' in key %}bricks{% else %}file-earmark-ruled{% endif %}"></i>
-                        {{ info.label }}
-                    </a>
-                </li>
-                {% endfor %}
-            </ul>
-
-            <div class="section-label">Migration</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if '/migration' in request.path %}active{% endif %}" href="/migration/">
-                        <i class="bi bi-arrow-left-right"></i> Import Projects
-                    </a>
-                </li>
-            </ul>
-
-            <div class="section-label">Optimizer</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/optimize' or request.path.startswith('/optimize/') and '/submissions' not in request.path %}active{% endif %}"
-                       href="{{ url_for('optimize_list') }}">
-                        <i class="bi bi-magic"></i> Rule Optimizer
-                    </a>
-                </li>
+                {# Build the canonical default order — only sections the user
+                   can actually see (role gating happens here, not inside each
+                   section). #}
+                {% set _default_order = ['navigation', 'network_objects', 'services', 'infrastructure', 'migration', 'optimizer'] %}
+                {% if is_domain_operator %}
+                  {% set _default_order = _default_order + ['change_queue', 'tls', 'engines', 'dhcp', 'logs'] %}
+                {% endif %}
                 {% if is_domain_admin %}
-                <li class="nav-item">
-                    <a class="nav-link d-flex justify-content-between align-items-center
-                              {% if '/optimize/submissions' in request.path %}active{% endif %}"
-                       href="{{ url_for('optimize_submissions') }}">
-                        <span><i class="bi bi-inbox"></i> Review Queue</span>
-                        {% if optimizer_pending_count %}
-                        <span class="badge bg-warning text-dark">{{ optimizer_pending_count }}</span>
-                        {% endif %}
-                    </a>
-                </li>
+                  {% set _default_order = _default_order + ['administration'] %}
                 {% endif %}
-            </ul>
 
-            {# Phase B (Change Management) — TLS / Engines / DHCP / Logs are
-               visible to anyone with a Domain role (Operator, Admin, Global
-               Admin). Operators can browse + submit changes through the
-               queue; the per-route action gating handles delete vs. mutate.
-               Pre-Phase-B admins all satisfy is_domain_operator via the
-               is_global_admin backfill, so today's view is unchanged. #}
-            {% if is_domain_operator %}
-            <div class="section-label">Change Queue</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link d-flex justify-content-between align-items-center
-                              {% if request.path == url_for('changes.index') %}active{% endif %}"
-                       href="{{ url_for('changes.index') }}">
-                        <span><i class="bi bi-stack"></i> Pending changes</span>
-                        {% if pending_changes_count %}
-                        <span class="badge bg-warning text-dark">{{ pending_changes_count }}</span>
-                        {% endif %}
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link
-                              {% if '/changes/drift' in request.path %}active{% endif %}"
-                       href="{{ url_for('changes.drift_index') }}">
-                        <i class="bi bi-binoculars"></i> Drift detector
-                    </a>
-                </li>
-            </ul>
+                {# Per-user saved order — sections in saved order first,
+                   then any remaining in default order so newly-added sections
+                   appear without being hidden. #}
+                {% set _saved = (user_sidebar_order or '').split(',') | map('trim') | select | list %}
+                {% set _allowed = _default_order %}
+                {% set _ordered = [] %}
+                {% for sid in _saved %}
+                  {% if sid in _allowed and sid not in _ordered %}
+                    {% set _ = _ordered.append(sid) %}
+                  {% endif %}
+                {% endfor %}
+                {% for sid in _allowed %}
+                  {% if sid not in _ordered %}
+                    {% set _ = _ordered.append(sid) %}
+                  {% endif %}
+                {% endfor %}
 
-            <div class="section-label">TLS Manager</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/tls/' %}active{% endif %}" href="/tls/">
-                        <i class="bi bi-shield-check"></i> Dashboard
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/certificates' in request.path %}active{% endif %}" href="/tls/certificates">
-                        <i class="bi bi-file-earmark-lock"></i> Certificates
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/deploy' in request.path %}active{% endif %}" href="/tls/deploy">
-                        <i class="bi bi-rocket-takeoff"></i> Deploy
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/hook' in request.path %}active{% endif %}" href="/tls/hook">
-                        <i class="bi bi-arrow-repeat"></i> Renewal Hook
-                    </a>
-                </li>
-                {# Roadmap item 5 / Phase LE.2 (2026-05-11) — Let's Encrypt CRUD. #}
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/letsencrypt' in request.path %}active{% endif %}"
-                       href="{{ url_for('letsencrypt.list_certs') }}">
-                        <i class="bi bi-shield-lock"></i> Let's Encrypt
-                    </a>
-                </li>
-                {# Expiration dashboard + SMTP alerts (2026-05-31). #}
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/expirations' in request.path or '/tls/smtp' in request.path %}active{% endif %}"
-                       href="{{ url_for('tls.expirations_dashboard') }}">
-                        <i class="bi bi-calendar-event"></i> Expirations
-                    </a>
-                </li>
-            </ul>
-
-            <div class="section-label">Engines</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if '/engines/clusters' in request.path %}active{% endif %}"
-                       href="{{ url_for('engines.clusters') }}">
-                        <i class="bi bi-bricks"></i> Clusters
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}"
-                       href="/dhcp/credentials">
-                        <i class="bi bi-key"></i> Credentials
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/engines/tools' in request.path %}active{% endif %}"
-                       href="{{ url_for('engines.tools') }}">
-                        <i class="bi bi-tools"></i> Tools
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path.startswith('/engines/scans') and '/graph' not in request.path %}active{% endif %}"
-                       href="{{ url_for('scan_history.history') }}">
-                        <i class="bi bi-clock-history"></i> Scan history
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/engines/scans/graph' in request.path %}active{% endif %}"
-                       href="{{ url_for('scan_history.graph') }}">
-                        <i class="bi bi-graph-up"></i> Time graph
-                    </a>
-                </li>
-            </ul>
-
-            <div class="section-label">DHCP Manager</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/dhcp/' %}active{% endif %}" href="/dhcp/">
-                        <i class="bi bi-router"></i> Dashboard
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/dhcp/scopes' in request.path %}active{% endif %}" href="/dhcp/scopes">
-                        <i class="bi bi-diagram-3"></i> Scopes
-                    </a>
-                </li>
-            </ul>
-
-            <div class="section-label">Logs</div>
-            <ul class="nav flex-column mb-2">
-                <li class="nav-item">
-                    <a class="nav-link {% if request.path == '/logs' %}active{% endif %}"
-                       href="{{ url_for('logs_index') }}">
-                        <i class="bi bi-journal-text"></i> Activity Logs
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/dhcp/history' in request.path %}active{% endif %}" href="/dhcp/history">
-                        <i class="bi bi-clock-history"></i> DHCP Deployments
-                    </a>
-                </li>
-                <li class="nav-item">
-                    <a class="nav-link {% if '/tls/history' in request.path %}active{% endif %}" href="/tls/history">
-                        <i class="bi bi-shield-check"></i> TLS Deployments
-                    </a>
-                </li>
-                {% if is_super_admin %}
-                <li class="nav-item">
-                    <a class="nav-link {% if '/admin/log-settings' in request.path %}active{% endif %}"
-                       href="{{ url_for('admin.log_settings') }}">
-                        <i class="bi bi-gear"></i> Log Settings
-                    </a>
-                </li>
-                {% endif %}
-            </ul>
-
-            {# Admin Portal (tenant/api-key/user/domain CRUD + log settings)
-               is for Domain Admins and Global Admins. Operators do not
-               see this section. #}
-            {% if is_domain_admin %}
-            <div class="section-label">Administration</div>
-            <ul class="nav flex-column mb-auto">
-                <li class="nav-item">
-                    <a class="nav-link {% if '/admin' in request.path %}active{% endif %}" href="/admin/">
-                        <i class="bi bi-gear"></i> Admin Portal
-                    </a>
-                </li>
-            </ul>
-            {% endif %}
-            {% endif %}{# is_domain_operator #}
+                {% for sid in _ordered %}
+                  {% if sid == 'navigation' %}{{ section_navigation() }}
+                  {% elif sid == 'network_objects' %}{{ section_network_objects() }}
+                  {% elif sid == 'services' %}{{ section_services() }}
+                  {% elif sid == 'infrastructure' %}{{ section_infrastructure() }}
+                  {% elif sid == 'migration' %}{{ section_migration() }}
+                  {% elif sid == 'optimizer' %}{{ section_optimizer() }}
+                  {% elif sid == 'change_queue' %}{{ section_change_queue() }}
+                  {% elif sid == 'tls' %}{{ section_tls() }}
+                  {% elif sid == 'engines' %}{{ section_engines() }}
+                  {% elif sid == 'dhcp' %}{{ section_dhcp() }}
+                  {% elif sid == 'logs' %}{{ section_logs() }}
+                  {% elif sid == 'administration' %}{{ section_administration() }}
+                  {% endif %}
+                {% endfor %}
+            </div>{# /#sidebar-sortable #}
 
             <!-- Active context badge -->
             {% if active_profile %}
@@ -642,6 +732,97 @@
             if (e.target.closest('a, button[type="submit"]')) save();
         });
         window.addEventListener('beforeunload', save);
+    })();
+
+    // ── Draggable sidebar sections (2026-05-31) ─────────────────────────
+    //
+    // Each .sidebar-section under #sidebar-sortable is HTML5-draggable.
+    // Drop reorders the DOM and POSTs the new section-ID order to
+    // /api/sidebar-order; the server persists it on User.sidebar_section_order
+    // so the next page load renders the saved order server-side (no
+    // flash of unstyled order).
+    (function () {
+        const container = document.getElementById('sidebar-sortable');
+        if (!container) return;
+        const sections = () => Array.from(container.querySelectorAll(':scope > .sidebar-section'));
+
+        let dragging = null;
+
+        function clearDropTargets() {
+            sections().forEach(s => {
+                s.classList.remove('drop-target-top', 'drop-target-bottom');
+            });
+        }
+
+        function saveOrder() {
+            const order = sections().map(s => s.dataset.sectionId).filter(Boolean);
+            if (!order.length) return;
+            try {
+                window.fexFetch('/api/sidebar-order', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ order: order }),
+                }).catch(err => {
+                    console.warn('sidebar-order save failed:', err);
+                });
+            } catch (e) {
+                console.warn('sidebar-order save threw:', e);
+            }
+        }
+
+        sections().forEach(section => {
+            section.addEventListener('dragstart', (e) => {
+                // Only initiate a drag from the section background, NOT from
+                // a click on a nav-link (so links remain clickable).
+                if (e.target.closest('.nav-link, a, button')) {
+                    e.preventDefault();
+                    return;
+                }
+                dragging = section;
+                section.classList.add('dragging');
+                try {
+                    e.dataTransfer.effectAllowed = 'move';
+                    e.dataTransfer.setData('text/plain', section.dataset.sectionId || '');
+                } catch (_) { /* some browsers reject setData on drag start */ }
+            });
+
+            section.addEventListener('dragend', () => {
+                if (dragging) dragging.classList.remove('dragging');
+                clearDropTargets();
+                dragging = null;
+            });
+
+            section.addEventListener('dragover', (e) => {
+                if (!dragging || dragging === section) return;
+                e.preventDefault();
+                e.dataTransfer.dropEffect = 'move';
+                const rect = section.getBoundingClientRect();
+                const after = e.clientY > rect.top + rect.height / 2;
+                clearDropTargets();
+                section.classList.add(after ? 'drop-target-bottom' : 'drop-target-top');
+            });
+
+            section.addEventListener('dragleave', (e) => {
+                // Only clear if leaving the section bounds entirely.
+                if (!section.contains(e.relatedTarget)) {
+                    section.classList.remove('drop-target-top', 'drop-target-bottom');
+                }
+            });
+
+            section.addEventListener('drop', (e) => {
+                if (!dragging || dragging === section) return;
+                e.preventDefault();
+                const rect = section.getBoundingClientRect();
+                const after = e.clientY > rect.top + rect.height / 2;
+                clearDropTargets();
+                if (after) {
+                    section.parentNode.insertBefore(dragging, section.nextSibling);
+                } else {
+                    section.parentNode.insertBefore(dragging, section);
+                }
+                saveOrder();
+            });
+        });
     })();
 
     // ── Quick-search (top-center input) ─────────────────────────────────

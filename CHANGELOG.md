@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-31
 
+### Sidebar — drag-and-drop section reorder, per-user (2026-05-31)
+
+Every sidebar section (Navigation, Network Objects, Services, Infrastructure, Migration, Optimizer, Change Queue, TLS Manager, Engines, DHCP Manager, Logs, Administration) is now HTML5-draggable. Operators reorder by grabbing a section's header (a `bi-grip-vertical` icon hints the affordance) and dropping above or below another section; the new order is persisted server-side on `User.sidebar_section_order` (per-user — different operators get different layouts on the same browser, layouts sync across browsers).
+
+**Server-side rendering of the saved order** — no FOUC. The base template builds a default order (gated by role: Operator-only sections appear for `is_domain_operator`, Administration for `is_domain_admin`), reads `user_sidebar_order` from the inject_globals helper, then emits sections in the saved order first followed by any unsaved sections in their default position. A section added in a future release never gets hidden — it renders at the bottom of its default group until the operator re-drops to position it.
+
+**Whitelisted persistence** at `POST /api/sidebar-order`. The endpoint accepts `{"order": [...]}` and filters every entry against a frozenset of the 12 known section IDs. Junk values (path traversal attempts, made-up keys) are silently dropped; duplicate / mixed-case IDs are deduped to lowercase-first-seen; non-list payloads return HTTP 400; unauthenticated POSTs hit the `@login_required` gate and 302 to login. The persisted column length is hard-capped at the size of the whitelist so repeated POSTs can't grow the row unboundedly.
+
+**Drag-drop UX details.** Native HTML5 drag-and-drop — zero new JS deps (matches the standing rule of vendoring functional assets locally). Each `.sidebar-section` carries the `draggable="true"` attribute; the drag is suppressed when the operator's `mousedown` originates on a `<a>` / `<button>` / `.nav-link` so links remain clickable. Visual cues: faded `.dragging` ghost on the source; thin top/bottom indigo edge on the section the cursor is over (top half = drop above, bottom half = drop below). Drop fires the DOM move + the persistence POST via the existing `window.fexFetch` wrapper (auto-attaches `X-CSRFToken`).
+
+**Schema migration.** Additive column `users.sidebar_section_order TEXT NOT NULL DEFAULT ""` added via the existing `_migrate_post_create` flow — picks up on next boot without operator intervention. Legacy User rows get the default empty value, which means "use the rendered order from base.html" — exactly today's behavior.
+
+Modules: column on `User` in [webapp/models.py](webapp/models.py); migration in [webapp/db_init.py](webapp/db_init.py) `_migrate_post_create`; API endpoint `api_sidebar_order_save` + `_ALLOWED_SIDEBAR_SECTIONS` whitelist in [webapp/app.py](webapp/app.py); injection variable `user_sidebar_order` in the same file's `inject_globals`; template macros + ordered render loop + CSS + drag IIFE in [webapp/templates/base.html](webapp/templates/base.html).
+
 ### TLS Manager — expiration dashboard + SMTP alerts (2026-05-31)
 
 Operator-requested counterpart to the PFX import. Closes the loop on cert lifecycle: import / track / deploy / **get pinged 30 / 14 / 7 / 3 / 1 days before expiry** / renew. Works uniformly across all three cert sources (LE HTTP-01, LE DNS-01 wildcards, PFX-imported) — they're all `ManagedCertificate` rows with an on-disk `cert.pem` whose `not_valid_after` the new module reads at sweep time.

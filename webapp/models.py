@@ -123,6 +123,13 @@ class User(db.Model):
     is_active = db.Column(db.Boolean, default=True, nullable=False)
     created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
     updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    # Per-user UI preference: drag-and-drop order for sidebar sections.
+    # Stored as a comma-separated list of section IDs (see base.html
+    # `data-section-id` attributes). NULL / empty = use default order.
+    # Sections present in the DB but not in this list (e.g. a new
+    # feature added after the user last saved) render in their default
+    # position at the bottom — never hidden.
+    sidebar_section_order = db.Column(db.Text, default="", nullable=False)
 
     # Relationships
     domain_accesses = db.relationship("UserDomainAccess", back_populates="user", lazy="joined")

@@ -207,6 +207,22 @@ def _migrate_post_create(db, app):
     if not _is_sqlite(app):
         return
 
+    # Add users.sidebar_section_order (per-user UI preference, 2026-05-31).
+    # Additive column — legacy rows get the default empty value which
+    # means "use the rendered order from base.html".
+    cols = _sqlite_columns(db, "users")
+    if cols and "sidebar_section_order" not in cols:
+        log.info("Adding users.sidebar_section_order column")
+        try:
+            db.session.execute(db.text(
+                "ALTER TABLE users ADD COLUMN sidebar_section_order "
+                "TEXT NOT NULL DEFAULT ''"
+            ))
+            db.session.commit()
+        except Exception as exc:
+            db.session.rollback()
+            log.error("Failed to add users.sidebar_section_order: %s", exc)
+
     # Add tenants.flexedge_source_ip if missing (existing tenants tables
     # predate this column).
     cols = _sqlite_columns(db, "tenants")

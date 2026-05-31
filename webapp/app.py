@@ -454,6 +454,20 @@ def inject_globals():
     if current_user:
         current_user_role = user_manager.get_user_role(current_user.get("email", ""))
 
+    # Sidebar drag-and-drop order (per-user UI preference, 2026-05-31).
+    # Loaded once per request so the sidebar can render in the saved
+    # order server-side, eliminating FOUC reordering. Read failure
+    # falls through to the default (empty) order.
+    user_sidebar_order = ""
+    if current_user:
+        try:
+            from webapp.models import User as _User
+            _u = _User.query.filter_by(email=current_user.get("email", "")).first()
+            if _u is not None and _u.sidebar_section_order:
+                user_sidebar_order = _u.sidebar_section_order
+        except Exception:
+            pass
+
     # Phase B (Change Management, refined 2026-05-01) — fine-grained role
     # resolution against the active Domain. The legacy
     # `current_user_role == 'admin'` check in templates keeps working
@@ -516,6 +530,7 @@ def inject_globals():
         "active_domain_obj": getattr(g, "domain", None),
         "available_profiles": available_profiles,
         "app_title":        os.environ.get("APP_TITLE", "FlexEdgeAdmin"),
+        "user_sidebar_order": user_sidebar_order,
         "setup_required":   app.config.get("SETUP_REQUIRED", False),
         "build_version":    _build_version,
         # M11 (audit fix-up, 2026-05-09): short cache-bust token for
@@ -1029,6 +1044,66 @@ def policy_rules(policy_name):
 
 
 # ── JSON API (read-only) ────────────────────────────────────────────────
+
+_ALLOWED_SIDEBAR_SECTIONS = frozenset({
+    "navigation", "network_objects", "services", "infrastructure",
+    "migration", "optimizer",
+    "change_queue", "tls", "engines", "dhcp", "logs",
+    "administration",
+})
+
+
+@app.route("/api/sidebar-order", methods=["POST"])
+@login_required
+def api_sidebar_order_save():
+    """Persist the user's drag-and-drop sidebar section order.
+
+    Body: ``{"order": ["navigation", "tls", "engines", ...]}``.
+
+    Whitelists every section ID against the known set so a malicious
+    payload can't store junk that downstream renders process. Drops
+    duplicates while preserving first-seen order. Hard-caps the list
+    length at the size of the whitelist so the column can't grow
+    unboundedly via repeated POSTs.
+    """
+    current_user = session.get("user")
+    if not current_user or not current_user.get("email"):
+        return jsonify({"ok": False, "error": "unauthenticated"}), 401
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    raw = payload.get("order")
+    if not isinstance(raw, list):
+        return jsonify({"ok": False, "error": "order must be a list"}), 400
+    seen = set()
+    cleaned = []
+    for item in raw:
+        if not isinstance(item, str):
+            continue
+        sid = item.strip().lower()
+        if sid in _ALLOWED_SIDEBAR_SECTIONS and sid not in seen:
+            seen.add(sid)
+            cleaned.append(sid)
+        if len(cleaned) >= len(_ALLOWED_SIDEBAR_SECTIONS):
+            break
+    try:
+        from webapp.models import User as _User
+        from shared.db import db as _db
+        u = _User.query.filter_by(email=current_user["email"]).first()
+        if u is None:
+            return jsonify({"ok": False, "error": "user not found"}), 404
+        u.sidebar_section_order = ",".join(cleaned)
+        _db.session.commit()
+    except Exception as exc:
+        try:
+            from shared.db import db as _db
+            _db.session.rollback()
+        except Exception:
+            pass
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    return jsonify({"ok": True, "order": cleaned})
+
 
 @app.route("/api/quick-search")
 @profile_required
