@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-31
 
+### Engine SSH Credentials — "Re-push policy" no longer blocked by source drift (2026-05-31)
+
+Operator report: with the FEA source object already in SMC, clicking **Re-push policy** on an existing rule failed with `Source IP drift detected: the existing rule was installed with source 10.199.128.7, but the tenant's current FEA source IP is 74.241.219.240. Don't reinstall — pick 'Add new source' or 'Overwrite source'`.
+
+Root cause: the "Re-push policy" button posted to `/credentials/rule/install`, which ran source-IP drift detection and refused whenever the rule's recorded source differed from the domain default. But a re-push is a **pure policy upload** — it doesn't (and shouldn't) touch the rule's source at all, so the drift check was firing spuriously and blocking a legitimate, harmless operation.
+
+Two changes:
+
+- **Re-push routes to the upload-only endpoint.** When the rule already exists, the action now posts to `/credentials/policy-install` (a pure `upload_policy` with no rule mutation and no drift check) instead of `/credentials/rule/install`. The re-push form was also stripped of its now-vestigial source-IP field and destination picker — re-push uploads the policy as-is; source changes go through the always-visible "Change rule source IP" card (Overwrite/Add), destination changes through remove + reinstall. (Same "don't show a field that does nothing" principle applied to the source field earlier.)
+- **The spurious drift refusal was removed from `credentials_rule_install`.** That route now only legitimately runs for a fresh install (no rule in the policy) or a recreate (rule externally removed); in both cases `add_ssh_access_rule` creates the rule with the requested source when absent and no-ops on the source when the rule is already present — so there's no silent-mutation hazard left to guard against. Changing an existing rule's source remains the explicit job of the Overwrite/Add controls.
+
+Net effect: re-pushing a policy whose rule source differs from the domain default just works (uploads the policy), and the operator is never sent chasing a drift banner for an operation that doesn't change the source. Verified with the Flask test client: install with a source differing from the recorded one proceeds past the (removed) drift gate to enqueue; the credentials page renders the re-push form posting to `/policy-install`. Modules: [webapp/dhcp_manager.py](webapp/dhcp_manager.py) (`credentials_rule_install` drift block removed), [webapp/templates/dhcp/credentials.html](webapp/templates/dhcp/credentials.html) (`renderRuleSection` rule-exists branch).
+
 ### Engine SSH Credentials — action-completion flash (2026-05-31)
 
 Operator-requested visual feedback: after any AJAX action in the credentials wizard, the relevant block briefly flashes a **soft green** background on success / **soft red** on failure, so completion is obvious at a glance. The tint holds ~1.4 s then fades over ~1 s and is self-clearing (the class is also stripped in JS so it never bleeds into the wizard's inline re-renders). Pure CSS keyframes — no library, no layout shift.

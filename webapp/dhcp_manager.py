@@ -2561,34 +2561,25 @@ def credentials_rule_install():
         )
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
 
-    # ── Source-IP drift detection ──────────────────────────────────────
-    # ONE canonical rule per engine — never duplicate. If the tenant's
-    # source_ip has drifted since the rule was last installed, do NOT
-    # silently mutate the existing source. Refuse the install here and
-    # surface the choice to the operator via the drift banner: either
-    # ADD the new IP as an additional source Host on the same rule, or
-    # OVERWRITE the existing source Host's address. Both paths keep a
-    # single rule per engine; the operator picks intent explicitly.
+    # NOTE (2026-05-31): the old source-IP "drift refusal" that lived here
+    # was REMOVED. It refused the install whenever the DB-recorded source
+    # differed from the requested source and told the operator to use
+    # Add/Overwrite — but that fired spuriously on a plain "Re-push policy"
+    # (which now routes to /credentials/policy-install, a pure upload that
+    # never touches the rule). Source changes on an EXISTING rule go
+    # through the always-visible "Change rule source IP" card
+    # (Overwrite / Add → update_source_host_address / add_source_host_to_rule).
+    # This route now only legitimately runs for a FRESH install (no rule in
+    # the policy) or a recreate (rule externally removed): `add_ssh_access_rule`
+    # creates the rule with the requested source when it's absent, and
+    # no-ops on the source when the rule is already present — so there is no
+    # silent-mutation hazard to guard against here anymore.
     existing_access = (DhcpEngineSshAccess.query
                        .filter_by(domain_id=domain_id, engine_name=engine_name)
                        .first())
-    prev_source_ip = existing_access.fea_source_ip if existing_access else ""
-    source_drift = bool(existing_access and prev_source_ip
-                        and prev_source_ip != source_ip)
-    if source_drift:
-        return _rule_action_response(
-            False,
-            (f"Source IP drift detected: the existing rule was installed "
-             f"with source {prev_source_ip}, but the tenant's current FEA "
-             f"source IP is {source_ip}. Don't reinstall — pick "
-             f"'Add new source' or 'Overwrite source' on the drift banner."),
-            level="warning",
-            extra={"drift_state": "sources_drift"},
-        )
-
-    # No drift: use the existing rule_name when present (preserves any
-    # legacy versioned name from before this redesign), otherwise let
-    # install_ssh_rule pick the canonical name.
+    # Preserve the existing rule_name when present (keeps any legacy
+    # versioned name from before the canonical-naming redesign); otherwise
+    # let install_ssh_rule pick the canonical name.
     rule_name_to_use = (existing_access.rule_name
                        if existing_access and existing_access.rule_name
                        else None)
