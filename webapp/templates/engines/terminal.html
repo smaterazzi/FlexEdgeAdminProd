@@ -8,15 +8,30 @@
     <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
     <link href="{{ url_for('static', filename='xterm/xterm.css') }}" rel="stylesheet">
     <style>
-        body { margin: 0; padding: 0; background: #0d1117; height: 100vh; display: flex; flex-direction: column; }
+        /* Lock the whole page to the viewport — the terminal fits inside;
+           only xterm's own viewport scrolls (scrollback), never the page.
+           This is what keeps the SSH window proportioned to the browser
+           window instead of overflowing and forcing a page scroll. */
+        html, body { height: 100%; }
+        body {
+            margin: 0; padding: 0; background: #0d1117;
+            height: 100vh; display: flex; flex-direction: column;
+            overflow: hidden;
+        }
         .term-bar {
             background: #161b22; color: #c9d1d9; padding: 0.4rem 0.8rem;
             border-bottom: 1px solid #30363d; display: flex; gap: 1rem;
             align-items: center; font-size: 0.82rem;
+            flex: 0 0 auto;
         }
         .term-bar .badge { font-size: 0.7rem; }
         .term-bar .status { margin-left: auto; }
-        #terminal { flex: 1; padding: 0.4rem; min-height: 0; }
+        /* flex:1 fills the remaining height; min-height:0 lets it shrink
+           inside the flex column; overflow:hidden so the container itself
+           never scrolls (xterm manages its own internal viewport). */
+        #terminal { flex: 1 1 auto; padding: 0.4rem; min-height: 0; overflow: hidden; }
+        #terminal .xterm,
+        #terminal .xterm-screen { height: 100%; }
         .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 4px; }
         .status-connecting { background: #f0b400; }
         .status-open       { background: #2ea043; }
@@ -49,7 +64,6 @@
             const fitAddon = new FitAddon.FitAddon();
             term.loadAddon(fitAddon);
             term.open(document.getElementById('terminal'));
-            fitAddon.fit();
 
             const dot  = document.getElementById('statusDot');
             const txt  = document.getElementById('statusText');
@@ -71,7 +85,9 @@
 
             ws.onopen = function () {
                 setStatus('open', 'connected');
-                sendResize();
+                // Fit + report geometry on connect — covers the case where
+                // the socket opens before the first layout-driven fit.
+                doFit();
             };
             ws.onmessage = function (ev) {
                 if (typeof ev.data === 'string') {
@@ -100,10 +116,32 @@
                 ws.send('\x00' + payload);
             }
 
-            window.addEventListener('resize', function () {
-                fitAddon.fit();
+            // Fit the terminal to its container, then tell the remote PTY
+            // the new geometry. Wrapped so the (rare) fit exception on a
+            // zero-size container doesn't break the session.
+            function doFit() {
+                try { fitAddon.fit(); } catch (e) { /* container not laid out yet */ }
                 sendResize();
-            });
+            }
+
+            // Initial sizing must wait for layout + web fonts: calling fit()
+            // synchronously right after open() measures stale cell metrics
+            // (before the monospace font loads) and overshoots the row count,
+            // which is what made the SSH window overflow the browser window.
+            requestAnimationFrame(doFit);
+            if (document.fonts && document.fonts.ready) {
+                document.fonts.ready.then(doFit).catch(function () {});
+            }
+
+            // Keep the terminal proportioned to its frame whenever the
+            // window OR the container box changes size. ResizeObserver
+            // catches cases a window 'resize' event misses (devtools dock,
+            // zoom, flex reflow after the status bar wraps).
+            if (window.ResizeObserver) {
+                const ro = new ResizeObserver(function () { doFit(); });
+                ro.observe(document.getElementById('terminal'));
+            }
+            window.addEventListener('resize', doFit);
 
             window.addEventListener('beforeunload', function () {
                 try { ws.close(); } catch (e) {}
