@@ -2146,11 +2146,12 @@ def credentials_discover_nodes():
     api_key = db.session.get(ApiKey, api_key_id)
     if not tenant or not api_key:
         return jsonify({"error": "Not found"}), 404
-    if not tenant.flexedge_source_ip:
-        return jsonify({"error": (
-            f"Tenant {tenant.name!r} has no FlexEdge source IP configured. "
-            f"Set it first using the 'Source IP' card at the top of the page."
-        )}), 400
+    # Per-engine source-IP override (2026-05-31): a blank domain default no
+    # longer hard-blocks discovery. The operator can type a per-engine FEA
+    # source IP at the rule-install step instead. The rule block surfaces a
+    # hint when the domain default is empty so it's clear an IP is needed
+    # before installing. Drift computation below tolerates an empty
+    # tenant_src gracefully.
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
     cfg = _smc_cfg(tenant, api_key)
     try:
@@ -2532,10 +2533,30 @@ def credentials_rule_install():
         return _rule_action_response(
             False, "Tenant or API key not found.", level="danger", http=404,
         )
-    source_ip = tenant.flexedge_source_ip
+    # Per-engine FEA source-IP override (2026-05-31). The operator can
+    # type a source IP in the rule block — used as the rule's source
+    # for THIS engine only, independent of the tenant/domain-wide
+    # default. Falls back to the tenant value when the field is blank.
+    # Use case: node-initiated clusters behind 1:1 NAT where FEA's
+    # egress IP as seen by THIS engine differs from the domain default.
+    override_ip = (request.form.get("fea_source_ip") or "").strip()
+    if override_ip:
+        from ipaddress import ip_address
+        try:
+            ip_address(override_ip)
+        except ValueError:
+            return _rule_action_response(
+                False, f"Invalid FEA source IP {override_ip!r}.",
+                level="danger", http=400,
+            )
+        source_ip = override_ip
+    else:
+        source_ip = (tenant.flexedge_source_ip or "").strip()
     if not source_ip:
         return _rule_action_response(
-            False, "Tenant FEA source IP not configured.",
+            False, ("No FEA source IP available. Type one in the "
+                    "'FEA source IP' field, or set the domain default "
+                    "in the Source IP card at the top of the page."),
             level="danger", http=400,
         )
     domain_id = _domain_id_for_form(tenant_id, api_key_id)
@@ -2806,6 +2827,29 @@ def _resolve_drift_context(request_form):
     return access, domain, cfg, target_label, ""
 
 
+def _resolve_override_source_ip(form, domain):
+    """Resolve the FEA source IP for a drift-resolution action.
+
+    Per-engine override (2026-05-31): if the form carries a non-empty
+    ``new_source_ip`` (the operator typed one in the rule block), validate
+    and use it. Otherwise fall back to the domain default
+    (``domain.api_key.flexedge_source_ip``).
+
+    Returns:
+      * the resolved IP string (may be "" if neither is set), or
+      * ``None`` when an explicit override was supplied but is invalid.
+    """
+    override = (form.get("new_source_ip") or "").strip()
+    if override:
+        from ipaddress import ip_address
+        try:
+            ip_address(override)
+        except ValueError:
+            return None
+        return override
+    return (domain.api_key.flexedge_source_ip or "").strip()
+
+
 @dhcp_bp.route("/credentials/rule/source/overwrite", methods=["POST"])
 @admin_required
 def credentials_rule_source_overwrite():
@@ -2823,7 +2867,20 @@ def credentials_rule_source_overwrite():
     access, domain, cfg, target_label, err = _resolve_drift_context(request.form)
     if access is None:
         return _rule_action_response(False, err, level="warning", http=400)
-    new_source_ip = (domain.api_key.flexedge_source_ip or "").strip()
+    # Per-engine override (2026-05-31): the operator may overwrite to a
+    # manually-typed source IP rather than the domain default.
+    new_source_ip = _resolve_override_source_ip(request.form, domain)
+    if new_source_ip is None:
+        return _rule_action_response(
+            False, "Invalid FEA source IP for overwrite.",
+            level="danger", http=400,
+        )
+    if not new_source_ip:
+        return _rule_action_response(
+            False, ("No FEA source IP available to overwrite to — type "
+                    "one in the rule block or set the domain default."),
+            level="danger", http=400,
+        )
     old_source_ip = access.fea_source_ip
     try:
         with engine_bootstrap_lock(access.engine_name):
@@ -2884,7 +2941,20 @@ def credentials_rule_source_add():
     access, domain, cfg, target_label, err = _resolve_drift_context(request.form)
     if access is None:
         return _rule_action_response(False, err, level="warning", http=400)
-    new_source_ip = (domain.api_key.flexedge_source_ip or "").strip()
+    # Per-engine override (2026-05-31): operator may add a manually-typed
+    # source IP rather than the domain default.
+    new_source_ip = _resolve_override_source_ip(request.form, domain)
+    if new_source_ip is None:
+        return _rule_action_response(
+            False, "Invalid FEA source IP to add.",
+            level="danger", http=400,
+        )
+    if not new_source_ip:
+        return _rule_action_response(
+            False, ("No FEA source IP available to add — type one in the "
+                    "rule block or set the domain default."),
+            level="danger", http=400,
+        )
     try:
         with engine_bootstrap_lock(access.engine_name):
             with smc_session(cfg):

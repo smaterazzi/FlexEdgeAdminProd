@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-05-31
 
+### Engine SSH Credentials — per-engine FEA source-IP override (2026-05-31)
+
+The SSH allow rule's **source** (the FEA address the engine sees on inbound TCP/22) was previously always the domain-wide `flexedge_source_ip` — one IP for every engine in the domain. Operators behind 1:1 NAT, where FEA reaches different engines from different egress addresses, had no way to set a per-engine source. Now the SSH-allow-rule block carries an editable **"FEA source IP for this rule"** field, pre-filled with the domain default but overridable per engine.
+
+- `credentials_rule_install` reads the optional `fea_source_ip` form field, validates it via `ipaddress.ip_address()`, and uses it as the rule's source for that engine; falls back to the domain default (`tenant.flexedge_source_ip`) when blank. The persisted `DhcpEngineSshAccess.fea_source_ip` already records whatever source the rule was installed with, so the override naturally survives on the row — no schema change needed.
+- The drift-resolution **Overwrite** / **Add** buttons (shown when an existing rule's live source doesn't match) now carry their own editable IP field too, so a cutover or transition can target a manually-typed address rather than only the domain default. Shared resolver `_resolve_override_source_ip(form, domain)` validates the `new_source_ip` field and falls back to the domain default.
+- The empty-source guard was relaxed: a blank domain default no longer hard-blocks node discovery (`credentials_discover_nodes`). The operator can reach the rule step and type a per-engine IP there; the install path refuses only if BOTH the override field and the domain default are empty, with a message pointing at the field + the Source IP card.
+- Mirrors the existing "custom destination IP" affordance (2026-05-13) on the source side. Complements the P1 NAT `connect_ip_override` (the IP FEA *dials*) — this is the IP the engine *sees*, i.e. the rule's source Host. The two are independent: behind 1:1 NAT, FEA dials the public contact address while the rule source is FEA's NAT egress as the engine observes it.
+
+Verified end-to-end with the Flask test client: invalid override → HTTP 400 before any SMC call; no-override-and-no-domain-default → HTTP 400 with the new guard message; valid override threads into `enqueue_install_ssh_rule(source_ip=…)` unchanged; the editable `fea_source_ip` + `new_source_ip` fields render on `/dhcp/credentials`. Module: [webapp/dhcp_manager.py](webapp/dhcp_manager.py) (`credentials_rule_install`, `credentials_rule_source_overwrite`, `credentials_rule_source_add`, `_resolve_override_source_ip`, relaxed `credentials_discover_nodes`); template: [webapp/templates/dhcp/credentials.html](webapp/templates/dhcp/credentials.html).
+
 ### Sidebar — drag-and-drop section reorder, per-user (2026-05-31)
 
 Every sidebar section (Navigation, Network Objects, Services, Infrastructure, Migration, Optimizer, Change Queue, TLS Manager, Engines, DHCP Manager, Logs, Administration) is now HTML5-draggable. Operators reorder by grabbing a section's header (a `bi-grip-vertical` icon hints the affordance) and dropping above or below another section; the new order is persisted server-side on `User.sidebar_section_order` (per-user — different operators get different layouts on the same browser, layouts sync across browsers).
