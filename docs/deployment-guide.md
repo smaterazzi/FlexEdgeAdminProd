@@ -467,6 +467,14 @@ For Traefik, the default `PathPrefix(`/`)` rule already covers the path — no e
 
 **Operator flow.** Open `/tls/letsencrypt`, accept the LE TOS in the one-shot account wizard, configure the per-FEA-Domain glob allowlist on `/tls/letsencrypt/patterns` (e.g. `*.prod.example.com`), then click **New cert**. Domain Admin or higher with the `letsencrypt` bypass feature gets instant issuance via a watcher card; otherwise the request goes through the standard change-management queue at `/changes/`. On success the cert appears in **TLS Manager → Certificates** ready to deploy.
 
+**DNS-01 wildcards (LE.4, landed 2026-05-29).** For certificates covering `*.example.com`, select **DNS-01 (manual)** on the request form. FEA opens an ACME order via the `acme` Python library (not a certbot subprocess), displays the required `_acme-challenge.example.com` TXT record with Copy buttons and a DNS-propagation pre-check, and waits for you to click **I've published — continue**. FEA then answers the challenge and finalises the order. Renewal on DNS-01 certs is always operator-initiated (the LE.3 lazy-sweep scheduler skips them); click **Force renew** on the cert detail page when the cert approaches expiry.
+
+> **Note on `is_staging`:** The ACME account's staging/production toggle is **Super Admin only**. Flipping it affects every Domain's cert operations across the entire deployment — Domain Admins see it read-only.
+
+**Renewal scheduler (LE.3, landed 2026-05-29).** FEA includes a lazy-sweep renewal scheduler. Every visit to `/tls/letsencrypt` checks whether a sweep is due (once per hour, configurable). Any active HTTP-01 cert with `next_renewal_after ≤ now + 7 days` is automatically enqueued for `cert_renew`. You no longer need to install the certbot deploy-hook for HTTP-01 certs — FEA drives the entire renewal cycle. The deploy-hook path is retained as a legacy fallback for operators who prefer host-cron management.
+
+**Revoke UI (LE.5.b, landed 2026-05-29).** The cert detail page carries a **Revoke at LE** button (distinct from "Stop tracking"). Revocation publishes the cert's serial to Let's Encrypt's CRL/OCSP responders so that browsers and engines checking revocation stop trusting it immediately. A reason picker (RFC 5280 subset) and an optional *"Also stop tracking in FEA after revoke"* checkbox are presented in a modal. The chain fires inside the queue handler after a successful certbot revoke, avoiding any ORM race with the async worker.
+
 ### Legacy / external certbot integration
 
 If you'd rather run certbot yourself (on the host, as a sidecar container, or via an existing managed-certs pipeline) and just have FEA discover the output, set `CERTBOT_LIVE_DIR` in `.env` to point at your existing lineage directory (typically `/etc/letsencrypt/live`) and ensure the FEA container can read it.
@@ -515,14 +523,42 @@ The webapp's own TLS is handled by Traefik and does not use certbot. To use TLS 
 
 For Coolify deployments the **Let's Encrypt CRUD flow above is usually simpler** — FEA owns everything under `/config/letsencrypt/` and the host doesn't need certbot at all.
 
-### Renewal hook
+### Renewal hook (legacy — superseded by LE.3 scheduler for HTTP-01 certs)
 
-Whichever option you use, wire certbot's deploy-hook to FlexEdgeAdmin so deployments re-execute after each renewal:
+> **Since LE.3 (2026-05-29)** the built-in lazy-sweep scheduler handles HTTP-01 cert renewal automatically. The deploy-hook path below is still supported as a fallback for operators who run certbot on the host or via a sidecar (legacy flow), or for DNS-01 wildcard certs which the scheduler skips by design.
 
-1. **TLS Manager → Renewal Hook** — shows the ready-to-install shell script + the API token
-2. Copy the script to `/etc/letsencrypt/renewal-hooks/deploy/flexedge-tls-renew.sh` and `chmod +x`, or click **Install Automatically** (requires write access to the hooks dir from the container — works natively in Options 1 and 2)
+If you are on the legacy certbot flow and want FEA to redeploy engine configurations after each host-cron renewal:
+
+1. **TLS Manager → Renewal Hook** — shows the ready-to-install shell script + the API token. The page carries a yellow "Legacy path since LE.3" banner to make the status clear.
+2. Copy the script to `/etc/letsencrypt/renewal-hooks/deploy/flexedge-tls-renew.sh` and `chmod +x`, or click **Install Automatically** (requires write access to the hooks dir from the container — works natively in Options 1 and 2). A sibling `.token` file (`chmod 0600`) is written alongside the script so the bearer token is never embedded in the script body.
 
 The script calls `POST /tls/api/renew` with the renewed domain. All deployments linked to that certificate (and with auto-renew enabled) are re-deployed automatically, including SMC policy upload.
+
+### PFX / PKCS#12 import
+
+Third-party or vendor-issued certificates can be imported directly without certbot. Open **TLS Manager → Certificates → Import PFX**, upload a `.pfx` or `.p12` file and provide the password. FEA parses the bundle in-process, validates it (wrong password, expired cert, key/cert mismatch, and clobbering an active LE-tracked lineage are all refused with a specific error), then writes certbot-layout PEM files under `${FEA_PFX_DIR}` (default `/config/imported-certs/<slug>/`). A `ManagedCertificate` row is created and the cert appears immediately with a blue **PFX** source badge. Click **Deploy** on the cert row to run the standard 5-step engine pipeline — no changes to the deploy workflow.
+
+Re-uploading a PFX with the same CN replaces the on-disk files and refreshes the DB row in place (no duplicate). PFX certs are excluded from the LE.3 auto-renewal sweep — renewal is operator-initiated; download a new PFX and re-import.
+
+`${FEA_PFX_DIR}` is included in the **Admin Portal → Backup** ZIP and wiped by Factory Reset alongside other on-disk artifacts.
+
+### Cert expiration dashboard + SMTP alerts
+
+**TLS Manager → Expirations** (`/tls/expirations`) lists every tracked cert across all three sources (LE HTTP-01, LE DNS-01, PFX) with live days-to-expiry read from `<lineage>/cert.pem` and colour-graded urgency badges:
+
+| Badge colour | Days remaining |
+| ------------ | -------------- |
+| Green | > 30 |
+| Blue | 14–30 |
+| Yellow | 4–14 |
+| Red | ≤ 3 |
+| Hard red | Expired or lineage missing on disk |
+
+**Per-Domain SMTP config** at **TLS Manager → SMTP** (`/tls/smtp`): host, port, security (`STARTTLS` / `SMTPS` / plain), username, Fernet-encrypted password, comma-separated recipients, and configurable alert thresholds (default `30,14,7,3,1` days). A **Send test email** button validates the config; `last_test_status` is shown alongside the form so you can confirm deliverability at any time.
+
+A lazy-sweep scheduler (same 1-hour gate pattern as LE.3) fires automatically when the expirations page is loaded. The first threshold `T ≤ days_to_expiry` that hasn't yet fired for a cert triggers an alert; subsequent sweeps are idempotent until expiry crosses the next threshold. A **Sweep now** button bypasses the gate for immediate manual runs. The notification log at `/tls/expirations/notifications` records every alert sent with recipients, status, and any error snapshot.
+
+**Dry-run mode**: set `FEA_SMTP_DRY_RUN=1` to write rendered `.eml` files to `${FEA_SMTP_DRY_RUN_LOG_DIR:-/tmp/fea-smtp}` instead of opening an SMTP socket. Useful for lab validation before pointing at a real mail server.
 
 ### Troubleshooting TLS Manager
 
@@ -584,6 +620,8 @@ The lease viewer (`/dhcp/scopes/<id>/leases`) carries a **Scan subnet** button n
 
 The button opens a small modal with three range options (Scope / Full subnet / Custom range). Anything bigger than /24 requires an explicit confirmation; hard cap at 4096 hosts (= /20). The scan runs in a background thread with a live progress bar + 10-line rolling log so big subnets don't block the page.
 
+**OUI vendor decoration.** Both the lease table and the discovered-host table show a vendor name alongside each MAC address (e.g. `00:50:56:… · VMware`). The OUI database is downloaded once from `$FEA_OUI_DB_URL` (default: maclookup.app JSON feed) and cached at `${FEA_OUI_DB_PATH:-/config/oui.json}`. A **Refresh OUI DB** button on the scan picker keeps it current; record count and age are shown in the picker's status card.
+
 Full guide with the legend, filter buttons, and troubleshooting: [DHCP-SubnetScan.md](DHCP-SubnetScan.md).
 
 ### Summary view
@@ -608,11 +646,13 @@ If the key lacks `change_ssh_pwd` permission, auto-enrollment fails with the SMC
 
 FlexEdgeAdmin is often deployed on a different network than the engines (Coolify host, dedicated VM, etc.). For SSH to work, the engine must accept port 22 from FEA's egress IP. The DHCP Manager handles this by installing an SSH allow rule on the engine's policy at enrollment time:
 
-- **Source** = the tenant's `flexedge_source_ip` (the IP the engine sees from FEA).
+- **Source** = the FEA source IP for that specific engine (defaults to the Domain-wide `flexedge_source_ip`, but can be overridden per engine via the editable **"FEA source IP for this rule"** field on the install form — useful when FEA reaches different engines from different egress addresses behind 1:1 NAT).
 - **Destination** = a Host element pointing to the chosen engine interface IP.
 - **Service** = TCP/22.
 - **Action** = Allow.
 - **Lifetime** = until you click **Remove SSH rule** OR delete the last credential for that engine. Both paths re-upload the policy.
+
+**Per-engine source-IP override (2026-05-31).** When you need a different source IP per engine (e.g. multi-homed FEA behind 1:1 NAT), type it into the **FEA source IP for this rule** field at install time. The drift-resolution **Overwrite** / **Add** controls for an existing rule also carry an editable source-IP field. When the rule already exists, the install form hides the source field and surfaces a **Change rule source IP** card instead — the field only appears when no rule exists yet, removing the earlier UX confusion where a source-IP field was shown but silently ignored.
 
 Intermediate firewalls (between FEA and the engine) are out of scope — the operator owns those.
 
@@ -652,6 +692,24 @@ It dumps the raw SMC interface JSON plus the walker's per-level decisions. If `d
 **Rule shown as "found in our records but missing from policy"** — admin removed it from Management Client. The credentials page surfaces a banner with **Recreate rule** button.
 
 For the per-phase test procedures, see [DHCP-Phase0-LabTest.md](DHCP-Phase0-LabTest.md), [DHCP-Phase1-Testing.md](DHCP-Phase1-Testing.md), and [DHCP-Phase3-Testing.md](DHCP-Phase3-Testing.md). For the subnet active-discovery scan, see [DHCP-SubnetScan.md](DHCP-SubnetScan.md).
+
+---
+
+## UI Features
+
+### Sidebar — drag-and-drop section reorder (2026-05-31)
+
+Every sidebar section (Navigation, TLS Manager, Engines, DHCP Manager, etc.) is draggable. Grab the `⠿` grip icon on a section header and drop it above or below another section to reorder. The new layout is saved per user server-side (`User.sidebar_section_order`) and syncs across browsers — different operators get independent layouts on the same deployment.
+
+Sections added in future releases always appear at the bottom of their default group until the operator repositions them, so upgrades never hide new features.
+
+### Top-center quick search
+
+Press `Cmd/Ctrl+K` from anywhere to open the global search overlay. Results group into **Features** (every menu destination) and **Cached SMC elements** (hosts, networks, services, groups visible in the active Domain's cache). Arrow keys to navigate, Enter to open, Esc to close.
+
+### Pinned bookmarks bar
+
+Click the ★ in the topbar to pin the current page. Pinned pages render as chips in a thin bar below the topbar. Click × on any chip to unpin. Stored in `localStorage` (`flexedge_pins_v1`), per-browser, max 12 pins.
 
 ---
 

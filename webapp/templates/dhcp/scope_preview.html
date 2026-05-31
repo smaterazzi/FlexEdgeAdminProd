@@ -30,18 +30,23 @@
 {% endif %}
 
 <div class="card mb-3">
-  <div class="card-body row">
+  <div class="card-body row g-3">
     <div class="col-md-3">
       <small class="text-muted d-block">Engine</small>
       <strong>{{ scope.engine_name }}</strong>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
       <small class="text-muted d-block">Interface</small>
       <strong>{{ scope.interface_id }}</strong>
     </div>
-    <div class="col-md-3">
+    <div class="col-md-2">
       <small class="text-muted d-block">Subnet</small>
       <code>{{ scope.subnet_cidr }}</code>
+    </div>
+    <div class="col-md-2">
+      <small class="text-muted d-block">Reservations</small>
+      <strong>{{ result.reservations_count }}</strong>
+      <span class="text-muted small">in DB</span>
     </div>
     <div class="col-md-3">
       <small class="text-muted d-block">Result</small>
@@ -51,6 +56,10 @@
         <span class="badge bg-warning text-dark">Partial — {{ result.successful_nodes }}/{{ result.nodes|length }} ok</span>
       {% else %}
         <span class="badge bg-danger">Failed — {{ result.failed_nodes }}/{{ result.nodes|length }} failed</span>
+      {% endif %}
+      {% set _all_in_sync = result.nodes and result.nodes|selectattr('in_sync')|list|length == result.nodes|length %}
+      {% if _all_in_sync %}
+        <span class="badge bg-secondary ms-1" title="dhcp-server.conf on every node already contains the FlexEdge block byte-for-byte">in sync</span>
       {% endif %}
     </div>
   </div>
@@ -63,10 +72,17 @@
       <strong>Node {{ n.node_index }}</strong>
       {% if n.node_hostname %} — <code>{{ n.node_hostname }}</code>{% endif %}
       {% if n.status == 'ok' %}
-        <span class="badge bg-success ms-2">would succeed</span>
+        {% if n.in_sync %}
+          <span class="badge bg-secondary ms-2" title="dhcp-server.conf already contains the FlexEdge block byte-for-byte — Deploy would be a no-op">already in sync</span>
+        {% else %}
+          <span class="badge bg-success ms-2">would succeed</span>
+        {% endif %}
       {% else %}
         <span class="badge bg-danger ms-2">would fail</span>
       {% endif %}
+      <span class="text-muted small ms-2">
+        {{ n.reservations_count }} reservation{{ '' if n.reservations_count == 1 else 's' }}
+      </span>
     </div>
     <small class="text-muted">{{ n.duration_ms }} ms</small>
   </div>
@@ -76,20 +92,44 @@
         <strong>Error:</strong> {{ n.error }}
       </div>
     {% endif %}
-    {% if n.diff %}
-      <div class="row mb-2">
-        <div class="col-md-6 small">
-          <span class="text-muted">sha256 before:</span>
-          <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_before }}">{{ n.sha256_before or '(file missing)' }}</code>
-        </div>
-        <div class="col-md-6 small">
-          <span class="text-muted">sha256 after:</span>
-          <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_after }}">{{ n.sha256_after or '—' }}</code>
-        </div>
+
+    {% if n.sha256_before or n.sha256_after %}
+    <div class="row mb-2">
+      <div class="col-md-6 small">
+        <span class="text-muted">sha256 before:</span>
+        <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_before }}">{{ n.sha256_before or '(file missing)' }}</code>
       </div>
+      <div class="col-md-6 small">
+        <span class="text-muted">sha256 after:</span>
+        <code class="text-truncate d-inline-block" style="max-width:18rem;" title="{{ n.sha256_after }}">{{ n.sha256_after or '—' }}</code>
+      </div>
+    </div>
+    {% endif %}
+
+    {% if n.in_sync and n.flexedge_block %}
+      {# File already contains the FlexEdge block byte-for-byte. The
+         operator still wants to see the reservations that are live in
+         the file — show the rendered block instead of the empty diff. #}
+      <div class="small text-muted mb-1">
+        <i class="bi bi-check-circle-fill text-success me-1"></i>
+        FlexEdge block currently in <code>/data/config/base/dhcp-server.conf</code>:
+      </div>
+      <pre class="json-detail mb-0" style="max-height:30rem;">{{ n.flexedge_block }}</pre>
+    {% elif n.diff %}
       <pre class="json-detail mb-0" style="max-height:30rem;">{{ n.diff }}</pre>
+      {% if n.flexedge_block %}
+      <details class="mt-2">
+        <summary class="small text-muted" style="cursor:pointer;">
+          Show the full FlexEdge block that would be written
+        </summary>
+        <pre class="json-detail mt-1 mb-0" style="max-height:30rem;">{{ n.flexedge_block }}</pre>
+      </details>
+      {% endif %}
     {% else %}
       <em class="text-muted small">(no diff to render)</em>
+      {% if n.flexedge_block %}
+      <pre class="json-detail mt-2 mb-0" style="max-height:30rem;">{{ n.flexedge_block }}</pre>
+      {% endif %}
     {% endif %}
   </div>
 </div>
