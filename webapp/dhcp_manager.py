@@ -778,18 +778,18 @@ def scopes_list():
         else:
             scopes = [s for s in all_scopes if s.engine_name in valid]
             hidden_count = len(all_scopes) - len(scopes)
-    # Domain-Scoping: only the active Domain's bound Tenant — never a
-    # full Tenant list. The operator should never see another Domain's
-    # infrastructure surfaced here.
+    # Domain-Scoping: the discover form operates on the ACTIVE Domain only
+    # — no tenant / api-key cascade. An ApiKey can be owned by a Tenant
+    # whose name belongs to a different customer (admin-internal bookkeeping)
+    # and can back several Domains, so surfacing a Tenant picker both (a)
+    # showed a confusing cross-customer name and (b) risked listing another
+    # customer's keys in the api-key cascade. The active Domain already
+    # pins the (api_key, smc_domain_name) pair; the operator just picks an
+    # engine. We pass the Domain object so the template can render its
+    # identity + the hidden tenant_id/api_key_id the discover POST needs.
     domain_obj = getattr(g, "domain", None)
-    bound_tenant_id = (domain_obj.api_key.tenant_id
-                       if domain_obj is not None and domain_obj.api_key is not None
-                       else None)
-    tenants = ([] if bound_tenant_id is None
-               else Tenant.query
-                          .filter_by(id=bound_tenant_id, is_active=True)
-                          .all())
-    return render_template("dhcp/scopes.html", scopes=scopes, tenants=tenants,
+    return render_template("dhcp/scopes.html", scopes=scopes,
+                           domain_obj=domain_obj,
                            hidden_count=hidden_count, show_all=show_all)
 
 

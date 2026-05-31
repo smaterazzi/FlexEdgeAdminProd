@@ -10,27 +10,31 @@
     <h5 class="mb-0">Discover scopes on an engine</h5>
   </div>
   <div class="card-body">
+    {% if domain_obj and domain_obj.api_key %}
     <form method="post" action="{{ url_for('dhcp.scopes_discover') }}" class="row g-2">
         <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
-      <div class="col-md-3">
-        <label class="form-label">Tenant</label>
-        <select class="form-select" name="tenant_id" id="tenant-select" required>
-          <option value="">Select tenant…</option>
-          {% for t in tenants %}
-            <option value="{{ t.id }}">{{ t.name }}</option>
-          {% endfor %}
-        </select>
-      </div>
-      <div class="col-md-3">
-        <label class="form-label">API Key</label>
-        <select class="form-select" name="api_key_id" id="apikey-select" required disabled>
-          <option value="">—</option>
-        </select>
+        {# Active Domain pins the (api_key, smc_domain) pair — no tenant /
+           api-key picker. These hidden fields carry exactly the active
+           Domain's binding to the discover POST. #}
+        <input type="hidden" name="tenant_id" id="active-tenant-id"
+               value="{{ domain_obj.api_key.tenant_id }}">
+        <input type="hidden" name="api_key_id" id="active-api-key-id"
+               value="{{ domain_obj.api_key.id }}">
+      <div class="col-md-6">
+        <label class="form-label">Domain</label>
+        <div class="form-control bg-body-secondary" style="cursor:default;">
+          <i class="bi bi-diagram-3"></i>
+          <strong>{{ domain_obj.display_name or domain_obj.slug }}</strong>
+          <span class="text-muted">·
+            API key {{ domain_obj.api_key.name }}
+            {% if domain_obj.smc_domain_name %}· SMC domain {{ domain_obj.smc_domain_name }}{% endif %}
+          </span>
+        </div>
       </div>
       <div class="col-md-3">
         <label class="form-label">Engine</label>
         <select class="form-select" name="engine_name" id="engine-select" required disabled>
-          <option value="">—</option>
+          <option value="">Loading engines…</option>
         </select>
       </div>
       <div class="col-md-3 d-flex align-items-end">
@@ -43,8 +47,15 @@
       Discovery reads every DHCP-enabled interface on the selected engine
       (including VLAN sub-interfaces) and registers each one as a scope.
       Scopes start in <em>disabled</em> state — enable them from the scope
-      page before adding reservations.
+      page before adding reservations. Engines are scoped to the active
+      Domain shown above; switch Domains from the top bar to discover on a
+      different one.
     </div>
+    {% else %}
+    <div class="alert alert-warning mb-0">
+      No active Domain — pick one from the top-bar Domain switcher first.
+    </div>
+    {% endif %}
   </div>
 </div>
 
@@ -138,39 +149,33 @@
 {% block extra_js %}
 <script>
 document.addEventListener('DOMContentLoaded', () => {
-  const tenantSel = document.getElementById('tenant-select');
-  const keySel    = document.getElementById('apikey-select');
-  const engSel    = document.getElementById('engine-select');
-  const btn       = document.getElementById('discover-btn');
+  const tenantIdEl = document.getElementById('active-tenant-id');
+  const keyIdEl    = document.getElementById('active-api-key-id');
+  const engSel     = document.getElementById('engine-select');
+  const btn        = document.getElementById('discover-btn');
 
-  const reset = (sel, placeholder) => {
-    sel.innerHTML = `<option value="">${placeholder}</option>`;
-    sel.disabled = true;
-  };
+  // No active Domain → the form isn't rendered; nothing to wire.
+  if (!tenantIdEl || !keyIdEl || !engSel) return;
 
-  tenantSel.addEventListener('change', async () => {
-    reset(keySel, '—');
-    reset(engSel, '—');
-    btn.disabled = true;
-    if (!tenantSel.value) return;
-    const r = await fetch(`{{ url_for('dhcp.api_tenant_keys', tenant_id=0) }}`.replace('/0/', `/${tenantSel.value}/`));
-    const keys = await r.json();
-    keySel.innerHTML = '<option value="">Select API key…</option>' +
-      keys.map(k => `<option value="${k.id}">${k.name}</option>`).join('');
-    keySel.disabled = false;
+  engSel.addEventListener('change', () => {
+    btn.disabled = !engSel.value;
   });
 
-  keySel.addEventListener('change', async () => {
-    reset(engSel, '—');
-    btn.disabled = true;
-    if (!keySel.value) return;
-    engSel.innerHTML = '<option value="">Loading engines…</option>';
-    const url = `/dhcp/api/tenants/${tenantSel.value}/api-keys/${keySel.value}/engines`;
+  // Auto-load engines for the active Domain's (tenant, api_key) on page
+  // load — the operator only chooses an engine. The engines endpoint is
+  // already scoped to the active Domain server-side, so the list never
+  // includes another customer's engines.
+  (async () => {
+    const url = `/dhcp/api/tenants/${tenantIdEl.value}/api-keys/${keyIdEl.value}/engines`;
     try {
       const r = await fetch(url);
       const engines = await r.json();
       if (!Array.isArray(engines)) {
         engSel.innerHTML = `<option value="">Error: ${engines.error || 'unknown'}</option>`;
+        return;
+      }
+      if (!engines.length) {
+        engSel.innerHTML = '<option value="">No engines in this Domain</option>';
         return;
       }
       engSel.innerHTML = '<option value="">Select engine…</option>' +
@@ -179,11 +184,7 @@ document.addEventListener('DOMContentLoaded', () => {
     } catch (e) {
       engSel.innerHTML = `<option value="">Error: ${e}</option>`;
     }
-  });
-
-  engSel.addEventListener('change', () => {
-    btn.disabled = !engSel.value;
-  });
+  })();
 });
 </script>
 {% endblock %}
