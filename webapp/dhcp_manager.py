@@ -135,6 +135,31 @@ def _log_activity(category: str, action: str, status: str,
           target=target, detail=detail, status=status)
 
 
+def _legacy_smc_domain_name(tenant, api_key) -> str:
+    """Resolve the SMC admin-domain for a legacy ``(tenant, api_key)`` cfg.
+
+    Root-cause fix (2026-05-31): an ApiKey can back MULTIPLE Domains (same
+    SMC server, different SMC admin-domain — e.g. "Shared Domain" vs.
+    "Milano"). The legacy cfg builders used ``tenant.default_domain``, a
+    single fixed value, so switching the topbar Domain never changed which
+    SMC admin-domain the DHCP cascade / scope discovery actually queried —
+    every Domain backed by the same key resolved to the tenant default.
+    Symptom: "the tenant list shows a cached one that doesn't switch to the
+    selected Domain."
+
+    Prefer the request's ACTIVE Domain when it's backed by this ApiKey —
+    that's the operator's authoritative scope and carries the correct
+    ``smc_domain_name``. Fall back to ``tenant.default_domain`` only when
+    there's no matching active Domain (CLI / out-of-request callers).
+    """
+    active = getattr(g, "domain", None)
+    if (api_key is not None and active is not None
+            and getattr(active, "api_key_id", None) == api_key.id
+            and active.smc_domain_name):
+        return active.smc_domain_name
+    return tenant.default_domain or ""
+
+
 def _smc_cfg(tenant_or_domain, api_key: ApiKey | None = None) -> SMCConfig:
     """Build the SMC client config.
 
@@ -155,13 +180,15 @@ def _smc_cfg(tenant_or_domain, api_key: ApiKey | None = None) -> SMCConfig:
             timeout=ak.timeout,
         )
     # Legacy form: (Tenant, ApiKey). Pull server fields from the ApiKey
-    # (Phase A absorbed them onto api_keys), fall back to tenant for the
-    # SMC domain since callers haven't been switched yet.
+    # (Phase A absorbed them onto api_keys); resolve the SMC admin-domain
+    # from the ACTIVE Domain (see _legacy_smc_domain_name) so a multi-domain
+    # ApiKey honors the operator's topbar selection instead of pinning to
+    # the tenant default.
     tenant = tenant_or_domain
     return SMCConfig(
         url=api_key.smc_url or tenant.smc_url,
         api_key=api_key.decrypted_key,
-        domain=tenant.default_domain or "",
+        domain=_legacy_smc_domain_name(tenant, api_key),
         api_version=api_key.api_version or tenant.api_version or "",
         verify_ssl=api_key.verify_ssl if api_key.verify_ssl is not None else tenant.verify_ssl,
         timeout=api_key.timeout or tenant.timeout,
@@ -206,7 +233,10 @@ def _smc_cfg_dict(tenant_or_domain, api_key: ApiKey | None = None) -> dict:
                              if api_key.verify_ssl is not None
                              else tenant.verify_ssl),
         "timeout":      api_key.timeout or tenant.timeout or 120,
-        "domain":       tenant.default_domain or "",
+        # Active-Domain-aware SMC admin-domain (see _legacy_smc_domain_name)
+        # — a multi-domain ApiKey must query the Domain the operator picked,
+        # not the tenant default.
+        "domain":       _legacy_smc_domain_name(tenant, api_key),
         "api_version":  api_key.api_version or tenant.api_version or "",
         "retry_on_busy": True,
     }
@@ -405,12 +435,19 @@ def _domain_from_form(tenant_id: int, api_key_id: int) -> Domain | None:
     """Resolve the Domain from the (tenant_id, api_key_id) pair the
     cascading admin forms still POST today.
 
-    Today there's one Domain per ApiKey so the lookup is trivial; future
-    multi-domain ApiKeys would need the SMC domain name in the form too.
-    Falls back gracefully — returns None if no Domain found, callers
-    should treat that as "Phase A migration didn't run for this key" and
-    bail out / re-run setup.
+    Multi-domain fix (2026-05-31): an ApiKey can back several Domains, so a
+    bare ``filter_by(api_key_id=…).first()`` silently pinned every action to
+    whichever Domain row was created first — ignoring the operator's topbar
+    selection (the reported "scopes don't switch Domain" bug). Prefer the
+    request's ACTIVE Domain when it's backed by this ApiKey; only fall back
+    to ``.first()`` for out-of-request callers or a mismatched form.
+
+    Falls back gracefully — returns None if no Domain found, callers should
+    treat that as "Phase A migration didn't run for this key" and bail out.
     """
+    active = getattr(g, "domain", None)
+    if active is not None and getattr(active, "api_key_id", None) == api_key_id:
+        return active
     return Domain.query.filter_by(api_key_id=api_key_id).first()
 
 
