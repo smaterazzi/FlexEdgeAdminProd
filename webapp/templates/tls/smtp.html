@@ -1,0 +1,156 @@
+{% extends "base.html" %}
+{% block title %}TLS — SMTP config{% endblock %}
+
+{% block content %}
+<div class="p-4" style="max-width: 880px;">
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, message in messages %}
+      <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+      </div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.dashboard') }}">TLS</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.expirations_dashboard') }}">Expirations</a></li>
+    <li class="breadcrumb-item active" aria-current="page">SMTP config</li>
+  </ol>
+</nav>
+
+<div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-envelope-gear"></i> SMTP configuration</h2>
+    {% if cfg and cfg.is_active %}
+        <form method="post" action="{{ url_for('tls.smtp_test') }}" class="d-inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-outline-success" type="submit">
+                <i class="bi bi-send"></i> Send test email
+            </button>
+        </form>
+    {% endif %}
+</div>
+
+<p class="text-muted">
+    Per-Domain SMTP credentials for cert-expiration alerts.
+    The password is stored Fernet-encrypted (same key as API key storage)
+    and only decrypted at send-time. Save this Domain's settings here once
+    — the lazy-sweep scheduler picks them up on the next
+    <a href="{{ url_for('tls.expirations_dashboard') }}">expirations page</a> visit.
+</p>
+
+{% if cfg and cfg.last_test_status %}
+    <div class="alert alert-{{ 'success' if cfg.last_test_status == 'ok' else 'danger' }} small">
+        <strong>Last test:</strong>
+        {{ cfg.last_test_status.upper() }}
+        at {{ cfg.last_test_at.strftime('%Y-%m-%d %H:%M UTC') if cfg.last_test_at else '—' }}.
+        {% if cfg.last_test_error %}<br><code>{{ cfg.last_test_error }}</code>{% endif %}
+    </div>
+{% endif %}
+
+<div class="card">
+  <div class="card-body">
+    <form method="post" action="{{ url_for('tls.smtp_config') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+      <div class="row g-3">
+        <div class="col-md-8">
+          <label class="form-label">SMTP host</label>
+          <input type="text" name="host" class="form-control"
+                 value="{{ cfg.host if cfg else '' }}" required
+                 placeholder="smtp.example.com">
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">Port</label>
+          <input type="number" name="port" class="form-control"
+                 value="{{ cfg.port if cfg else 587 }}" min="1" max="65535" required>
+        </div>
+        <div class="col-md-2">
+          <label class="form-label">Security</label>
+          <select name="security" class="form-select">
+            {% set sec = cfg.security if cfg else 'starttls' %}
+            <option value="starttls" {{ 'selected' if sec == 'starttls' else '' }}>STARTTLS</option>
+            <option value="ssl" {{ 'selected' if sec == 'ssl' else '' }}>SSL/TLS (SMTPS)</option>
+            <option value="plain" {{ 'selected' if sec == 'plain' else '' }}>plain (no TLS)</option>
+          </select>
+        </div>
+
+        <div class="col-md-6">
+          <label class="form-label">Username</label>
+          <input type="text" name="username" class="form-control"
+                 value="{{ cfg.username if cfg else '' }}"
+                 autocomplete="off">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">Password</label>
+          <input type="password" name="password" class="form-control"
+                 autocomplete="off"
+                 placeholder="{{ 'leave blank to keep existing' if cfg and cfg.encrypted_password else 'optional for open relays' }}">
+          {% if cfg and cfg.encrypted_password %}
+            <input type="hidden" name="keep_password" value="1">
+          {% endif %}
+        </div>
+
+        <div class="col-md-6">
+          <label class="form-label">From address</label>
+          <input type="email" name="from_address" class="form-control" required
+                 value="{{ cfg.from_address if cfg else '' }}"
+                 placeholder="alerts@yourcompany.com">
+        </div>
+        <div class="col-md-6">
+          <label class="form-label">From name</label>
+          <input type="text" name="from_name" class="form-control"
+                 value="{{ cfg.from_name if cfg else 'FlexEdgeAdmin' }}">
+        </div>
+
+        <div class="col-12">
+          <label class="form-label">Alert recipients</label>
+          <textarea name="recipients_csv" class="form-control" rows="3"
+                    placeholder="ops@example.com, security@example.com">{{ cfg.recipients_csv if cfg else '' }}</textarea>
+          <div class="form-text">Comma- or newline-separated. Every recipient receives every
+            cert-expiration alert for this Domain.</div>
+        </div>
+
+        <div class="col-md-8">
+          <label class="form-label">Threshold days</label>
+          <input type="text" name="thresholds_csv" class="form-control"
+                 value="{{ cfg.thresholds_csv if cfg else '30,14,7,3,1' }}"
+                 placeholder="30,14,7,3,1">
+          <div class="form-text">Comma-separated positive integers (days before expiry).
+            The sweep fires one alert per cert per threshold crossed.</div>
+        </div>
+        <div class="col-md-4 d-flex align-items-end">
+          <div class="form-check">
+            <input type="checkbox" class="form-check-input" id="is_active" name="is_active"
+                   {{ 'checked' if (cfg is none) or cfg.is_active else '' }}>
+            <label class="form-check-label" for="is_active">Active</label>
+            <div class="form-text">Uncheck to pause auto-alerts without losing the config.</div>
+          </div>
+        </div>
+      </div>
+
+      <hr class="my-4">
+      <button type="submit" class="btn btn-primary"><i class="bi bi-save"></i> Save</button>
+      <a href="{{ url_for('tls.expirations_dashboard') }}" class="btn btn-outline-secondary">Cancel</a>
+    </form>
+  </div>
+</div>
+
+<details class="mt-4">
+  <summary class="text-muted">Dry-run mode</summary>
+  <div class="card card-body mt-2 small">
+    <p class="mb-1">Set <code>FEA_SMTP_DRY_RUN=1</code> in the environment to short every
+      SMTP send to a written-to-disk <code>.eml</code> file under
+      <code>${FEA_SMTP_DRY_RUN_LOG_DIR:-/tmp/fea-smtp}</code>.</p>
+    <p class="mb-0">Useful for lab smoke tests — the operator exercises the full pipeline
+      (threshold detection, body rendering, persistence) without burning real
+      email deliverability. The "Send test email" button respects this flag too.</p>
+  </div>
+</details>
+
+</div>
+{% endblock %}

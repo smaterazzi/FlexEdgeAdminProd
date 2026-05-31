@@ -32,6 +32,18 @@ def cert_file_hash(lineage_path: str) -> str:
 def handle_renewal_webhook(domain: str) -> dict:
     """Re-deploy all active deployments tied to a domain's certificate.
 
+    Legacy/fallback path since LE.3 (2026-05-29, operator answer
+    LE-Q1=A): LE.3's in-process scheduler in
+    [webapp/letsencrypt_scheduler.py] is now THE orchestrator for
+    certs managed via ``/tls/letsencrypt/*``. This webhook stays in
+    service for two cases:
+      1. Pre-LE.1 operator-tracked certbot lineages — operator runs
+         ``certbot renew`` on the host themselves and the deploy-hook
+         posts here so FEA can redeploy the new cert.
+      2. Belt-and-braces — if the LE.3 scheduler is disabled or
+         broken, certbot host-cron + this webhook still keeps engines
+         current.
+
     Cross-Domain by design (Domain-Scoping Audit, exception E2): the
     certbot renewal hook fires at host level, not Domain level, so a
     single cert lineage may legitimately fan out to engines across

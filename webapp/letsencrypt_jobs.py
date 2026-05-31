@@ -26,10 +26,11 @@ def start_cert_op(*, change_id: int, certificate_id: int,
                   is_bypass: bool) -> str:
     """Kick off a cert op (request / renew / revoke) in a daemon thread.
 
-    `action` is one of "cert_request" / "cert_renew" / "cert_revoke" —
-    the queue op type, also used as a log/audit tag. `change_id`
-    identifies the PendingChange to push; the queue handler reads the
-    target ManagedCertificate from the change's payload.
+    `action` is one of "cert_request" / "cert_renew" / "cert_revoke"
+    / "cert_dns_verify" (LE.4) — the queue op type, also used as a
+    log/audit tag. `change_id` identifies the PendingChange to push;
+    the queue handler reads the target ManagedCertificate from the
+    change's payload.
 
     `is_bypass=True` matches the Phase E.2 bypass-queue semantics: the
     PendingChange row is deleted after a successful push (transient,
@@ -37,9 +38,10 @@ def start_cert_op(*, change_id: int, certificate_id: int,
     row stays and goes through normal /changes/ review.
     """
     total_steps = {
-        "cert_request": 4,  # validate → certbot exec → parse → persist
-        "cert_renew":   3,  # certbot exec → parse → persist
-        "cert_revoke":  3,
+        "cert_request":    4,  # validate → certbot exec → parse → persist
+        "cert_renew":      3,  # certbot exec → parse → persist
+        "cert_revoke":     3,
+        "cert_dns_verify": 4,  # LE.4 — answer → poll authz → finalize → save
     }.get(action, 3)
 
     scan_id = scan_jobs.register_job(

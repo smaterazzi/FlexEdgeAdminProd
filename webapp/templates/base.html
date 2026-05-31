@@ -291,6 +291,13 @@
                         <i class="bi bi-shield-lock"></i> Let's Encrypt
                     </a>
                 </li>
+                {# Expiration dashboard + SMTP alerts (2026-05-31). #}
+                <li class="nav-item">
+                    <a class="nav-link {% if '/tls/expirations' in request.path or '/tls/smtp' in request.path %}active{% endif %}"
+                       href="{{ url_for('tls.expirations_dashboard') }}">
+                        <i class="bi bi-calendar-event"></i> Expirations
+                    </a>
+                </li>
             </ul>
 
             <div class="section-label">Engines</div>

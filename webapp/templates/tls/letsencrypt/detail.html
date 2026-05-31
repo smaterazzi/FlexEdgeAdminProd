@@ -45,6 +45,14 @@
         <i class="bi bi-arrow-counterclockwise"></i> Reset state
       </button>
     </form>
+    {% if cert.status == 'active' %}
+    <button type="button" class="btn btn-sm btn-outline-danger"
+            data-bs-toggle="modal" data-bs-target="#cert-revoke-modal"
+            {% if scan_running %}disabled{% endif %}
+            title="Revoke this cert at Let's Encrypt (adds it to the CRL). Distinct from Stop tracking — see modal for details.">
+      <i class="bi bi-shield-x"></i> Revoke at LE
+    </button>
+    {% endif %}
     <form method="post" action="{{ url_for('letsencrypt.cert_delete', cert_id=cert.id) }}"
           id="cert-delete-form"
           onsubmit="return confirmCertDelete(this);"
@@ -63,6 +71,75 @@
         {% if cert.status == 'pending' %}Delete request{% else %}Stop tracking{% endif %}
       </button>
     </form>
+
+{# Revoke modal — LE.5.b (operator answer LE-Q3=B). Distinct from
+   Stop tracking: revoke adds the cert to LE's CRL/OCSP. Optional
+   checkbox chains to Stop tracking. #}
+{% if cert.status == 'active' %}
+<div class="modal fade" id="cert-revoke-modal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog">
+    <div class="modal-content">
+      <form method="post" action="{{ url_for('letsencrypt.cert_revoke', cert_id=cert.id) }}">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-header">
+          <h5 class="modal-title">
+            <i class="bi bi-shield-x text-danger"></i>
+            Revoke {{ cert.domain }} at Let's Encrypt
+          </h5>
+          <button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+        <div class="modal-body">
+          <p class="mb-2">
+            Revoking publishes the certificate's serial to LE's CRL/OCSP responders,
+            so browsers / engines that check revocation will stop trusting it.
+            <strong class="text-warning">This cannot be undone</strong> — you'll need
+            to issue a fresh certificate to serve the same domain.
+          </p>
+          <p class="small text-muted mb-3">
+            Revoking is distinct from <em>Stop tracking</em> (which just removes FEA's
+            record but leaves the cert valid at LE until natural expiry). Use the
+            checkbox below to chain both.
+          </p>
+          <div class="mb-3">
+            <label for="revoke-reason" class="form-label">Revocation reason</label>
+            <select class="form-select" id="revoke-reason" name="reason">
+              <option value="unspecified" selected>unspecified (default)</option>
+              <option value="keyCompromise">keyCompromise — the private key was exposed</option>
+              <option value="superseded">superseded — replaced by a newer certificate</option>
+              <option value="cessationOfOperation">cessationOfOperation — the service is being retired</option>
+              <option value="affiliationChanged">affiliationChanged — operator/ownership changed</option>
+            </select>
+            <div class="form-text">
+              RFC 5280 reason code. LE accepts this as the <code>--reason</code> value to
+              certbot revoke; it surfaces on CRL entries.
+            </div>
+          </div>
+          <div class="form-check">
+            <input class="form-check-input" type="checkbox" id="also-stop-tracking"
+                   name="also_stop_tracking" value="1">
+            <label class="form-check-label" for="also-stop-tracking">
+              Also stop tracking in FEA after revoke (chain)
+            </label>
+            <div class="form-text small">
+              When ticked, the FEA row is deleted right after the successful revoke.
+              Certbot files on disk are NOT purged automatically — run
+              <code>certbot delete --cert-name {{ cert.domain }}</code> on the host
+              if you want to clear them. Leave unticked to keep the row for audit
+              purposes (it'll show as <code>status=revoked</code>).
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" class="btn btn-danger">
+            <i class="bi bi-shield-x"></i> Revoke now
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+{% endif %}
 <script>
 function confirmCertDelete(form) {
   var purge = form.querySelector('#purge-lineage').checked;
@@ -89,6 +166,96 @@ function confirmCertDelete(form) {
 <div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
 {% endfor %}
 {% endwith %}
+
+{# LE.4 — DNS-01 awaiting_dns state. Show the TXT record the operator
+   must publish, with copy buttons + a "I've published" submit that
+   enqueues cert_dns_verify. #}
+{% if cert.challenge_type == 'dns01_manual'
+      and cert.status == 'pending'
+      and cert.dns_challenge_record_name
+      and cert.dns_challenge_state %}
+<div class="card mb-3 border-warning" id="le-dns01-pending">
+  <div class="card-header bg-warning text-dark">
+    <h5 class="mb-0">
+      <i class="bi bi-megaphone"></i>
+      Awaiting DNS — publish a TXT record to continue
+    </h5>
+  </div>
+  <div class="card-body">
+    <p class="mb-3">
+      Let's Encrypt opened an order for <code>{{ cert.domain }}</code>.
+      To prove you control this domain, publish the following TXT record
+      at your DNS provider. Once it's propagated, click
+      <strong>I've published it</strong> below — FEA will answer the
+      challenge and finalize the cert.
+    </p>
+    <table class="table table-sm table-borderless mb-3">
+      <tr>
+        <th style="width: 12rem;">Record type</th>
+        <td><code>TXT</code></td>
+      </tr>
+      <tr>
+        <th>Record name</th>
+        <td>
+          <code id="dns-record-name">{{ cert.dns_challenge_record_name }}</code>
+          <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
+                  onclick="navigator.clipboard.writeText({{ cert.dns_challenge_record_name|tojson }})">
+            <i class="bi bi-clipboard"></i> Copy
+          </button>
+        </td>
+      </tr>
+      <tr>
+        <th>Record value</th>
+        <td>
+          <code id="dns-record-value" style="word-break: break-all;">{{ cert.dns_challenge_record_value }}</code>
+          <button type="button" class="btn btn-sm btn-outline-secondary ms-2"
+                  onclick="navigator.clipboard.writeText({{ cert.dns_challenge_record_value|tojson }})">
+            <i class="bi bi-clipboard"></i> Copy
+          </button>
+        </td>
+      </tr>
+      <tr>
+        <th>TTL</th>
+        <td>
+          <span class="text-muted small">Use the provider's default (often 300s). Lower TTL = faster propagation.</span>
+        </td>
+      </tr>
+    </table>
+
+    <div class="alert alert-info small mb-3" role="alert">
+      <i class="bi bi-info-circle"></i>
+      Some providers prefix the record name with the zone — e.g. at
+      Cloudflare you'd enter <code>_acme-challenge</code> (or just
+      <code>_acme-challenge.&lt;subdomain&gt;</code>) and the
+      <code>{{ cert.domain|replace('*.', '') }}</code> zone is implicit.
+      The full FQDN above is what LE will query.
+    </div>
+
+    <div class="d-flex gap-2 align-items-center flex-wrap">
+      <form method="post" action="{{ url_for('letsencrypt.cert_dns_precheck', cert_id=cert.id) }}"
+            class="mb-0">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <button class="btn btn-sm btn-outline-info" type="submit">
+          <i class="bi bi-search"></i> Check DNS propagation
+        </button>
+      </form>
+      <span class="text-muted small">— optional pre-check; queries the TXT and compares the value.</span>
+    </div>
+    <hr>
+    <form method="post" action="{{ url_for('letsencrypt.cert_dns_verify', cert_id=cert.id) }}"
+          onsubmit="return confirm('Tell LE to validate the TXT record now? If it has not propagated yet, the order will fail.');"
+          class="mb-0">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+      <button class="btn btn-success" type="submit" {% if scan_running %}disabled{% endif %}>
+        <i class="bi bi-check2-circle"></i> I've published it — continue
+      </button>
+      <span class="text-muted small ms-2">
+        Triggers LE to poll the TXT record. FEA finalizes the order on success.
+      </span>
+    </form>
+  </div>
+</div>
+{% endif %}
 
 {% if scan_running %}
 {# Watcher card — JS at the bottom polls /tls/letsencrypt/<id>/status. #}

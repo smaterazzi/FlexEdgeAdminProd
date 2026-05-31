@@ -71,6 +71,17 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # and they race on freshly-added tables (the loser crashes with "table already
 # exists"). Preload also halves memory via copy-on-write fork semantics.
 # CLI tools available via: docker compose exec flexedge-web python -m cli.connect --tenant prod
+#
+# --timeout 360: bumped from 120 (LE hygiene, 2026-05-29). Cover the
+# worst-case synchronous certbot round-trips that hold a worker:
+#   * first-time ACME account registration ([webapp/letsencrypt_certbot]
+#     register_account, up to 300s)
+#   * TLS deploy auto-push (engine SMC operations behind smc_global_lock,
+#     ~30-60s per engine, can stack)
+# The shorter 120s default would 504 the operator's request mid-LE-flow
+# before certbot finishes. Operators on faster networks can reduce this
+# back to 120 via compose override; the warning logs in
+# letsencrypt_manager.account_view name the constraint.
 CMD ["gunicorn", "--preload", "-w", "2", "-k", "gthread", "--threads", "8", \
-     "-b", "0.0.0.0:8088", "--timeout", "120", \
+     "-b", "0.0.0.0:8088", "--timeout", "360", \
      "--chdir", "/app/webapp", "app:app"]

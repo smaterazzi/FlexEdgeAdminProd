@@ -43,7 +43,8 @@ def _current_user_id() -> Optional[int]:
 def enqueue_cert_request(*, fqdn: str, domain: Domain,
                          is_staging: bool,
                          requested_by_user_id: Optional[int] = None,
-                         account: Optional[AcmeAccount] = None
+                         account: Optional[AcmeAccount] = None,
+                         challenge_type: str = "http01",
                          ) -> tuple[ManagedCertificate, PendingChange]:
     """Create the ManagedCertificate row + a queued cert_request change.
 
@@ -52,10 +53,19 @@ def enqueue_cert_request(*, fqdn: str, domain: Domain,
       * the FQDN passes the per-Domain allowlist
       * an AcmeAccount exists (the setup wizard ran)
 
+    ``challenge_type`` (LE.4, 2026-05-29): ``"http01"`` (default — the
+    pre-LE.4 webroot flow handled by certbot subprocess) or
+    ``"dns01_manual"`` (operator publishes a TXT record; multi-step
+    state machine handled by webapp/letsencrypt_acme.py). Wildcards
+    (``*.example.com``) require ``dns01_manual``.
+
     Returns (cert, change) — both committed.
     """
     if account is None:
         account = AcmeAccount.query.first()
+
+    if challenge_type not in ("http01", "dns01_manual"):
+        raise ValueError(f"Unsupported challenge_type: {challenge_type!r}")
 
     cert = ManagedCertificate(
         domain=fqdn,
@@ -67,7 +77,7 @@ def enqueue_cert_request(*, fqdn: str, domain: Domain,
         last_error="",
         is_staging=bool(is_staging or (account and account.is_staging)),
         account_id=account.id if account else None,
-        challenge_type="http01",
+        challenge_type=challenge_type,
     )
     db.session.add(cert)
     db.session.flush()  # need cert.id for the source_correlation_id
@@ -115,12 +125,57 @@ def enqueue_cert_renew(*, cert: ManagedCertificate,
     return change
 
 
+def enqueue_cert_dns_verify(*, cert: ManagedCertificate,
+                            requested_by_user_id: Optional[int] = None
+                            ) -> PendingChange:
+    """LE.4 — operator clicked "I've published the TXT record".
+
+    Enqueues a ``cert_dns_verify`` queue op. Handler will answer the
+    LE challenge, poll the authorization, finalize the order, and
+    save the cert files. On success the cert flips status='active'
+    + populates certbot_lineage + next_renewal_after, same shape as
+    a successful HTTP-01 cert.
+
+    Only meaningful for certs in ``status='pending'`` + ``challenge_type='dns01_manual'``
+    + ``dns_challenge_state='awaiting_dns'``. Defensive checks live
+    in the route + the handler.
+    """
+    payload = {"certificate_id": cert.id}
+    change = PendingChange(
+        domain_id=cert.domain_id,
+        user_id=requested_by_user_id or _current_user_id(),
+        smc_object_id=None,
+        scope="main",
+        operation="cert_dns_verify",
+        payload_json=json.dumps(payload),
+        feature_source="letsencrypt",
+        source_correlation_id=f"letsencrypt_cert:{cert.id}",
+        state="queued",
+    )
+    db.session.add(change)
+    db.session.flush()
+    cert.pending_change_id = change.id
+    db.session.commit()
+    return change
+
+
 def enqueue_cert_revoke(*, cert: ManagedCertificate, reason: str = "unspecified",
+                        also_stop_tracking: bool = False,
                         requested_by_user_id: Optional[int] = None
                         ) -> PendingChange:
-    """Queue a revoke. UI for this is Phase LE.5; the helper exists now
-    so a Phase LE.3 cron sweep (e.g. retire-stale) can call it."""
-    payload = {"certificate_id": cert.id, "reason": reason}
+    """Queue a revoke.
+
+    ``also_stop_tracking`` (LE-Q3=B chain): when True, the handler
+    deletes the ManagedCertificate row AFTER a successful revoke at
+    LE. The async flow makes a post-route ORM delete unsafe — the
+    handler reads the cert mid-flight, so the chain has to live with
+    the handler that owns the state transition.
+    """
+    payload = {
+        "certificate_id": cert.id,
+        "reason": reason,
+        "also_stop_tracking": bool(also_stop_tracking),
+    }
     change = PendingChange(
         domain_id=cert.domain_id,
         user_id=requested_by_user_id or _current_user_id(),

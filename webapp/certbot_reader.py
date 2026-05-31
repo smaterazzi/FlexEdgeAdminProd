@@ -1,7 +1,11 @@
 """
 FlexEdgeAdmin — Certbot certificate discovery and reading.
-Reads /etc/letsencrypt/live/ and /etc/letsencrypt/renewal/ to enumerate
-managed certificates, their domains, expiry, and file paths.
+Reads ``$CERTBOT_LIVE_DIR`` (default ``/config/letsencrypt/live`` since
+the Phase LE.2 hotfix, 2026-05-11 — previously hardcoded
+``/etc/letsencrypt/live``, which was unwritable by the unprivileged
+gunicorn user inside the Docker image) and the sibling ``renewal/``
+directory to enumerate managed certificates, their domains, expiry,
+and file paths.
 """
 import hashlib
 import logging

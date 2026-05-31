@@ -1,0 +1,89 @@
+{% extends "base.html" %}
+{% block title %}TLS — Notification log{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, message in messages %}
+      <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+      </div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+<nav aria-label="breadcrumb" class="mb-3">
+  <ol class="breadcrumb">
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.dashboard') }}">TLS</a></li>
+    <li class="breadcrumb-item"><a href="{{ url_for('tls.expirations_dashboard') }}">Expirations</a></li>
+    <li class="breadcrumb-item active" aria-current="page">Notification log</li>
+  </ol>
+</nav>
+
+<h2 class="mb-3"><i class="bi bi-list-check"></i> Expiration notification log</h2>
+
+<p class="text-muted">
+    Every cert-expiration alert fired by the lazy-sweep scheduler in this
+    Domain, newest first. Notifications are de-duplicated per
+    <code>(certificate, threshold)</code> pair — a failed send is retried
+    on the next sweep until it succeeds. Latest 200 rows shown.
+</p>
+
+<div class="card">
+    {% if rows %}
+    <div class="table-responsive">
+        <table class="table table-hover mb-0 align-middle">
+            <thead>
+                <tr>
+                    <th>Sent at</th>
+                    <th>Domain</th>
+                    <th>Threshold</th>
+                    <th>Days to expiry</th>
+                    <th>Status</th>
+                    <th>Recipients</th>
+                    <th>Error</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in rows %}
+                <tr>
+                    <td>{{ r.sent_at.strftime('%Y-%m-%d %H:%M UTC') }}</td>
+                    <td><strong>{{ r.certificate.domain if r.certificate else '?' }}</strong></td>
+                    <td><span class="badge bg-secondary">{{ r.threshold_days }}d</span></td>
+                    <td>
+                        {% if r.days_to_expiry < 0 %}
+                            <span class="badge bg-danger">{{ r.days_to_expiry }}</span>
+                        {% elif r.days_to_expiry <= 3 %}
+                            <span class="badge bg-danger">{{ r.days_to_expiry }}</span>
+                        {% elif r.days_to_expiry <= 14 %}
+                            <span class="badge bg-warning text-dark">{{ r.days_to_expiry }}</span>
+                        {% else %}
+                            <span class="badge bg-info text-dark">{{ r.days_to_expiry }}</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if r.status == 'ok' %}
+                            <span class="badge bg-success">ok</span>
+                        {% else %}
+                            <span class="badge bg-danger">failed</span>
+                        {% endif %}
+                    </td>
+                    <td class="small">{{ r.recipients_csv or '—' }}</td>
+                    <td class="small text-danger">{{ r.error or '' }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="card-body">
+        <p class="text-muted mb-0">No notifications fired yet in this Domain.</p>
+    </div>
+    {% endif %}
+</div>
+
+</div>
+{% endblock %}

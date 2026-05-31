@@ -1,0 +1,148 @@
+{% extends "base.html" %}
+{% block title %}TLS — Expirations{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% if messages %}
+    {% for category, message in messages %}
+      <div class="alert alert-{{ category if category != 'message' else 'info' }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+      </div>
+    {% endfor %}
+  {% endif %}
+{% endwith %}
+
+<div class="d-flex justify-content-between align-items-center mb-4">
+    <h2 class="mb-0"><i class="bi bi-calendar-event"></i> Certificate expirations</h2>
+    <div class="btn-group">
+        <a href="{{ url_for('tls.smtp_config') }}" class="btn btn-outline-primary">
+            <i class="bi bi-envelope-gear"></i> SMTP config
+        </a>
+        <a href="{{ url_for('tls.expirations_notifications') }}" class="btn btn-outline-secondary">
+            <i class="bi bi-list-check"></i> Notification log
+        </a>
+        <form method="post" action="{{ url_for('tls.expirations_sweep_now') }}" class="d-inline">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <button class="btn btn-success" type="submit">
+                <i class="bi bi-arrow-repeat"></i> Sweep now
+            </button>
+        </form>
+    </div>
+</div>
+
+{% if not smtp_cfg %}
+    <div class="alert alert-warning d-flex align-items-center">
+        <i class="bi bi-exclamation-triangle me-2"></i>
+        <div>
+            No SMTP configuration for this Domain yet — the table below renders
+            but no alerts will be sent.
+            <a href="{{ url_for('tls.smtp_config') }}" class="alert-link">Configure SMTP</a>
+            to enable the lazy-sweep auto-alerts.
+        </div>
+    </div>
+{% elif not smtp_cfg.is_active %}
+    <div class="alert alert-info">
+        SMTP is configured but <strong>not active</strong> — auto-alerts are
+        paused. <a href="{{ url_for('tls.smtp_config') }}" class="alert-link">Enable</a>
+        from the SMTP page to resume sweeps.
+    </div>
+{% endif %}
+
+{% if sweep_report %}
+    <div class="alert alert-light border d-flex align-items-center small">
+        <i class="bi bi-info-circle me-2"></i>
+        Lazy sweep ran {{ sweep_report.started_at.strftime('%Y-%m-%d %H:%M UTC') }} —
+        considered <strong>{{ sweep_report.certs_considered }}</strong> cert(s) across
+        <strong>{{ sweep_report.domains_considered }}</strong> Domain(s);
+        sent <strong>{{ sweep_report.sends_ok }}</strong> ok,
+        <strong>{{ sweep_report.sends_failed }}</strong> failed,
+        skipped <strong>{{ sweep_report.certs_no_threshold_due }}</strong> not-yet-due.
+    </div>
+{% endif %}
+
+<div class="card">
+    <div class="card-header"><h5 class="mb-0">Tracked certificates in this Domain</h5></div>
+    {% if views %}
+    <div class="table-responsive">
+        <table class="table table-hover mb-0 align-middle">
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Source</th>
+                    <th>Valid until</th>
+                    <th>Days to expiry</th>
+                    <th>Deployments</th>
+                    <th>Last threshold notified</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for v in views %}
+                <tr>
+                    <td><strong>{{ v.cert.domain }}</strong></td>
+                    <td>
+                        {% if v.source_label == 'PFX' %}
+                            <span class="badge bg-info text-dark">PFX</span>
+                        {% elif v.source_label == 'LE · DNS-01' %}
+                            <span class="badge bg-primary">LE · DNS-01</span>
+                        {% else %}
+                            <span class="badge bg-secondary">LE · HTTP-01</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if v.valid_to %}
+                            {{ v.valid_to.strftime('%Y-%m-%d') }}
+                        {% else %}
+                            <span class="text-muted">—</span>
+                        {% endif %}
+                    </td>
+                    <td>
+                        {% if v.days_to_expiry is none %}
+                            {% if not v.on_disk_present %}
+                                <span class="badge bg-danger">no lineage on disk</span>
+                            {% else %}
+                                <span class="badge bg-warning text-dark">parse failed</span>
+                            {% endif %}
+                        {% elif v.days_to_expiry < 0 %}
+                            <span class="badge bg-danger">expired {{ -v.days_to_expiry }}d ago</span>
+                        {% elif v.days_to_expiry == 0 %}
+                            <span class="badge bg-danger">expires today</span>
+                        {% elif v.days_to_expiry <= 3 %}
+                            <span class="badge bg-danger">{{ v.days_to_expiry }}d</span>
+                        {% elif v.days_to_expiry <= 14 %}
+                            <span class="badge bg-warning text-dark">{{ v.days_to_expiry }}d</span>
+                        {% elif v.days_to_expiry <= 30 %}
+                            <span class="badge bg-info text-dark">{{ v.days_to_expiry }}d</span>
+                        {% else %}
+                            <span class="badge bg-success">{{ v.days_to_expiry }}d</span>
+                        {% endif %}
+                    </td>
+                    <td><span class="badge bg-secondary">{{ v.deployments_count }}</span></td>
+                    <td>
+                        {% if v.last_notified_threshold is not none %}
+                            <span class="text-muted">at {{ v.last_notified_threshold }}d</span>
+                        {% else %}
+                            <span class="text-muted">never</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <div class="card-body">
+        <p class="text-muted mb-0">
+            No tracked certificates in this Domain yet.
+            <a href="{{ url_for('tls.certificates_list') }}">Track a certificate</a>
+            or <a href="{{ url_for('tls.certificates_import_pfx') }}">import a PFX</a>
+            to populate the dashboard.
+        </p>
+    </div>
+    {% endif %}
+</div>
+
+</div>
+{% endblock %}

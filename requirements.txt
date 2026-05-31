@@ -11,3 +11,10 @@ requests>=2.31
 paramiko>=3.4
 flask-sock>=0.7
 simple-websocket>=1.0
+# LE.4 (2026-05-29): DNS-01 wildcard support via the `acme` Python
+# library (NOT certbot subprocess — DNS-01 needs to pause for the
+# operator to publish the TXT record at their DNS provider).
+# `dnspython` powers the operator-facing TXT-propagation pre-check.
+acme>=2.0
+josepy>=1.14
+dnspython>=2.4

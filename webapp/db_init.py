@@ -393,6 +393,17 @@ def _migrate_post_create(db, app):
     # additive column adds on the existing `managed_certificates` table.
     _phase_le_certs(db, app)
 
+    # Audit V1 (2026-05-29): one-shot move of pre-V1 migration projects
+    # from `webapp/projects/` into the resolved `PROJECTS_DIR` (typically
+    # `/app/data/projects/` in Docker). Idempotent — see the helper for
+    # the gate conditions. Pure filesystem op, runs outside the DB
+    # transaction; failures log + swallow, never abort boot.
+    try:
+        from webapp import project_manager
+        project_manager._migrate_legacy_projects_dir()
+    except Exception as exc:
+        log.warning("V1 legacy-projects migration skipped: %s", exc)
+
 
 def _phase_le_certs(db, app):
     """Extend `managed_certificates` for the Let's Encrypt CRUD feature.

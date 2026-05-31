@@ -839,26 +839,25 @@ def api_key_delete(id):
 @admin_bp.route("/backup")
 @super_admin_required
 def backup():
-    """Download a ZIP containing the database and encryption key."""
-    import os
+    """Download a full ZIP snapshot of the deployment state.
 
-    db_path = current_app.config["SQLALCHEMY_DATABASE_URI"].replace("sqlite:///", "")
-    key_path = os.environ.get("ENCRYPTION_KEY_FILE", KEY_FILE)
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        if os.path.isfile(db_path):
-            zf.write(db_path, "flexedge.db")
-        if os.path.isfile(key_path):
-            zf.write(key_path, "encryption.key")
-
-    buf.seek(0)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    LE.5.a + V1 follow-up (2026-05-29): now includes
+    ``/config/letsencrypt/*`` (full certbot state — accounts /
+    live / archive / renewal) AND ``data/projects/*`` (migration
+    project manifests + uploaded FortiGate configs). Operators
+    restoring from a backup get working LE certs AND in-flight
+    migrations back, not just admin config. See
+    ``webapp.factory_reset.build_backup_zip`` for the full content
+    map.
+    """
+    from webapp.factory_reset import build_backup_zip
+    backup_bytes, backup_filename = build_backup_zip(prefix="flexedge-backup")
+    buf = io.BytesIO(backup_bytes)
     return send_file(
         buf,
         mimetype="application/zip",
         as_attachment=True,
-        download_name=f"flexedge-backup-{timestamp}.zip",
+        download_name=backup_filename,
     )
 
 
@@ -933,7 +932,8 @@ def factory_reset_execute():
 
     # 1. Build the backup BEFORE we wipe.
     try:
-        backup_bytes, backup_filename = build_backup_zip()
+        backup_bytes, backup_filename = build_backup_zip(
+            prefix="flexedge-pre-reset-backup")
     except Exception as exc:
         log.exception("factory_reset: backup build failed")
         flash(f"Could not build pre-reset backup — aborting reset. {exc}",

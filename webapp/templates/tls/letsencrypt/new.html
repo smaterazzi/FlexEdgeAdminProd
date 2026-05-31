@@ -103,11 +103,50 @@
     <div class="mb-3">
       <label class="form-label">Fully-qualified domain name</label>
       <input type="text" name="fqdn" class="form-control" required
-             value="{{ form_fqdn }}" placeholder="admin.example.com"
-             pattern="^[a-z0-9.\-]+$" autocomplete="off">
+             value="{{ form_fqdn }}" placeholder="admin.example.com (or *.example.com)"
+             pattern="^\*?[a-z0-9.\-]+$" autocomplete="off">
       <div class="form-text">
-        Lowercase ASCII, digits, dots, hyphens. Single FQDN only —
-        wildcards land in a later phase via the manual DNS-01 flow.
+        Lowercase ASCII, digits, dots, hyphens. For wildcards, prefix
+        with <code>*.</code> (e.g. <code>*.prod.example.com</code>) —
+        wildcards require the DNS-01 challenge below.
+      </div>
+    </div>
+
+    {# LE.4 (2026-05-29) — challenge type. HTTP-01 is default and only
+       for single-FQDN; DNS-01 is required for wildcards and useful
+       when the host can't serve HTTP/80 (e.g. air-gapped internal
+       hostnames behind split DNS). #}
+    <div class="mb-3">
+      <label class="form-label">ACME challenge type</label>
+      <div class="form-check">
+        <input class="form-check-input" type="radio" name="challenge_type"
+               id="challenge-http01" value="http01"
+               {% if (form_challenge_type or 'http01') == 'http01' %}checked{% endif %}>
+        <label class="form-check-label" for="challenge-http01">
+          <strong>HTTP-01</strong> (default, automated end-to-end)
+        </label>
+        <div class="form-text small">
+          FEA serves the challenge at
+          <code>/.well-known/acme-challenge/&lt;token&gt;</code>;
+          LE GETs it. Requires the FQDN to resolve to this FEA
+          instance with port 80 reachable. Single FQDN only — no
+          wildcards.
+        </div>
+      </div>
+      <div class="form-check mt-2">
+        <input class="form-check-input" type="radio" name="challenge_type"
+               id="challenge-dns01" value="dns01_manual"
+               {% if form_challenge_type == 'dns01_manual' %}checked{% endif %}>
+        <label class="form-check-label" for="challenge-dns01">
+          <strong>DNS-01</strong> (manual TXT record — required for wildcards)
+        </label>
+        <div class="form-text small">
+          After submit FEA opens the ACME order and shows you a
+          <code>_acme-challenge.&lt;fqdn&gt;</code> TXT record to publish at
+          your DNS provider. You click "I've published" once propagated;
+          FEA finalizes. Renewals are operator-driven (re-publish
+          required) — the LE.3 auto-renewal scheduler skips DNS-01 certs.
+        </div>
       </div>
     </div>
 

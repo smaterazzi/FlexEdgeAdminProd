@@ -2076,6 +2076,52 @@ def _handle_cert_request(change, cfg) -> HandlerResult:
                 error="no AcmeAccount configured (run setup wizard at /tls/letsencrypt first)",
             )
 
+        # LE.4 (2026-05-29) — branch on challenge_type. DNS-01 needs a
+        # multi-step flow (open order → operator publishes TXT → resume).
+        # The cert stays in status='pending' after this handler returns
+        # successfully; the operator-clicked "I've published" path
+        # enqueues cert_dns_verify which finalizes.
+        if cert.challenge_type == "dns01_manual":
+            import base64
+            try:
+                from webapp.letsencrypt_acme import start_dns01_order, AcmeError
+            except ImportError as exc:
+                cert.status = "failed"
+                cert.last_error = f"ACME library missing — pip install acme: {exc}"
+                db.session.commit()
+                return HandlerResult(success=False, error=str(exc))
+            try:
+                details = start_dns01_order(
+                    fqdn=cert.domain,
+                    is_staging=bool(cert.is_staging or account.is_staging),
+                )
+            except AcmeError as exc:
+                cert.status = "failed"
+                cert.last_error = f"DNS-01 order start failed: {exc}"[:1500]
+                db.session.commit()
+                return HandlerResult(success=False, error=str(exc))
+            # Stash everything the verify step needs into the cert row.
+            # cert_key_pem is base64'd so the JSON stays ASCII-safe.
+            cert.dns_challenge_record_name = details.record_name
+            cert.dns_challenge_record_value = details.record_value
+            cert.dns_challenge_state = _json.dumps({
+                "order_uri": details.order_uri,
+                "challenge_uri": details.challenge_uri,
+                "authz_uri": details.authz_uri,
+                "cert_key_pem_b64": base64.b64encode(details.cert_key_pem).decode("ascii"),
+                "stage": "awaiting_dns",
+                "ready_at": _utcnow().isoformat(),
+            })
+            cert.last_error = ""
+            cert.last_checked_at = _utcnow()
+            db.session.commit()
+            return HandlerResult(
+                success=True, applied=True,
+                detail=(f"DNS-01 order opened for {cert.domain}; "
+                        f"operator must publish TXT at {details.record_name} "
+                        f"then click verify."),
+            )
+
         result = request_certificate(
             fqdn=cert.domain,
             email=account.email,
@@ -2183,6 +2229,10 @@ def _handle_cert_revoke(change, cfg) -> HandlerResult:
         return HandlerResult(success=False,
                              error="cert_revoke payload missing certificate_id")
     reason = (payload.get("reason") or "unspecified").strip()
+    # LE.5.b (LE-Q3=B): when True, ORM-delete the cert row after a
+    # successful revoke. Chains "Revoke at LE" → "Stop tracking in FEA"
+    # into one operator action while keeping the two concepts distinct.
+    also_stop_tracking = bool(payload.get("also_stop_tracking", False))
 
     try:
         from shared.db import db
@@ -2194,13 +2244,28 @@ def _handle_cert_revoke(change, cfg) -> HandlerResult:
             return HandlerResult(success=False,
                                  error=f"ManagedCertificate #{cert_id} not found")
 
+        fqdn = cert.domain
         result = revoke_certificate(
-            fqdn=cert.domain,
+            fqdn=fqdn,
             is_staging=bool(cert.is_staging),
             reason=reason,
         )
 
         if result.success:
+            if also_stop_tracking:
+                # Chain — drop the FEA row. The PendingChange FK is
+                # ondelete=SET NULL (models.py) so this row's reference
+                # to the cert is cleared automatically. The certbot
+                # files on disk are NOT purged here (operator can run
+                # certbot delete manually); LE.4 follow-up could add an
+                # optional purge_lineage flag mirroring cert_delete.
+                db.session.delete(cert)
+                db.session.commit()
+                return HandlerResult(
+                    success=True, applied=True,
+                    detail=(f"revoked + stopped tracking in "
+                            f"{result.duration_ms}ms (reason={reason})"),
+                )
             cert.status = "revoked"
             cert.last_error = ""
             cert.last_checked_at = _utcnow()
@@ -2219,6 +2284,101 @@ def _handle_cert_revoke(change, cfg) -> HandlerResult:
             )
     except Exception as exc:
         log.exception("cert_revoke handler raised")
+        return HandlerResult(success=False, error=str(exc))
+
+
+@register_handler("cert_dns_verify")
+def _handle_cert_dns_verify(change, cfg) -> HandlerResult:
+    """LE.4 — operator clicked "I've published the TXT record".
+
+    Reads the order/challenge/authz URIs + the stashed cert private
+    key from ``cert.dns_challenge_state`` (JSON blob written by the
+    cert_request handler's DNS-01 branch), answers the challenge,
+    polls the authz, finalizes the order, and saves the cert files
+    in the certbot layout. On success: cert.status='active' +
+    certbot_lineage populated + next_renewal_after stamped — same
+    shape as a successful HTTP-01 cert.
+    """
+    import base64
+    try:
+        payload = _json.loads(change.payload_json or "{}")
+    except Exception as exc:
+        return HandlerResult(success=False, error=f"Invalid payload JSON: {exc}")
+
+    cert_id = payload.get("certificate_id")
+    if not cert_id:
+        return HandlerResult(
+            success=False, error="cert_dns_verify payload missing certificate_id",
+        )
+
+    try:
+        from shared.db import db
+        from webapp.models import ManagedCertificate
+        from webapp.letsencrypt_acme import finalize_dns01_order, AcmeError
+
+        cert = db.session.get(ManagedCertificate, int(cert_id))
+        if cert is None:
+            return HandlerResult(
+                success=False, error=f"ManagedCertificate #{cert_id} not found",
+            )
+        if cert.challenge_type != "dns01_manual":
+            return HandlerResult(
+                success=False,
+                error=f"cert {cert_id} is not a DNS-01 cert "
+                      f"(challenge_type={cert.challenge_type!r})",
+            )
+        if cert.status != "pending":
+            return HandlerResult(
+                success=False,
+                error=f"cert {cert_id} is in status={cert.status!r}; "
+                      "verify only valid for pending DNS-01 certs.",
+            )
+        if not cert.dns_challenge_state:
+            return HandlerResult(
+                success=False,
+                error="cert has no DNS-01 state stashed — order was never opened",
+            )
+        try:
+            stash = _json.loads(cert.dns_challenge_state)
+        except Exception as exc:
+            cert.status = "failed"
+            cert.last_error = f"cert dns_challenge_state is corrupted: {exc}"
+            db.session.commit()
+            return HandlerResult(success=False, error=str(exc))
+
+        try:
+            cert_key_pem = base64.b64decode(stash["cert_key_pem_b64"])
+            lineage, next_renewal_after = finalize_dns01_order(
+                fqdn=cert.domain,
+                is_staging=bool(cert.is_staging),
+                challenge_uri=stash["challenge_uri"],
+                authz_uri=stash["authz_uri"],
+                order_uri=stash["order_uri"],
+                cert_key_pem=cert_key_pem,
+            )
+        except AcmeError as exc:
+            cert.status = "failed"
+            cert.last_error = f"DNS-01 verify failed: {exc}"[:1500]
+            db.session.commit()
+            return HandlerResult(success=False, error=str(exc))
+
+        cert.status = "active"
+        cert.certbot_lineage = lineage
+        cert.last_error = ""
+        cert.last_checked_at = _utcnow()
+        cert.next_renewal_after = next_renewal_after
+        # Clear the stash now that the order is closed. Record name +
+        # value stay for audit / display ("this cert was issued via
+        # DNS-01 using TXT _acme-challenge.example.com").
+        cert.dns_challenge_state = ""
+        db.session.commit()
+        return HandlerResult(
+            success=True, applied=True,
+            detail=(f"DNS-01 verify completed for {cert.domain}; "
+                    f"lineage={lineage}"),
+        )
+    except Exception as exc:
+        log.exception("cert_dns_verify handler raised")
         return HandlerResult(success=False, error=str(exc))
 
 

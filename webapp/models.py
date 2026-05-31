@@ -452,6 +452,100 @@ class TLSDeploymentLog(db.Model):
     deployment = db.relationship("TLSDeployment", back_populates="logs")
 
 
+class SmtpConfig(db.Model):
+    """Per-Domain SMTP configuration for cert-expiration alerts.
+
+    Operator-facing TLS feature add 2026-05-31. One row per Domain;
+    Domain Admin manages from ``/tls/smtp``. The password is stored
+    Fernet-encrypted via the project-wide ``EncryptedString``
+    transparent column so it's only ever decrypted at send-time
+    inside the worker thread.
+
+    Recipients + thresholds are CSV strings — simple to edit in a
+    form textarea, no extra join table. Thresholds are positive
+    integers in DAYS (default 30/14/7/3/1) — the expirations sweep
+    fires one notification per (cert, threshold) pair.
+    """
+    __tablename__ = "smtp_configs"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer,
+                          db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, unique=True, index=True)
+    is_active = db.Column(db.Boolean, default=True, nullable=False)
+    host = db.Column(db.String(255), nullable=False)
+    port = db.Column(db.Integer, default=587, nullable=False)
+    # security mode: "starttls" (default, port 587) | "ssl" (SMTPS, port 465) | "plain"
+    security = db.Column(db.String(16), default="starttls", nullable=False)
+    username = db.Column(db.String(255), default="", nullable=False)
+    encrypted_password = db.Column(EncryptedString, default="", nullable=False)
+    from_address = db.Column(db.String(255), nullable=False)
+    from_name = db.Column(db.String(255), default="FlexEdgeAdmin", nullable=False)
+    # Comma-separated recipient list. Validation happens at form-handling time.
+    recipients_csv = db.Column(db.String(2048), default="", nullable=False)
+    # Comma-separated integer thresholds in days. Default "30,14,7,3,1".
+    thresholds_csv = db.Column(db.String(128), default="30,14,7,3,1", nullable=False)
+    # Smoke-test bookkeeping — last result of the operator-clicked Test
+    # button. Surfaces on the SMTP page so the operator knows the config
+    # is reachable before relying on the lazy sweep.
+    last_test_at = db.Column(db.DateTime, nullable=True)
+    last_test_status = db.Column(db.String(16), default="", nullable=False)  # ok|failed|""
+    last_test_error = db.Column(db.Text, default="", nullable=False)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+
+    domain = db.relationship("Domain")
+
+    def __repr__(self):
+        return f"<SmtpConfig domain_id={self.domain_id} host={self.host!r}>"
+
+
+class CertExpirationNotification(db.Model):
+    """Per-(cert, threshold) notification de-duplication ledger.
+
+    Operator-facing TLS feature add 2026-05-31. The expirations sweep
+    fires one alert per ManagedCertificate per crossed threshold, then
+    records a row here so the next sweep doesn't re-fire the same
+    alert. Rows survive across the cert's lifecycle — a renewed cert
+    whose ``valid_to`` jumps back above the highest threshold doesn't
+    invalidate prior rows; instead the sweep notices it's no longer
+    near any threshold and exits.
+
+    Threshold "fired" semantics: a row exists if and only if an alert
+    has been sent (status=ok) OR attempted-and-failed (status=failed)
+    for that exact (cert_id, threshold_days). The sweep retries
+    failed rows by upserting status back to ok on next success.
+    """
+    __tablename__ = "cert_expiration_notifications"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    certificate_id = db.Column(
+        db.Integer,
+        db.ForeignKey("managed_certificates.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    threshold_days = db.Column(db.Integer, nullable=False)
+    sent_at = db.Column(db.DateTime, default=_utcnow, nullable=False, index=True)
+    status = db.Column(db.String(16), default="ok", nullable=False)  # ok|failed
+    error = db.Column(db.Text, default="", nullable=False)
+    # Snapshot of who got pinged + the days-to-expiry at send time so the
+    # historical view is honest even if the SMTP config / cert lineage
+    # later change.
+    recipients_csv = db.Column(db.String(2048), default="", nullable=False)
+    days_to_expiry = db.Column(db.Integer, nullable=False)
+
+    certificate = db.relationship("ManagedCertificate")
+
+    __table_args__ = (
+        db.UniqueConstraint("certificate_id", "threshold_days",
+                            name="uq_cert_threshold"),
+    )
+
+    def __repr__(self):
+        return (f"<CertExpirationNotification cert_id={self.certificate_id} "
+                f"threshold={self.threshold_days}d status={self.status}>")
+
+
 class TLSActivityLog(db.Model):
     """Application-wide activity log for TLS operations."""
     __tablename__ = "tls_activity_logs"

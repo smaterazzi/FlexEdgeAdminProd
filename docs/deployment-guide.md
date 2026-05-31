@@ -364,26 +364,69 @@ sudo -u flexedge /opt/flexedge/cli/smc.sh --tenant prod connect
 | `flexedge.db` | SQLite database | All admin config lost |
 | `encryption.key` | Fernet encryption key | API keys become unreadable |
 | `.env` | Azure AD credentials, Flask secret | Must be recreated manually |
+| `data/projects/` | Migration project manifests + uploaded FortiGate `.conf` files | In-flight migrations lost (audit V1, 2026-05-29 — included in `/admin/backup` since LE.5.a) |
+| `/config/letsencrypt/` | Certbot state: account keys, lineages (live/archive), renewal config | Operator must re-register at LE AND re-issue every cert (LE.5.a, 2026-05-29 — included in `/admin/backup`) |
 
 ### Location by deployment
 
 | Option | Path |
 | ------ | ---- |
-| Standalone | `/etc/flexedge/` |
-| Docker + nginx | `<project>/config/` |
-| Coolify | Persistent volume `flexedge-config` (mounted at `/config` in container) |
+| Standalone | `/etc/flexedge/` + `/var/lib/flexedge/projects/` (or `$FLEXEDGE_PROJECTS_DIR`) |
+| Docker + nginx | `<project>/config/` + `<project>/data/projects/` (bind-mounted to `/app/data/projects/` in container) |
+| Coolify | Persistent volume `flexedge-config` (mounted at `/config`) + persistent volume for `/app/data/projects/` |
 
 ### Backup methods
 
-- **Admin Portal → Backup**: downloads a ZIP with `flexedge.db` + `encryption.key` (works in all 3 options)
-- **Manual**: copy the files from the location above to secure storage
-- **Coolify**: use the built-in backup feature with S3 target
+- **Admin Portal → Backup** (LE.5.a, 2026-05-29): downloads a ZIP with `flexedge.db` + `encryption.key` + the full `/config/letsencrypt/` tree (accounts / live / archive / renewal) + `data/projects/`. Restore is reissue-free for LE certs and preserves in-flight migrations. `.env` is the only critical file NOT in the ZIP (it contains operator-supplied secrets like Azure AD credentials — re-create from `config/.env.example` after restore).
+- **Manual**: copy `flexedge.db`, `encryption.key`, `.env`, `/config/letsencrypt/`, AND `data/projects/` from the location above to secure storage.
+- **Coolify**: use the built-in backup feature with S3 target; make sure the `data/projects/` volume AND the `/config/letsencrypt/` subtree are in the backup set.
 
 ### Restore
 
-Place `flexedge.db`, `encryption.key`, and `.env` in the correct location, then restart. All tenants, users, and API keys are restored.
+Place `flexedge.db`, `encryption.key`, `.env`, `/config/letsencrypt/`, and `data/projects/` in the correct location, then restart. All tenants, users, API keys, LE certs (no re-issuance needed), and in-flight migration projects are restored.
 
 Without `encryption.key`, API keys stored in the database are permanently irrecoverable. This is by design.
+
+---
+
+## Local verification without Azure AD (audit V3, 2026-05-29)
+
+Sometimes you need to drive authenticated routes from a shell — to verify a fix, reproduce a bug, or smoke-test before a deploy — and standing up a full Entra ID app registration for every local checkout is overkill. The **dev auth bypass** synthesises a session for a configured email address, letting `curl` / `httpie` / Flask test client reach every `@login_required` route without OIDC.
+
+### Activation (dev only)
+
+Set **both** of these env vars before starting the app:
+
+```bash
+export FLASK_DEBUG=1
+export FEA_DEV_AUTH_BYPASS_EMAIL=verify@example.com   # any email
+```
+
+The two-key gate is intentional. A single env var would be too easy to leave on in a Coolify config; requiring `FLASK_DEBUG=1` ties activation to the same flag that already disables `SESSION_COOKIE_SECURE` and other dev affordances.
+
+When active, the boot log shows a banner:
+
+```text
+═════════════════════════════════════════════════════════════
+  DEV AUTH BYPASS IS ACTIVE — Entra ID login is SKIPPED.
+  Every request becomes user=verify@example.com.
+  Set both FLASK_DEBUG=0 AND unset FEA_DEV_AUTH_BYPASS_EMAIL
+  to disable. NEVER ship a production image with this on.
+═════════════════════════════════════════════════════════════
+```
+
+The bypass also disables the setup wizard — `/setup` returns HTTP 503 with a flash explaining why. Bootstrap a real Super Admin via genuine Entra ID first, **then** turn the bypass on for verification work.
+
+### Production guards
+
+1. The Docker image ships with `FLASK_DEBUG=0`; the bypass cannot activate.
+2. The `FEA_DEV_AUTH_BYPASS_EMAIL` env var is not in `.env.example` and not documented in the production deployment paths.
+3. Every authenticated request emits a `WARNING` log line naming the bypass email and the route — accidental activation in production would show up in audit logs immediately.
+4. The setup wizard refuses to run while the bypass is active, so a bypassed login cannot become Super Admin.
+
+### Companion: CSRF for `curl` POST flows
+
+The web UI sends a CSRF token in every form via the `<meta name="csrf-token">` injection in `base.html`. For shell-driven POSTs (where extracting the token is friction), the test client typically sets `app.config['WTF_CSRF_ENABLED'] = False`. There is no env-var equivalent today; if `curl`-driven POST verification becomes common, file a follow-up to wire a `FEA_DEV_DISABLE_CSRF=1` flag gated by the same `FLASK_DEBUG=1` check.
 
 ---
 

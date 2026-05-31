@@ -45,12 +45,31 @@ def setup():
     """
     from webapp.models import User, PlatformSetting
     from sqlalchemy.exc import IntegrityError
-    from webapp.auth import verify_aad_tid, aad_tenant_is_single
+    from webapp.auth import (
+        verify_aad_tid, aad_tenant_is_single, dev_auth_bypass_is_active,
+    )
 
     # If setup is no longer needed, redirect to index
     if not current_app.config.get("SETUP_REQUIRED", False):
         flash("Setup has already been completed.", "info")
         return redirect(url_for("index"))
+
+    # V3 (audit, 2026-05-29): the setup wizard must NEVER run with the
+    # dev-auth bypass active. A bypassed session would let the operator
+    # write themselves in as Super Admin without any Entra ID proof.
+    if dev_auth_bypass_is_active():
+        log.error(
+            "Setup wizard refused: FEA_DEV_AUTH_BYPASS_EMAIL is set with "
+            "FLASK_DEBUG=1. Setup MUST run under real Entra ID auth so the "
+            "first Super Admin is provably the legitimate operator."
+        )
+        flash(
+            "Setup is disabled: dev auth bypass is active. Unset "
+            "FEA_DEV_AUTH_BYPASS_EMAIL (or set FLASK_DEBUG=0) and restart, "
+            "then complete setup via real Azure AD login.",
+            "danger",
+        )
+        return render_template("auth/login.html"), 503
 
     # Must be logged in via Azure AD first
     user_info = session.get("user")

@@ -6,9 +6,21 @@ Provides:
   init_auth()   — call once after app is created to initialise OAuth
   login_required      — decorator: redirect to login if not authenticated
   profile_required    — decorator: implies login + active SMC profile & domain selected
+
+Dev-only auth bypass (audit V3, 2026-05-29):
+  When BOTH ``FLASK_DEBUG=1`` AND ``FEA_DEV_AUTH_BYPASS_EMAIL=<email>`` are
+  set, ``login_required`` synthesises a session for ``<email>`` without
+  going through Entra ID. Lets `curl` / `httpie` flows drive authenticated
+  routes for local verification. Two-key gate is intentional — a single
+  env var would be too easy to leave on in a Coolify config. Production
+  guards:
+    * Boot-time WARNING log in webapp/app.py when the bypass is active.
+    * Setup wizard refuses to run while the bypass is active so a
+      bypassed login can't take over the bootstrap.
 """
 
 import logging
+import os
 import re
 from functools import wraps
 
@@ -23,6 +35,24 @@ log = logging.getLogger(__name__)
 
 auth_bp = Blueprint("auth", __name__)
 oauth = OAuth()
+
+
+def _dev_auth_bypass_email() -> str:
+    """Return the dev-bypass email iff both gating env vars are set.
+
+    Empty string means bypass OFF — the production path. Boot-time
+    warning emitted in webapp/app.py when this returns non-empty.
+    """
+    if (os.environ.get("FLASK_DEBUG", "").strip() == "1"
+            and os.environ.get("FEA_DEV_AUTH_BYPASS_EMAIL", "").strip()):
+        return os.environ["FEA_DEV_AUTH_BYPASS_EMAIL"].strip()
+    return ""
+
+
+def dev_auth_bypass_is_active() -> bool:
+    """True iff the V3 dev-auth bypass is currently enabled. Exported
+    so the setup wizard can refuse to run (defense-in-depth)."""
+    return bool(_dev_auth_bypass_email())
 
 
 _UUID_RE = re.compile(
@@ -79,11 +109,36 @@ def init_auth(app):
 
 # ── Decorators ────────────────────────────────────────────────────────────
 
+def _maybe_synthesise_dev_session() -> bool:
+    """V3 dev-auth bypass: synthesise ``session['user']`` when both gating
+    env vars are set AND the session is currently empty. Returns True if
+    a synthesis happened (the caller should proceed as if logged in).
+    Never reaches production: gated by FLASK_DEBUG=1.
+    """
+    if "user" in session:
+        return False
+    bypass_email = _dev_auth_bypass_email()
+    if not bypass_email:
+        return False
+    session["user"] = {
+        "email": bypass_email,
+        "name": "Dev Bypass",
+        "oid": "dev-bypass-oid",
+        "tid": _aad_tenant_id() or "dev-bypass-tid",
+    }
+    log.warning(
+        "DEV AUTH BYPASS — synthesised session for %s (route=%s). "
+        "NEVER expected in production.",
+        bypass_email, request.path,
+    )
+    return True
+
+
 def login_required(f):
-    """Redirect unauthenticated users to /login."""
+    """Redirect unauthenticated users to /login. V3 dev-bypass aware."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        if "user" not in session:
+        if "user" not in session and not _maybe_synthesise_dev_session():
             return redirect(url_for("auth.login", next=request.url))
         return f(*args, **kwargs)
     return decorated
@@ -104,7 +159,7 @@ def profile_required(f):
     """
     @wraps(f)
     def decorated(*args, **kwargs):
-        if "user" not in session:
+        if "user" not in session and not _maybe_synthesise_dev_session():
             return redirect(url_for("auth.login", next=request.url))
         if "active_profile" not in session:
             flash("Select an SMC profile to continue.", "warning")

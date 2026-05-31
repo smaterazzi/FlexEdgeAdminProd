@@ -2,7 +2,20 @@
 Migration Project Manager
 ==========================
 CRUD operations for migration projects.
-Projects are persisted as JSON files in webapp/projects/<uuid>/.
+Projects are persisted as JSON files in the resolved ``PROJECTS_DIR``.
+
+Resolution order (audit V1, 2026-05-29):
+  1. ``$FLEXEDGE_PROJECTS_DIR`` env var, if set.
+  2. ``/app/data/projects/`` when ``/app/data/`` exists — this is the
+     Docker bind-mount target (see docker-compose.yml). Production
+     storage; survives container recreate.
+  3. ``webapp/projects/`` next to this file — dev/standalone fallback.
+     Gitignored, lives inside the source tree for hands-on debugging.
+
+The pre-V1 default (``webapp/projects/`` only) wrote manifests inside
+the container's writable overlay layer in Docker deployments; every
+``make update`` / image rebuild silently destroyed in-flight migrations
+because the bind-mounted ``/app/data/projects/`` was never read.
 
 Each project directory contains:
   - project.json         — Project manifest (metadata, target config, status)
@@ -14,12 +27,80 @@ Each project directory contains:
 """
 
 import json
+import logging
+import os
 import shutil
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECTS_DIR = Path(__file__).parent / "projects"
+log = logging.getLogger(__name__)
+
+_LEGACY_PROJECTS_DIR = Path(__file__).parent / "projects"
+_DOCKER_DATA_DIR = Path("/app/data/projects")
+
+
+def _resolve_projects_dir() -> Path:
+    """Pick the live PROJECTS_DIR per the resolution order in the module
+    docstring. Called at import time and cached in ``PROJECTS_DIR``."""
+    override = os.environ.get("FLEXEDGE_PROJECTS_DIR", "").strip()
+    if override:
+        return Path(override)
+    # Detect Docker by the existence of /app/data (the Dockerfile creates
+    # it explicitly). On non-Docker hosts /app rarely exists, so this
+    # check stays cheap and unambiguous.
+    if _DOCKER_DATA_DIR.parent.exists():
+        return _DOCKER_DATA_DIR
+    return _LEGACY_PROJECTS_DIR
+
+
+PROJECTS_DIR = _resolve_projects_dir()
+
+
+def _migrate_legacy_projects_dir() -> int:
+    """Move any pre-V1 projects from ``webapp/projects/`` into the
+    resolved ``PROJECTS_DIR``. One-shot, idempotent.
+
+    Triggers only when:
+      * The resolved dir is NOT the legacy dir (otherwise a no-op).
+      * The legacy dir actually exists AND has at least one project
+        subdirectory (a ``.gitignore`` alone doesn't count).
+      * The resolved dir is empty of project subdirs (don't blindly
+        overwrite a populated production volume).
+
+    Returns the number of project directories moved.
+    """
+    if PROJECTS_DIR == _LEGACY_PROJECTS_DIR:
+        return 0
+    if not _LEGACY_PROJECTS_DIR.exists():
+        return 0
+    legacy_projects = [p for p in _LEGACY_PROJECTS_DIR.iterdir()
+                       if p.is_dir() and not p.name.startswith(".")]
+    if not legacy_projects:
+        return 0
+    PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    target_projects = [p for p in PROJECTS_DIR.iterdir()
+                       if p.is_dir() and not p.name.startswith(".")]
+    if target_projects:
+        log.warning(
+            "Migration projects dir %s already populated (%d projects); "
+            "leaving legacy dir %s alone — operator should reconcile by hand.",
+            PROJECTS_DIR, len(target_projects), _LEGACY_PROJECTS_DIR,
+        )
+        return 0
+    moved = 0
+    for src in legacy_projects:
+        dst = PROJECTS_DIR / src.name
+        try:
+            shutil.move(str(src), str(dst))
+            moved += 1
+        except Exception as exc:
+            log.error("Could not move legacy project %s → %s: %s",
+                      src, dst, exc)
+    if moved:
+        log.info("V1 migration: moved %d project(s) from %s to %s",
+                 moved, _LEGACY_PROJECTS_DIR, PROJECTS_DIR)
+    return moved
 
 
 def _ensure_projects_dir():

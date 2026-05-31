@@ -55,26 +55,113 @@ from webapp.models import (
 log = logging.getLogger(__name__)
 
 
-# ── Backup (pre-reset snapshot) ──────────────────────────────────────────
+# ── Backup (full deployment snapshot) ────────────────────────────────────
 
-def build_backup_zip() -> tuple[bytes, str]:
-    """Build a ZIP containing the live DB + encryption key.
+def _walk_dir_into_zip(zf: "zipfile.ZipFile", root: str, arc_prefix: str) -> int:
+    """Add every regular file under ``root`` into the ZIP, prefixed with
+    ``arc_prefix``. Returns the count of files written. Symlinks
+    skipped (we want the snapshot self-contained). Failures on
+    individual files log + swallow so one unreadable file doesn't
+    abort the whole backup.
+    """
+    if not root or not os.path.isdir(root):
+        return 0
+    written = 0
+    root_abs = os.path.abspath(root)
+    for dirpath, _dirnames, filenames in os.walk(root_abs, followlinks=False):
+        for fname in filenames:
+            fpath = os.path.join(dirpath, fname)
+            if os.path.islink(fpath) or not os.path.isfile(fpath):
+                continue
+            try:
+                rel = os.path.relpath(fpath, root_abs)
+                zf.write(fpath, os.path.join(arc_prefix, rel))
+                written += 1
+            except Exception as exc:
+                log.warning("Backup: could not add %s: %s", fpath, exc)
+    return written
 
-    Returns ``(bytes, filename)``. Caller streams it as a download
-    BEFORE invoking ``perform_reset`` so the operator has a rollback
-    point on disk regardless of what happens next.
+
+def build_backup_zip(prefix: str = "flexedge-backup") -> tuple[bytes, str]:
+    """Build a ZIP snapshot of the full deployment state.
+
+    Returns ``(bytes, filename)``. Contents (LE-Q5=B, audit V1
+    follow-up — 2026-05-29):
+
+    * ``flexedge.db`` — SQLite database
+    * ``encryption.key`` — Fernet key (without this, every encrypted
+      API key in the DB is irrecoverable)
+    * ``letsencrypt/`` — full certbot state from ``CERTBOT_CONFIG_DIR``
+      (accounts / live / archive / renewal subtrees). Restore is
+      reissue-free — operator gets working certs back without burning
+      ACME order budget.
+    * ``data/projects/`` — migration project manifests + uploaded
+      FortiGate .conf files (audit V1 follow-up — was previously
+      excluded, in-flight migrations were lost on restore)
+    * ``imported-certs/`` — PFX-imported cert lineages from
+      ``${FEA_PFX_DIR}`` (added with the PFX-import feature, 2026-05-31).
+      Restore reinstates the on-disk PEM files alongside the
+      ``ManagedCertificate`` rows that point at them — no re-upload
+      from the operator required.
+
+    The caller picks the filename prefix — ``"flexedge-backup"`` for
+    ``/admin/backup`` downloads; ``"flexedge-pre-reset-backup"`` for
+    the auto-snapshot in front of ``/admin/factory-reset``.
+
+    Resilient by design: missing files / dirs are silently skipped
+    (a deployment with no LE certs still gets a usable backup); per-
+    file errors log + swallow so one bad symlink doesn't abort the
+    whole snapshot.
     """
     db_path = current_app.config["SQLALCHEMY_DATABASE_URI"].replace("sqlite:///", "")
     key_path = os.environ.get("ENCRYPTION_KEY_FILE", KEY_FILE)
+    # LE-Q5 = B — full certbot state under one parent dir; default
+    # matches the LE.2 hotfix in webapp/letsencrypt_certbot.py.
+    le_root = os.environ.get("CERTBOT_CONFIG_DIR", "/config/letsencrypt")
+    # V1 follow-up — projects dir is resolved by the project_manager
+    # so the env override + Docker-default + dev-fallback all match.
+    try:
+        from webapp import project_manager
+        projects_root = str(project_manager.PROJECTS_DIR)
+    except Exception as exc:
+        log.warning("Backup: could not resolve PROJECTS_DIR: %s", exc)
+        projects_root = ""
+    # PFX-imported cert lineages (2026-05-31). Resolved through the
+    # pfx_import module so the env override matches what writes actually
+    # land on disk.
+    try:
+        from webapp import pfx_import
+        pfx_dir = str(pfx_import.pfx_root())
+    except Exception as exc:
+        log.warning("Backup: could not resolve PFX dir: %s", exc)
+        pfx_dir = ""
 
     buf = io.BytesIO()
+    counts = {"letsencrypt": 0, "projects": 0, "pfx": 0}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if os.path.isfile(db_path):
             zf.write(db_path, "flexedge.db")
         if os.path.isfile(key_path):
             zf.write(key_path, "encryption.key")
+        # Walk each LE subtree (accounts / live / archive / renewal).
+        # Skip "logs" / "work" — transient state, not needed for restore.
+        if le_root and os.path.isdir(le_root):
+            for sub in ("accounts", "live", "archive", "renewal"):
+                counts["letsencrypt"] += _walk_dir_into_zip(
+                    zf, os.path.join(le_root, sub),
+                    os.path.join("letsencrypt", sub),
+                )
+        counts["projects"] = _walk_dir_into_zip(
+            zf, projects_root, "data/projects",
+        )
+        counts["pfx"] = _walk_dir_into_zip(
+            zf, pfx_dir, "imported-certs",
+        )
+
+    log.info("Backup ZIP built: %d LE files, %d project files, %d PFX files",
+             counts["letsencrypt"], counts["projects"], counts["pfx"])
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    return buf.getvalue(), f"flexedge-pre-reset-backup-{timestamp}.zip"
+    return buf.getvalue(), f"{prefix}-{timestamp}.zip"
 
 
 # ── Reset execution ──────────────────────────────────────────────────────
@@ -282,6 +369,18 @@ def _wipe_filesystem(report: ResetReport) -> None:
     ):
         if token_file.is_file():
             _rm_path_into_report(token_file, report)
+
+    # PFX-imported cert lineages — wipe alongside the DB rows that
+    # reference them. The backup ZIP built before the reset already
+    # contains a copy, so restore-from-backup recovers them.
+    try:
+        from webapp import pfx_import
+        pfx_dir = pfx_import.pfx_root()
+    except Exception:
+        pfx_dir = None
+    if pfx_dir is not None and pfx_dir.is_dir():
+        for entry in pfx_dir.iterdir():
+            _rm_path_into_report(entry, report)
 
 
 def _rm_path_into_report(path: Path, report: ResetReport) -> None:

@@ -88,10 +88,34 @@ def account_view():
     same view.
     """
     account = AcmeAccount.query.first()
+    # LE hygiene (2026-05-29): AcmeAccount is a singleton (Q3=A) and
+    # `is_staging` is global — flipping it changes which LE endpoint
+    # EVERY Domain's cert ops hit. Gate writes to that flag behind
+    # Super Admin so a Domain Admin can't accidentally take everyone
+    # else's prod cert ops into staging (or vice versa). Email and
+    # ToS-acceptance edits stay Domain-Admin-mutable.
+    try:
+        from webapp.auth_roles import is_super_admin
+        _is_super = is_super_admin()
+    except Exception:
+        _is_super = False
 
     if request.method == "POST":
         email = (request.form.get("email") or "").strip().lower()
-        is_staging = (request.form.get("is_staging") == "1")
+        is_staging_form = (request.form.get("is_staging") == "1")
+        # If non-Super-Admin posts a different is_staging value, ignore
+        # it and keep the existing flag. New-account flow (account is
+        # None) still respects the operator's pick because somebody has
+        # to set the initial value — and only Domain Admins can hit
+        # this route in the first place.
+        if account is not None and not _is_super and is_staging_form != account.is_staging:
+            flash("Only a Super Admin can change the staging/production "
+                  "endpoint on the singleton Let's Encrypt account — it "
+                  "affects every Domain. Keeping the existing value.",
+                  "warning")
+            is_staging = account.is_staging
+        else:
+            is_staging = is_staging_form
         agreed = (request.form.get("agree_tos") == "1")
 
         if not email or "@" not in email:
@@ -100,6 +124,7 @@ def account_view():
                 "tls/letsencrypt/account.html",
                 account=account, form_email=email,
                 form_is_staging=is_staging,
+                can_change_staging=(_is_super or account is None),
             )
         if account is None and not agreed:
             flash("You must accept the Let's Encrypt Terms of Service "
@@ -108,11 +133,26 @@ def account_view():
                 "tls/letsencrypt/account.html",
                 account=account, form_email=email,
                 form_is_staging=is_staging,
+                can_change_staging=(_is_super or account is None),
             )
 
         # Register the account at LE if it's new; otherwise just update
         # the in-FEA metadata.
         if account is None:
+            # LE hygiene (2026-05-29): certbot register is synchronous
+            # and can block up to DEFAULT_TIMEOUT_S=300s — the request
+            # thread holds the gunicorn worker for that long. Default
+            # Dockerfile gunicorn timeout is 120s, so a slow LE round-
+            # trip would 504 before certbot returns. Log at the moment
+            # the operator triggers the slow path so the warning shows
+            # in `make logs` exactly when it matters; the route doc on
+            # docs/deployment-guide.md spells out the bump.
+            log.warning(
+                "LE: registering ACME account at LE — this can block up "
+                "to 300s. If gunicorn 504s before completion, bump "
+                "--timeout in docker/Dockerfile CMD (current default is "
+                "120s) and retry. Tracking ticket: LE hygiene 2026-05-29."
+            )
             from webapp.letsencrypt_certbot import register_account
             result = register_account(email=email, is_staging=is_staging)
             if not result.success:
@@ -123,6 +163,7 @@ def account_view():
                     "tls/letsencrypt/account.html",
                     account=None, form_email=email,
                     form_is_staging=is_staging,
+                    can_change_staging=True,  # new account flow
                 )
             from webapp.letsencrypt_certbot import CERTBOT_CONFIG_DIR
             account = AcmeAccount(
@@ -174,7 +215,8 @@ def account_view():
                            account=account,
                            form_email=(account.email if account else ""),
                            form_is_staging=(account.is_staging
-                                            if account else True))
+                                            if account else True),
+                           can_change_staging=(_is_super or account is None))
 
 
 # ── List + new request + detail ──────────────────────────────────────────
@@ -182,7 +224,29 @@ def account_view():
 @letsencrypt_bp.route("/")
 @domain_admin_required
 def list_certs():
-    """Cert list scoped to the active FEA Domain (Super sees all)."""
+    """Cert list scoped to the active FEA Domain (Super sees all).
+
+    LE.3 (2026-05-29): every visit triggers
+    ``ensure_lazy_renewal_sweep()`` if the last sweep was more than
+    ``SWEEP_INTERVAL`` ago. Cross-Domain by design — single sweep
+    walks every Domain's active certs (operator answer LE-Q1=A).
+    Best-effort: failures log + swallow so the cert list still
+    renders even if SMC or the scheduler are unhealthy.
+    """
+    # Trigger the lazy sweep BEFORE the list query so this Domain's
+    # operator sees any freshly-enqueued renewals immediately.
+    try:
+        from webapp.letsencrypt_scheduler import ensure_lazy_renewal_sweep
+        sweep_report = ensure_lazy_renewal_sweep(
+            triggered_by_user_email=_operator_email(),
+        )
+        if sweep_report and sweep_report.enqueued > 0:
+            flash(f"LE renewal sweep: enqueued {sweep_report.enqueued} due "
+                  f"cert(s) for renewal. See /tls/letsencrypt/requests for "
+                  f"per-cert status.", "info")
+    except Exception as exc:
+        log.warning("LE renewal lazy-sweep skipped: %s", exc)
+
     domain = _active_domain()
     account = AcmeAccount.query.first()
     if account is None:
@@ -248,24 +312,51 @@ def cert_new():
     if request.method == "POST":
         fqdn = normalize_fqdn(request.form.get("fqdn", ""))
         is_staging = (request.form.get("is_staging") == "1")
-
-        if not fqdn:
-            flash("A fully-qualified domain name is required.", "danger")
+        # LE.4 — challenge_type picker. Wildcards (*.) are only
+        # supportable via DNS-01.
+        challenge_type = (request.form.get("challenge_type") or "http01").strip()
+        if challenge_type not in ("http01", "dns01_manual"):
+            flash(f"Unknown challenge type: {challenge_type!r}", "danger")
             return render_template(
                 "tls/letsencrypt/new.html",
                 patterns=patterns, form_fqdn=fqdn,
-                form_is_staging=is_staging, account=account,
+                form_is_staging=is_staging,
+                form_challenge_type=challenge_type, account=account,
             )
+
+        def _rerender():
+            return render_template(
+                "tls/letsencrypt/new.html",
+                patterns=patterns, form_fqdn=fqdn,
+                form_is_staging=is_staging,
+                form_challenge_type=challenge_type, account=account,
+            )
+
+        if not fqdn:
+            flash("A fully-qualified domain name is required.", "danger")
+            return _rerender()
+
+        is_wildcard = fqdn.startswith("*.")
+        if is_wildcard and challenge_type != "dns01_manual":
+            flash("Wildcard certs (*.example.com) require DNS-01 — "
+                  "switch the challenge type.", "danger")
+            return _rerender()
+        if not is_wildcard:
+            # FQDN validator for non-wildcard: lowercase ASCII / digits
+            # / dots / hyphens only. (HTML5 pattern is operator
+            # affordance only; server-side is the source of truth.)
+            import re as _re
+            if not _re.fullmatch(r"[a-z0-9.\-]+", fqdn):
+                flash("Invalid FQDN — lowercase ASCII / digits / dots / "
+                      "hyphens only. For wildcards, prefix with *.",
+                      "danger")
+                return _rerender()
 
         # Q6 allowlist check (also re-checked in the queue handler).
         allowed, reason = is_fqdn_allowed_for_domain(fqdn, domain.id)
         if not allowed:
             flash(f"Cert request refused: {fqdn!r} {reason}.", "danger")
-            return render_template(
-                "tls/letsencrypt/new.html",
-                patterns=patterns, form_fqdn=fqdn,
-                form_is_staging=is_staging, account=account,
-            )
+            return _rerender()
 
         # Duplicate check.
         existing = (ManagedCertificate.query
@@ -284,7 +375,7 @@ def cert_new():
         cert, change = enqueue_cert_request(
             fqdn=fqdn, domain=domain, is_staging=is_staging,
             requested_by_user_id=_current_user_id(),
-            account=account,
+            account=account, challenge_type=challenge_type,
         )
         try:
             from shared.logging import audit
@@ -314,7 +405,7 @@ def cert_new():
     return render_template(
         "tls/letsencrypt/new.html",
         patterns=patterns, form_fqdn="", form_is_staging=False,
-        account=account,
+        form_challenge_type="http01", account=account,
     )
 
 
@@ -402,8 +493,11 @@ def cert_status(cert_id):
 def cert_renew(cert_id):
     """Force-renew a cert. Operator-triggered button.
 
-    Phase LE.3 scheduler enqueues these automatically; for LE.2 the
-    operator presses this button on the cert detail page.
+    LE.3 scheduler enqueues these automatically for HTTP-01 certs.
+    For DNS-01 certs, "renewal" is structurally a re-issuance —
+    operator publishes a fresh TXT record. We route those through
+    ``cert_request`` again instead of ``cert_renew``, so the DNS-01
+    flow re-opens an ACME order and surfaces the new TXT details.
     """
     cert = db.session.get(ManagedCertificate, cert_id)
     if cert is None or not _can_see(cert):
@@ -415,8 +509,66 @@ def cert_renew(cert_id):
         return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
 
     from webapp.letsencrypt_queue import (
-        enqueue_cert_renew, try_auto_push_for_admins,
+        enqueue_cert_renew, enqueue_cert_request, try_auto_push_for_admins,
     )
+
+    # LE.4 — DNS-01 renewal is structurally a re-issuance. Re-open the
+    # DNS-01 order via cert_request so the operator gets a fresh TXT
+    # record they can publish.
+    if cert.challenge_type == "dns01_manual":
+        # Wipe the prior stash so cert_request's DNS-01 branch
+        # initialises a clean order. Status goes back to pending.
+        cert.status = "pending"
+        cert.dns_challenge_state = ""
+        cert.dns_challenge_record_name = ""
+        cert.dns_challenge_record_value = ""
+        cert.last_error = ""
+        db.session.commit()
+        # Use enqueue_cert_request to drive the dns01 branch in the
+        # handler. The existing cert row is reused (challenge_type
+        # already set); we just need a fresh PendingChange.
+        import json as _json
+        from webapp.models import PendingChange
+        payload = {"certificate_id": cert.id}
+        change = PendingChange(
+            domain_id=cert.domain_id,
+            user_id=_current_user_id(),
+            smc_object_id=None,
+            scope="main",
+            operation="cert_request",
+            payload_json=_json.dumps(payload),
+            feature_source="letsencrypt",
+            source_correlation_id=f"letsencrypt_cert:{cert.id}",
+            state="queued",
+        )
+        db.session.add(change)
+        db.session.flush()
+        cert.pending_change_id = change.id
+        db.session.commit()
+        try:
+            from shared.logging import audit
+            audit(
+                feature="letsencrypt",
+                action="cert_request.enqueue",
+                target=cert.domain,
+                detail=(f"DNS-01 renewal — cert_id={cert.id} "
+                        f"change_id={change.id} (re-issuance)"),
+                source_correlation_id=change.source_correlation_id,
+                domain_id=cert.domain_id,
+            )
+        except Exception:
+            pass
+        spawned, scan_id = try_auto_push_for_admins(
+            change=change, cert=cert, user_email=_operator_email(),
+        )
+        if spawned and scan_id:
+            return redirect(url_for("letsencrypt.cert_detail",
+                                    cert_id=cert.id, le_scan_id=scan_id))
+        flash(f"DNS-01 re-issuance queued for {cert.domain}. Once the "
+              f"order opens you'll see a fresh TXT record to publish.",
+              "info")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
     change = enqueue_cert_renew(
         cert=cert, requested_by_user_id=_current_user_id(),
     )
@@ -444,6 +596,185 @@ def cert_renew(cert_id):
     return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
 
 
+@letsencrypt_bp.route("/<int:cert_id>/dns-verify", methods=["POST"])
+@domain_admin_required
+def cert_dns_verify(cert_id):
+    """LE.4 — operator clicked "I've published the TXT record".
+
+    Only meaningful for DNS-01 certs in awaiting_dns state. Enqueues
+    a ``cert_dns_verify`` queue op which the handler runs to resume
+    the ACME order (answer challenge → poll → finalize → save files).
+    """
+    cert = db.session.get(ManagedCertificate, cert_id)
+    if cert is None or not _can_see(cert):
+        flash("Certificate not found.", "warning")
+        return redirect(url_for("letsencrypt.list_certs"))
+    if cert.challenge_type != "dns01_manual":
+        flash("Only DNS-01 certs need this step.", "warning")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+    if cert.status != "pending" or not cert.dns_challenge_state:
+        flash(f"Cert is in state '{cert.status}' — verify is only valid "
+              "for pending DNS-01 certs with an open order.", "warning")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+    from webapp.letsencrypt_queue import (
+        enqueue_cert_dns_verify, try_auto_push_for_admins,
+    )
+    change = enqueue_cert_dns_verify(
+        cert=cert, requested_by_user_id=_current_user_id(),
+    )
+    try:
+        from shared.logging import audit
+        audit(
+            feature="letsencrypt",
+            action="cert_dns_verify.enqueue",
+            target=cert.domain,
+            detail=(f"cert_id={cert.id} change_id={change.id} "
+                    f"record={cert.dns_challenge_record_name}"),
+            source_correlation_id=change.source_correlation_id,
+            domain_id=cert.domain_id,
+        )
+    except Exception:
+        pass
+
+    spawned, scan_id = try_auto_push_for_admins(
+        change=change, cert=cert, user_email=_operator_email(),
+    )
+    if spawned and scan_id:
+        return redirect(url_for("letsencrypt.cert_detail",
+                                cert_id=cert.id, le_scan_id=scan_id))
+    flash(f"DNS-01 verify queued for {cert.domain} (change #{change.id}).",
+          "info")
+    return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+
+@letsencrypt_bp.route("/<int:cert_id>/dns-precheck", methods=["POST"])
+@domain_admin_required
+def cert_dns_precheck(cert_id):
+    """Operator-facing pre-check — queries the configured TXT record
+    via dnspython and compares the value. Diagnostic only; doesn't
+    talk to LE.
+    """
+    cert = db.session.get(ManagedCertificate, cert_id)
+    if cert is None or not _can_see(cert):
+        flash("Certificate not found.", "warning")
+        return redirect(url_for("letsencrypt.list_certs"))
+    if not (cert.dns_challenge_record_name and cert.dns_challenge_record_value):
+        flash("No DNS-01 challenge details on this cert yet.", "warning")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+    try:
+        from webapp.letsencrypt_acme import precheck_dns_txt
+        found, detail = precheck_dns_txt(
+            record_name=cert.dns_challenge_record_name,
+            expected_value=cert.dns_challenge_record_value,
+        )
+    except Exception as exc:
+        flash(f"DNS pre-check failed to run: {exc}", "danger")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+    if found:
+        flash(f"DNS pre-check OK — {detail}", "success")
+    else:
+        flash(f"DNS pre-check did NOT find the expected TXT record. "
+              f"{detail} Try again after the record propagates "
+              "(usually <5 min, sometimes longer).", "warning")
+    try:
+        from shared.logging import audit
+        audit(
+            feature="letsencrypt",
+            action="cert_dns_precheck",
+            target=cert.domain,
+            detail=detail[:500], status=("ok" if found else "error"),
+            domain_id=cert.domain_id,
+        )
+    except Exception:
+        pass
+    return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+
+# RFC 5280 revocation reason codes accepted by certbot. Subset chosen
+# to match realistic operator scenarios — the full list (`cACompromise`,
+# `certificateHold`, etc.) is rarely meaningful for an end-entity cert.
+_REVOKE_REASONS = (
+    "unspecified",
+    "keyCompromise",
+    "superseded",
+    "cessationOfOperation",
+    "affiliationChanged",
+)
+
+
+@letsencrypt_bp.route("/<int:cert_id>/revoke", methods=["POST"])
+@domain_admin_required
+def cert_revoke(cert_id):
+    """Revoke a cert at Let's Encrypt (LE.5.b — operator answer LE-Q3=B).
+
+    Distinct from `cert_delete` ("Stop tracking"):
+      * revoke = "burn this cert at LE so it can no longer be served"
+        (the issued certificate is added to LE's CRL/OCSP).
+      * stop tracking = "drop FEA's record of the cert" (cert at LE
+        stays valid until natural expiry).
+
+    The optional ``also_stop_tracking=1`` form field chains both
+    actions into one click. The chain runs INSIDE the queue handler
+    after the revoke succeeds — doing it from the request thread
+    would race the async handler (which reads the cert mid-flight).
+    """
+    cert = db.session.get(ManagedCertificate, cert_id)
+    if cert is None or not _can_see(cert):
+        flash("Certificate not found.", "warning")
+        return redirect(url_for("letsencrypt.list_certs"))
+    if cert.status != "active":
+        flash(f"Only active certs can be revoked at LE — this one is "
+              f"in state '{cert.status}'. Use Stop tracking instead.",
+              "warning")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+    if not cert.certbot_lineage:
+        flash("This cert has no lineage on disk — nothing to revoke.",
+              "warning")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+    reason = (request.form.get("reason") or "unspecified").strip()
+    if reason not in _REVOKE_REASONS:
+        flash(f"Invalid revoke reason: {reason}", "danger")
+        return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+    also_stop_tracking = (request.form.get("also_stop_tracking") == "1")
+
+    from webapp.letsencrypt_queue import (
+        enqueue_cert_revoke, try_auto_push_for_admins,
+    )
+    change = enqueue_cert_revoke(
+        cert=cert, reason=reason,
+        also_stop_tracking=also_stop_tracking,
+        requested_by_user_id=_current_user_id(),
+    )
+    try:
+        from shared.logging import audit
+        audit(
+            feature="letsencrypt",
+            action="cert_revoke.enqueue",
+            target=cert.domain,
+            detail=(f"cert_id={cert.id} change_id={change.id} "
+                    f"reason={reason} chain_stop_tracking={also_stop_tracking}"),
+            source_correlation_id=change.source_correlation_id,
+            domain_id=cert.domain_id,
+        )
+    except Exception:
+        pass
+
+    spawned, scan_id = try_auto_push_for_admins(
+        change=change, cert=cert, user_email=_operator_email(),
+    )
+    if spawned and scan_id:
+        return redirect(url_for("letsencrypt.cert_detail",
+                                cert_id=cert.id, le_scan_id=scan_id))
+    chain_msg = " (will also stop tracking)" if also_stop_tracking else ""
+    flash(f"Revoke queued for {cert.domain}{chain_msg} "
+          f"(change #{change.id}).", "info")
+    return redirect(url_for("letsencrypt.cert_detail", cert_id=cert.id))
+
+
 @letsencrypt_bp.route("/<int:cert_id>/delete", methods=["POST"])
 @domain_admin_required
 def cert_delete(cert_id):
@@ -458,11 +789,14 @@ def cert_delete(cert_id):
     other FQDNs' state are always preserved.
 
     Does NOT revoke at LE — that's the dedicated revoke flow (Phase
-    LE.5). For pending requests with an active queue row, the
-    abort-then-delete pattern still applies: the linked PendingChange
-    is left in `queued` state because purging files doesn't unstick a
-    queued request; click Abort on the requests page or the linked-
-    request card first if you need that.
+    LE.5.b).
+
+    LE hygiene (2026-05-29): the linked PendingChange (if any) is
+    auto-aborted before the cert is deleted, so we don't leave the
+    queue row in `queued` state with a dangling `certificate_id` the
+    handler would later resolve to "not found". push_failed / applied
+    rows are terminal-ish (no race) and rely on the FK's
+    ondelete=SET NULL cascade.
     """
     cert = db.session.get(ManagedCertificate, cert_id)
     if cert is None or not _can_see(cert):
@@ -475,6 +809,28 @@ def cert_delete(cert_id):
     if purge_lineage:
         from webapp.letsencrypt_certbot import reset_lineage_for_fqdn
         purge_summary = reset_lineage_for_fqdn(fqdn)
+
+    # LE hygiene: auto-abort the linked queue row if it's still actively
+    # queued / conflicted. abort_one() handles atomic claim — returns
+    # False if the row is in a non-abortable state (already applied /
+    # push_failed / aborted), in which case the FK's ondelete=SET NULL
+    # takes care of dropping the certificate_id reference.
+    linked_change_id = cert.pending_change_id
+    if linked_change_id is not None:
+        try:
+            from shared.queue_runner import abort_one
+            if abort_one(linked_change_id,
+                         reason=f"cert deleted by operator "
+                                f"({_operator_email() or 'unknown'})"):
+                log.info(
+                    "LE: aborted PendingChange %d before deleting cert %d (%s)",
+                    linked_change_id, cert.id, fqdn,
+                )
+        except Exception as exc:
+            log.warning(
+                "LE: could not auto-abort PendingChange %d for cert %d: %s",
+                linked_change_id, cert.id, exc,
+            )
 
     db.session.delete(cert)
     db.session.commit()
@@ -539,7 +895,7 @@ def cert_delete(cert_id):
 # leaving the LE feature.
 
 
-_LE_OPS = ("cert_request", "cert_renew", "cert_revoke")
+_LE_OPS = ("cert_request", "cert_renew", "cert_revoke", "cert_dns_verify")
 _ACTIONABLE_STATES = ("queued", "push_failed")
 
 

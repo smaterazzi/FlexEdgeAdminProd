@@ -247,6 +247,27 @@ register_feature("engine_sginfo", "Engine sgInfo")
 init_auth(app)
 app.register_blueprint(auth_bp)
 
+# V3 dev-auth bypass (audit, 2026-05-29) — boot-time visibility.
+# When the bypass is active, every authenticated request synthesises a
+# session for the configured email instead of going through Entra ID.
+# This is local-verification-only; the boot log makes accidental
+# activation impossible to miss.
+try:
+    from auth import dev_auth_bypass_is_active
+    if dev_auth_bypass_is_active():
+        bypass_email = os.environ.get("FEA_DEV_AUTH_BYPASS_EMAIL", "")
+        app.logger.warning(
+            "═════════════════════════════════════════════════════════════\n"
+            "  DEV AUTH BYPASS IS ACTIVE — Entra ID login is SKIPPED.\n"
+            "  Every request becomes user=%s.\n"
+            "  Set both FLASK_DEBUG=0 AND unset FEA_DEV_AUTH_BYPASS_EMAIL\n"
+            "  to disable. NEVER ship a production image with this on.\n"
+            "═════════════════════════════════════════════════════════════",
+            bypass_email,
+        )
+except Exception:
+    pass
+
 # ── Setup wizard (one-time, before admin blueprint) ─────────────────────
 
 from setup import setup_bp

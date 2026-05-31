@@ -48,14 +48,32 @@
     <div class="form-check mb-3">
       <input type="checkbox" id="is_staging" name="is_staging" value="1"
              class="form-check-input"
-             {% if form_is_staging %}checked{% endif %}>
+             {% if form_is_staging %}checked{% endif %}
+             {% if not can_change_staging %}disabled{% endif %}>
       <label for="is_staging" class="form-check-label">
         Use the <strong>staging</strong> ACME endpoint
+        {% if not can_change_staging %}
+          <span class="badge bg-warning text-dark ms-2" title="Singleton account — flipping this changes the endpoint every Domain hits">
+            <i class="bi bi-shield-lock"></i> Super Admin only
+          </span>
+        {% endif %}
       </label>
+      {# Re-post the existing value so a Domain-Admin form submit doesn't
+         silently drop the flag — server-side guard refuses any change
+         anyway, but this keeps the hidden-input contract honest. #}
+      {% if not can_change_staging %}
+      <input type="hidden" name="is_staging" value="{% if form_is_staging %}1{% else %}0{% endif %}">
+      {% endif %}
       <div class="form-text">
         Staging certs are NOT trusted by browsers but don't count against
         Let's Encrypt's rate limits. Recommended for the first cert; flip
         OFF once you've verified a successful issuance end-to-end.
+        {% if not can_change_staging %}
+        <br>
+        <strong>This singleton account is shared across every Domain</strong>
+        — flipping staging/production affects all of them at once. Only
+        a Super Admin can change it after the account is created.
+        {% endif %}
       </div>
     </div>
 

@@ -171,27 +171,35 @@ def init_tls_manager(app):
 # ── Dashboard ───────────────────────────────────────────────────────────
 
 def _certs_in_active_domain(domain_id):
-    """ManagedCertificate rows that have at least one TLSDeployment in
-    the given Domain (Domain-Scoping Audit fix C, Path I).
+    """ManagedCertificate rows visible inside the given Domain.
 
-    `ManagedCertificate` itself has no `domain_id` column — its
-    `domain` field is a DNS hostname, and a cert lineage on the
-    FEA host can be deployed to engines across multiple Domains.
-    Visibility is therefore implicit through the linked
-    `TLSDeployment` rows (which ARE Domain-scoped). An operator in
-    Domain B never sees the existence of a cert deployed only in
-    Domain A.
+    A cert is visible if EITHER:
+      * It has at least one `TLSDeployment` whose `domain_id` matches
+        (Path I — historical LE-issued / manually-tracked certs).
+      * It was directly created inside the Domain (its own `domain_id`
+        column matches — LE Phase 1+2 stamps this, and the PFX-import
+        flow (2026-05-31) does too). This shows a freshly imported
+        cert in the Domain it was uploaded into, even before the
+        operator has wired up any deployment.
 
-    Returns an empty list when ``domain_id is None`` (no active
-    Domain → no rows).
+    An operator in Domain B never sees a cert that was both stamped to
+    Domain A AND only deployed in Domain A.
+
+    Returns an empty list when ``domain_id is None`` (no active Domain).
     """
     if domain_id is None:
         return []
-    return (ManagedCertificate.query
-            .join(TLSDeployment,
-                  TLSDeployment.certificate_id == ManagedCertificate.id)
-            .filter(TLSDeployment.domain_id == domain_id)
-            .distinct()
+    via_deployment = (
+        ManagedCertificate.query
+        .join(TLSDeployment,
+              TLSDeployment.certificate_id == ManagedCertificate.id)
+        .filter(TLSDeployment.domain_id == domain_id)
+    )
+    via_own_domain = (
+        ManagedCertificate.query
+        .filter(ManagedCertificate.domain_id == domain_id)
+    )
+    return (via_deployment.union(via_own_domain)
             .order_by(ManagedCertificate.domain.asc())
             .all())
 
@@ -283,6 +291,129 @@ def certificates_untrack(cert_id):
         db.session.commit()
         _log_activity("certificate", "untrack", "ok", domain)
         flash(f"Stopped tracking {domain}.", "warning")
+    return redirect(url_for("tls.certificates_list"))
+
+
+@tls_bp.route("/certificates/import-pfx", methods=["GET", "POST"])
+@admin_required
+def certificates_import_pfx():
+    """Upload a PKCS#12 (.pfx) bundle and register it as a tracked cert.
+
+    Replaces the manual ``openssl pkcs12`` procedure documented in
+    ``docs/PFX2CER.md``. The bundle is parsed in-process via
+    ``webapp.pfx_import.parse_pfx``; on success the PEM files are
+    written into ``${FEA_PFX_DIR}/<slug>/`` and a ``ManagedCertificate``
+    row is created (or replaced, on re-import of the same CN). The
+    existing ``/tls/deploy`` pipeline picks the cert up unchanged.
+    """
+    from webapp import pfx_import
+
+    if request.method == "GET":
+        return render_template("tls/import_pfx.html")
+
+    pfx_file = request.files.get("pfx_file")
+    if pfx_file is None or not pfx_file.filename:
+        flash("No PFX file uploaded.", "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+    password = request.form.get("password", "")
+    domain_override = (request.form.get("domain_override") or "").strip().lower()
+
+    try:
+        pfx_bytes = pfx_file.read()
+    except Exception as exc:
+        flash(f"Failed to read uploaded file: {exc}", "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+
+    try:
+        parsed = pfx_import.parse_pfx(pfx_bytes, password)
+    except pfx_import.PfxImportError as exc:
+        _log_activity("certificate", "import_pfx", "error",
+                      pfx_file.filename or "<unnamed>", str(exc))
+        flash(str(exc), "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+
+    # Domain: explicit override > CN > first SAN. Reject if none is
+    # usable — we need it for the unique constraint on ManagedCertificate.
+    cn = (parsed.metadata.get("subject_cn") or "").strip().lower()
+    sans = [s.strip().lower() for s in parsed.metadata.get("san_domains") or [] if s]
+    if domain_override:
+        cert_domain = domain_override
+    elif cn:
+        cert_domain = cn
+    elif sans:
+        cert_domain = sans[0]
+    else:
+        flash("PFX has neither a Common Name nor a SAN — provide an "
+              "explicit domain override.", "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+
+    # Refuse to clobber a Let's Encrypt-tracked row from this UI. The
+    # operator must untrack the LE cert first to keep the LE lineage
+    # at /config/letsencrypt/live/<fqdn>/ clean.
+    existing = ManagedCertificate.query.filter_by(domain=cert_domain).first()
+    if existing is not None and existing.challenge_type in ("http01", "dns01_manual"):
+        flash(
+            f"A Let's Encrypt certificate for {cert_domain} is already "
+            "tracked. Untrack it first (or pick a different domain "
+            "override) — re-importing would conflict with the LE "
+            "lifecycle.", "danger",
+        )
+        return redirect(url_for("tls.certificates_import_pfx"))
+
+    try:
+        lineage_path, fullchain_hash = pfx_import.save_parsed_pfx(
+            parsed, cert_domain,
+        )
+    except Exception as exc:
+        log.exception("PFX save failed for %s", cert_domain)
+        _log_activity("certificate", "import_pfx", "error", cert_domain,
+                      f"save failed: {exc}")
+        flash(f"Failed to save PFX files to disk: {exc}", "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+
+    now = datetime.now(timezone.utc)
+    active_domain = getattr(g, "domain", None)
+    active_domain_id = active_domain.id if active_domain is not None else None
+    if existing is None:
+        cert = ManagedCertificate(
+            domain=cert_domain,
+            certbot_lineage=str(lineage_path),
+            last_cert_hash=fullchain_hash,
+            last_checked_at=now,
+            status="active",
+            challenge_type="pfx_import",
+            is_staging=False,
+            # Stamp the active Domain so the cert is visible on
+            # /tls/certificates immediately (before any TLSDeployment
+            # exists). Matches the LE.1 stamping pattern.
+            domain_id=active_domain_id,
+        )
+        db.session.add(cert)
+        action_word = "imported"
+    else:
+        # Re-import of a PFX-tracked cert — refresh paths + hash.
+        # Keep `domain_id` if previously set; only fill it in for
+        # legacy rows where it was NULL.
+        existing.certbot_lineage = str(lineage_path)
+        existing.last_cert_hash = fullchain_hash
+        existing.last_checked_at = now
+        existing.status = "active"
+        existing.last_error = ""
+        if existing.domain_id is None and active_domain_id is not None:
+            existing.domain_id = active_domain_id
+        cert = existing
+        action_word = "reimported"
+    db.session.commit()
+
+    valid_to = parsed.metadata.get("valid_to")
+    expires = valid_to.strftime("%Y-%m-%d") if valid_to else "unknown"
+    _log_activity("certificate", "import_pfx", "ok", cert_domain,
+                  f"action={action_word} lineage={lineage_path} "
+                  f"expires={expires} cn={cn!r}")
+    flash(
+        f"PFX {action_word} for {cert_domain} (expires {expires}). "
+        "Deploy it from /tls/deploy.", "success",
+    )
     return redirect(url_for("tls.certificates_list"))
 
 
@@ -660,6 +791,214 @@ def hook_install():
         _log_activity("system", "install_hook", "error", hook_dir, str(e))
         flash(f"Failed to install hook: {e}", "danger")
     return redirect(url_for("tls.hook_view"))
+
+
+# ── Cert expirations dashboard + SMTP alerts (2026-05-31) ───────────────
+
+@tls_bp.route("/expirations")
+@admin_required
+def expirations_dashboard():
+    """Per-Domain cert-expiration dashboard with auto-alert sweep."""
+    from webapp import cert_expirations
+    domain = getattr(g, "domain", None)
+    domain_id = domain.id if domain is not None else None
+    views = cert_expirations.build_views_for_domain(domain_id)
+    user_email = (session.get("user") or {}).get("email", "")
+    # Lazy-sweep — fires once per hour from any visit; never raises.
+    sweep_report = cert_expirations.ensure_lazy_expiration_sweep(
+        triggered_by_user_email=user_email,
+    )
+    smtp_cfg = None
+    if domain_id is not None:
+        from webapp.models import SmtpConfig
+        smtp_cfg = SmtpConfig.query.filter_by(domain_id=domain_id).first()
+    return render_template(
+        "tls/expirations.html",
+        views=views, sweep_report=sweep_report, smtp_cfg=smtp_cfg,
+    )
+
+
+@tls_bp.route("/expirations/notifications")
+@admin_required
+def expirations_notifications():
+    """Audit-style log of every cert-expiration alert sent."""
+    from webapp import cert_expirations
+    domain = getattr(g, "domain", None)
+    domain_id = domain.id if domain is not None else None
+    rows = cert_expirations.recent_notifications(domain_id, limit=200)
+    return render_template(
+        "tls/expiration_notifications.html",
+        rows=rows,
+    )
+
+
+@tls_bp.route("/expirations/sweep", methods=["POST"])
+@admin_required
+def expirations_sweep_now():
+    """Operator-clicked manual sweep (bypasses the 1h gate)."""
+    from webapp import cert_expirations
+    user_email = (session.get("user") or {}).get("email", "")
+    try:
+        report = cert_expirations.sweep_all_domains(
+            triggered_by_user_email=user_email,
+        )
+        cert_expirations.mark_swept_now()
+        flash(f"Sweep complete — considered {report.certs_considered} cert(s), "
+              f"sent {report.sends_ok} ok / {report.sends_failed} failed.",
+              "success" if report.sends_failed == 0 else "warning")
+    except Exception as exc:
+        log.exception("manual expirations sweep failed")
+        flash(f"Sweep failed: {exc}", "danger")
+    return redirect(url_for("tls.expirations_dashboard"))
+
+
+@tls_bp.route("/smtp", methods=["GET", "POST"])
+@admin_required
+def smtp_config():
+    """Per-Domain SMTP configuration CRUD."""
+    from webapp.models import SmtpConfig
+    from webapp import cert_expirations
+
+    domain = getattr(g, "domain", None)
+    if domain is None:
+        flash("Pick a Domain before configuring SMTP.", "warning")
+        return redirect(url_for("tls.dashboard"))
+
+    cfg = SmtpConfig.query.filter_by(domain_id=domain.id).first()
+
+    if request.method == "POST":
+        host = (request.form.get("host") or "").strip()
+        port_raw = (request.form.get("port") or "587").strip()
+        try:
+            port = int(port_raw)
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            flash(f"Port must be 1–65535 (got {port_raw!r}).", "danger")
+            return redirect(url_for("tls.smtp_config"))
+        security = (request.form.get("security") or "starttls").strip().lower()
+        if security not in ("starttls", "ssl", "plain"):
+            security = "starttls"
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password", "")
+        # Preserve existing password when the field is blank on edit —
+        # operators commonly leave it empty to avoid retyping. Empty
+        # password on a fresh row is a legitimate config (open relay).
+        keep_password = (cfg is not None and not password
+                         and (request.form.get("keep_password") == "1"))
+        from_address = (request.form.get("from_address") or "").strip()
+        from_name = (request.form.get("from_name") or "FlexEdgeAdmin").strip()
+        recipients_csv = (request.form.get("recipients_csv") or "").strip()
+        thresholds_csv = (request.form.get("thresholds_csv") or "30,14,7,3,1").strip()
+        is_active = request.form.get("is_active") == "on"
+
+        if not host:
+            flash("SMTP host is required.", "danger")
+            return redirect(url_for("tls.smtp_config"))
+        if not from_address or "@" not in from_address:
+            flash("From address is required (and must look like an email).",
+                  "danger")
+            return redirect(url_for("tls.smtp_config"))
+        if "@" not in from_address.split("@", 1)[-1]:
+            # Already covered by the above; guarding against pure-domain inputs.
+            pass
+
+        # Validate recipients + thresholds at form-handling time so the
+        # operator sees an immediate refusal rather than discovering
+        # the silent skip on the next sweep.
+        recipients = cert_expirations.parse_recipients(recipients_csv)
+        if not recipients:
+            flash("At least one alert recipient is required.", "danger")
+            return redirect(url_for("tls.smtp_config"))
+        bad = [r for r in recipients if "@" not in r]
+        if bad:
+            flash(f"Invalid recipient(s): {', '.join(bad)}", "danger")
+            return redirect(url_for("tls.smtp_config"))
+        thresholds = cert_expirations.parse_thresholds(thresholds_csv)
+        if not thresholds:
+            flash("At least one threshold (positive integer days) is required.",
+                  "danger")
+            return redirect(url_for("tls.smtp_config"))
+
+        if cfg is None:
+            cfg = SmtpConfig(domain_id=domain.id)
+            db.session.add(cfg)
+        cfg.host = host
+        cfg.port = port
+        cfg.security = security
+        cfg.username = username
+        if not keep_password:
+            cfg.encrypted_password = password
+        cfg.from_address = from_address
+        cfg.from_name = from_name
+        cfg.recipients_csv = ",".join(recipients)
+        cfg.thresholds_csv = ",".join(str(t) for t in thresholds)
+        cfg.is_active = is_active
+        db.session.commit()
+        _log_activity("smtp", "save", "ok", host,
+                      f"port={port} security={security} "
+                      f"recipients={len(recipients)} thresholds={thresholds_csv}")
+        flash("SMTP configuration saved.", "success")
+        return redirect(url_for("tls.smtp_config"))
+
+    return render_template("tls/smtp.html", cfg=cfg)
+
+
+@tls_bp.route("/smtp/test", methods=["POST"])
+@admin_required
+def smtp_test():
+    """Send a smoke-test email using the saved SMTP config."""
+    from webapp.models import SmtpConfig
+    from webapp.smtp_sender import SmtpSettings, send_smtp
+    from webapp import cert_expirations
+
+    domain = getattr(g, "domain", None)
+    if domain is None:
+        flash("Pick a Domain first.", "warning")
+        return redirect(url_for("tls.dashboard"))
+    cfg = SmtpConfig.query.filter_by(domain_id=domain.id).first()
+    if cfg is None or not cfg.is_active:
+        flash("Save and activate the SMTP config first.", "warning")
+        return redirect(url_for("tls.smtp_config"))
+    recipients = cert_expirations.parse_recipients(cfg.recipients_csv)
+    if not recipients:
+        flash("No recipients configured.", "warning")
+        return redirect(url_for("tls.smtp_config"))
+
+    settings = SmtpSettings(
+        host=cfg.host, port=cfg.port, security=cfg.security,
+        username=cfg.username, password=cfg.encrypted_password or "",
+        from_address=cfg.from_address, from_name=cfg.from_name,
+    )
+    subject = "[FlexEdgeAdmin] SMTP smoke test"
+    text_body = (
+        "This is a smoke test from FlexEdgeAdmin's TLS expiration alerter.\n"
+        f"Domain : {domain.display_name or domain.slug}\n"
+        f"From   : {cfg.from_address}\n"
+        f"Time   : {datetime.now(timezone.utc).isoformat()}\n\n"
+        "If you received this, the SMTP configuration is working and "
+        "cert-expiration alerts can be delivered to this address list.\n"
+    )
+    result = send_smtp(
+        settings=settings, to_addrs=recipients,
+        subject=subject, body_text=text_body,
+    )
+    cfg.last_test_at = datetime.now(timezone.utc)
+    cfg.last_test_status = "ok" if result.ok else "failed"
+    cfg.last_test_error = result.error
+    db.session.commit()
+    if result.ok:
+        suffix = " (DRY RUN — no email was sent)" if result.dry_run else ""
+        flash(f"SMTP test sent to {len(recipients)} recipient(s){suffix}.",
+              "success")
+        _log_activity("smtp", "test", "ok",
+                      f"{cfg.host}:{cfg.port}",
+                      f"recipients={len(recipients)} dry_run={result.dry_run}")
+    else:
+        flash(f"SMTP test failed: {result.error}", "danger")
+        _log_activity("smtp", "test", "error",
+                      f"{cfg.host}:{cfg.port}", result.error)
+    return redirect(url_for("tls.smtp_config"))
 
 
 # ── History ──────────────────────────────────────────────────────────────

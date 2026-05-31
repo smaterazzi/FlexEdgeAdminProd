@@ -5,6 +5,27 @@
 <div class="p-4">
 <h2 class="mb-4"><i class="bi bi-arrow-repeat"></i> Certbot Renewal Hook</h2>
 
+<div class="alert alert-warning d-flex align-items-start gap-2 mb-4" role="alert">
+  <i class="bi bi-exclamation-triangle-fill flex-shrink-0 mt-1"></i>
+  <div>
+    <strong>Legacy path since LE.3 (2026-05-29).</strong>
+    Let's Encrypt certificates managed through
+    <a href="{{ url_for('letsencrypt.list_certs') }}" class="alert-link">/tls/letsencrypt</a>
+    are now renewed by FEA's own in-process scheduler (operator answer LE-Q1=A) —
+    you don't need certbot's host-cron path for those any more. This page stays
+    so existing operator-tracked certbot lineages (the pre-LE.1 flow, where you ran
+    <code>certbot certonly</code> on the host yourself) keep working: the deploy hook
+    below still POSTs <code>/tls/api/renew</code> so FEA can redeploy whatever the
+    host-cron renewed.
+    <br>
+    <span class="small">
+      If every cert on this deployment was issued via
+      <code>/tls/letsencrypt/new</code>, you can stop installing this hook —
+      FEA handles renewals end-to-end without it.
+    </span>
+  </div>
+</div>
+
 <div class="row">
     <div class="col-md-8">
         <div class="card mb-4">
