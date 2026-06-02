@@ -363,12 +363,18 @@ def cache_get_or_fetch(section: str,
             with lock:
                 cached = cache.get(cache_key)
             if cached is not None:
-                data, cached_at = cached
+                # Handle both legacy 2-tuple and new 3-tuple form (C5 fix).
+                if len(cached) == 3:
+                    data, cached_at, stored_domain_id = cached
+                else:
+                    data, cached_at = cached
+                    stored_domain_id = domain_id
                 _hit_count += 1
                 return CachedValue(
                     data=data, cached_at=cached_at,
                     served_from_cache=True,
                     section=section, cache_key=cache_key,
+                    domain_id=stored_domain_id,
                 )
             _coalesced_count += 1
             log.debug("smc_cache: COALESCED key=%s — joining in-flight fetch",

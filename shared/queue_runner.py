@@ -551,10 +551,15 @@ def push_one(change_id: int) -> PushResult:
         from webapp.smc_tls_client import smc_session
         with smc_session(cfg):
             result: HandlerResult = handler(change, cfg)
-    except Exception as exc:
+    except BaseException as exc:
+        # Catch BaseException to handle KeyboardInterrupt/SystemExit too —
+        # ensures the row is marked push_failed instead of stuck in "pushing".
         log.exception("queue_runner: handler raised (change=#%s op=%s)",
                       change.id, change.operation)
         _mark_push_failed(change, f"Handler raised: {exc!s}")
+        # Re-raise KeyboardInterrupt/SystemExit so signals propagate properly.
+        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+            raise
         return PushResult(failed=True, change_id=change_id,
                           state="push_failed", error=str(exc))
 

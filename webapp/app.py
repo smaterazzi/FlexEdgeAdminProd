@@ -1385,8 +1385,15 @@ def migration_new():
     active_did = getattr(getattr(g, "domain", None), "id", None)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".conf") as tmp:
         file.save(tmp.name)
+        tmp_path = tmp.name
+
+    try:
         project = project_manager.create_project(
-            name, tmp.name, file.filename, domain_id=active_did)
+            name, tmp_path, file.filename, domain_id=active_did)
+    finally:
+        # Clean up temp file after create_project copies it to data/projects/
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
     try:
         source_path = project_manager.get_source_path(project["id"])
@@ -2062,12 +2069,17 @@ def migration_import(project_id):
                     # Find every queued change in this batch (filter by
                     # correlation id explicitly so we don't push other
                     # rows from concurrent activity).
-                    batch_q = PendingChange.query.filter_by(
-                        domain_id=getattr(g, "domain", None).id,
-                        state="queued", scope="main",
-                        source_correlation_id=corr,
-                    )
-                    batch_ids = [r.id for r in batch_q.all()]
+                    active_dom = getattr(g, "domain", None)
+                    if active_dom is None:
+                        log.warning("DHCP bypass push skipped: g.domain is None")
+                        batch_ids = []
+                    else:
+                        batch_q = PendingChange.query.filter_by(
+                            domain_id=active_dom.id,
+                            state="queued", scope="main",
+                            source_correlation_id=corr,
+                        )
+                        batch_ids = [r.id for r in batch_q.all()]
                     if batch_ids:
                         from shared.queue_runner import push_batch
                         batch_result = push_batch(batch_ids)
