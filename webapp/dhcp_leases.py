@@ -21,9 +21,22 @@ The file is plain text with blocks of the form:
 This module turns that into a list of `Lease` dataclasses. No SSH, no DB —
 just text in, structured data out.
 """
+import ipaddress
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional
+
+log = logging.getLogger(__name__)
+
+# Audit M17 (2026-06-11) hardening caps. The leases file comes from a
+# root-owned path on the engine, but its *content* is shaped by DHCP
+# clients on the network (hostnames, vendor strings, uids) — treat it
+# as untrusted input. Today Jinja autoescape renders it safely; these
+# caps keep a hostile client from bloating memory or smuggling huge
+# strings toward any future consumer.
+_MAX_FIELD_CHARS = 256       # any single string value
+_MAX_EXTRAS_PER_BLOCK = 32   # unknown key/value pairs kept per lease block
 
 
 @dataclass
@@ -81,6 +94,10 @@ def parse_dhcpd_leases(content: str) -> list[Lease]:
     """
     leases: list[Lease] = []
     cur: Optional[dict] = None
+    skipped_bad_ip = 0
+
+    def _capped(s: str) -> str:
+        return s[:_MAX_FIELD_CHARS]
 
     for raw in content.splitlines():
         line = raw.strip()
@@ -90,6 +107,14 @@ def parse_dhcpd_leases(content: str) -> list[Lease]:
             # "lease 192.168.10.55 {"
             end = line.find("{")
             ip = line[len("lease "):end if end >= 0 else None].strip()
+            # M17: a lease block whose header isn't a real IP is either
+            # corruption or tampering — skip the whole block.
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                skipped_bad_ip += 1
+                cur = None
+                continue
             cur = {"ip": ip}
             continue
         if cur is None:
@@ -101,15 +126,18 @@ def parse_dhcpd_leases(content: str) -> list[Lease]:
         # All other fields end in ';'
         body = line.rstrip(";").rstrip()
         if body.startswith("hardware ethernet "):
-            cur["mac"] = body[len("hardware ethernet "):].strip().lower()
+            cur["mac"] = _capped(body[len("hardware ethernet "):].strip().lower())
         elif body.startswith("client-hostname "):
-            cur["client_hostname"] = body[len("client-hostname "):].strip().strip('"')
+            cur["client_hostname"] = _capped(
+                body[len("client-hostname "):].strip().strip('"'))
         elif body.startswith("vendor-class-identifier "):
-            cur["vendor_class_identifier"] = body[len("vendor-class-identifier "):].strip().strip('"')
+            cur["vendor_class_identifier"] = _capped(
+                body[len("vendor-class-identifier "):].strip().strip('"'))
         elif body.startswith("binding state "):
-            cur["binding_state"] = body[len("binding state "):].strip()
+            cur["binding_state"] = _capped(body[len("binding state "):].strip())
         elif body.startswith("next binding state "):
-            cur["next_binding_state"] = body[len("next binding state "):].strip()
+            cur["next_binding_state"] = _capped(
+                body[len("next binding state "):].strip())
         elif body.startswith("starts "):
             cur["starts"] = _parse_isc_timestamp(body[len("starts "):])
         elif body.startswith("ends "):
@@ -119,14 +147,18 @@ def parse_dhcpd_leases(content: str) -> list[Lease]:
         elif body.startswith("tstp "):
             cur["tstp"] = _parse_isc_timestamp(body[len("tstp "):])
         elif body.startswith("uid "):
-            cur["uid_hex"] = body[len("uid "):].strip()
+            cur["uid_hex"] = _capped(body[len("uid "):].strip())
         else:
             cur.setdefault("extras", {})
-            # Best-effort split key/value for unknown fields
-            if " " in body:
+            # Best-effort split key/value for unknown fields; bounded so
+            # a hostile file can't grow one block without limit.
+            if " " in body and len(cur["extras"]) < _MAX_EXTRAS_PER_BLOCK:
                 k, v = body.split(" ", 1)
-                cur["extras"][k] = v.strip()
+                cur["extras"][_capped(k)] = _capped(v.strip())
 
+    if skipped_bad_ip:
+        log.warning("parse_dhcpd_leases: skipped %d lease block(s) with "
+                    "invalid IP header", skipped_bad_ip)
     return leases
 
 

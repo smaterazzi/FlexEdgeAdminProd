@@ -82,12 +82,6 @@ class NodeResult:
     duration_ms: int = 0
     error: str = ""
     reload_warning: str = ""
-    # The FlexEdge-managed block as it would appear in dhcp-server.conf
-    # for this scope. Always populated when the push reaches the render
-    # step. Lets the preview UI show the operator what's in (or going
-    # into) the file even when the diff is empty (in-sync case).
-    flexedge_block: str = ""
-    in_sync: bool = False     # True iff sha256_before == sha256_after
 
 
 @dataclass
@@ -97,10 +91,6 @@ class PushResult:
     overall_status: str       # "ok" | "partial" | "failed" | "blocked"
     blocked_reason: str = ""
     nodes: list[NodeResult] = field(default_factory=list)
-    # Total DhcpReservation rows considered for this scope. Surfaced on
-    # the preview page so the operator can confirm the DB-side count
-    # regardless of diff state.
-    reservations_count: int = 0
 
     @property
     def successful_nodes(self) -> int:
@@ -376,13 +366,11 @@ def _push_to_node(scope: DhcpScope,
                                               operator_email)
         new_content = merge_into_conf(existing, new_block, scope.id)
         node.sha256_after = _sha256_text(new_content)
-        node.flexedge_block = new_block
 
         if node.sha256_before == node.sha256_after:
             node.status = "ok"
             node.error = ""
             node.diff = "(no changes — file already in sync)"
-            node.in_sync = True
             return node
 
         node.diff = _unified_diff(existing, new_content)
@@ -509,7 +497,6 @@ def _push_scope_to_engine_locked(scope: DhcpScope,
                     .filter_by(scope_id=scope.id)
                     .order_by(DhcpReservation.ip_address)
                     .all())
-    result.reservations_count = len(reservations)
 
     log.info("Phase 4 push: scope=%s engine=%s nodes=%d reservations=%d "
              "action=%s dry_run=%s by=%s",

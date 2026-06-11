@@ -387,6 +387,25 @@ Place `flexedge.db`, `encryption.key`, `.env`, `/config/letsencrypt/`, and `data
 
 Without `encryption.key`, API keys stored in the database are permanently irrecoverable. This is by design.
 
+### Retention sweeps (cron — audit M9, 2026-06-11)
+
+Log and scan-history retention normally runs as a *lazy sweep* on page
+load — fine for actively used deployments, but tables grow unbounded if
+nobody opens the relevant pages. One cron entry covers everything:
+
+```bash
+# Weekly, Sunday 03:30 — sweeps dhcp_activity_logs, dhcp_deployments,
+# platform_logs (90-day retention) AND the engine scan-history
+# retention rule (mode/value as configured at /engines/scans;
+# starred scans are always kept):
+30 3 * * 0  docker compose -f /opt/flexedge/docker/docker-compose.yml exec -T flexedge-web \
+    python /app/cli/sweep_dhcp_logs.py --retention 90 --quiet
+```
+
+Pass `--skip-scan-history` to sweep only logs, or `--domain <slug>` for
+a single Domain. Output is JSON on stdout (suppressed with `--quiet`
+on success); non-zero exit status on failure so cron mail catches it.
+
 ---
 
 ## Local verification without Azure AD (audit V3, 2026-05-29)

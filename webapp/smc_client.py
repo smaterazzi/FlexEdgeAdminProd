@@ -11,6 +11,7 @@ inherited objects from parent domains transparently.
 
 import os
 import logging
+import threading
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -85,7 +86,11 @@ def smc_session(cfg=None):
 
 # ── Href Resolution Cache ────────────────────────────────────────────────
 
+# Audit L5 (2026-06-11): guarded by a lock — under threaded gunicorn a
+# clear_href_cache() racing a resolve_href() iteration raised
+# RuntimeError("dictionary changed size during iteration").
 _href_cache = {}
+_href_cache_lock = threading.Lock()
 
 
 def resolve_href(href):
@@ -97,25 +102,30 @@ def resolve_href(href):
     """
     if not href:
         return None
-    if href in _href_cache:
-        return _href_cache[href]
+    with _href_cache_lock:
+        cached = _href_cache.get(href)
+    if cached is not None:
+        return cached
     try:
         elem = Element.from_href(href)
         if elem:
             info = {"name": elem.name, "type": getattr(elem, "typeof", "")}
-            _href_cache[href] = info
+            with _href_cache_lock:
+                _href_cache[href] = info
             return info
     except Exception as e:
         log.debug(f"Could not resolve href {href}: {e}")
     # Fallback: extract the numeric ID from the href
     fallback = {"name": href.split("/")[-1], "type": "unresolved"}
-    _href_cache[href] = fallback
+    with _href_cache_lock:
+        _href_cache[href] = fallback
     return fallback
 
 
 def clear_href_cache():
     """Clear the href resolution cache (call between sessions)."""
-    _href_cache.clear()
+    with _href_cache_lock:
+        _href_cache.clear()
 
 
 # ── Element Listing (read-only) ──────────────────────────────────────────

@@ -41,6 +41,7 @@ Cross-cert short-circuit: if the Domain has no SmtpConfig (or it's
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -138,18 +139,36 @@ def _source_label(cert: ManagedCertificate) -> str:
     return "LE · HTTP-01"
 
 
+# Audit P2 (2026-06-11): memoise the X.509 parse keyed on the file's
+# (mtime_ns, size) — a renewed lineage rewrites cert.pem so the stat
+# changes and we re-parse; an unchanged file costs one stat() instead
+# of a full read + ASN.1 parse per cert per page render.
+_valid_to_memo: dict[str, tuple[tuple[int, int], datetime | None]] = {}
+_valid_to_memo_lock = threading.Lock()
+
+
 def _read_valid_to(cert: ManagedCertificate) -> tuple[datetime | None, bool]:
     """Return (valid_to, on_disk_present). Defensive — never raises."""
     if not cert.certbot_lineage:
         return None, False
     cert_pem = Path(cert.certbot_lineage) / "cert.pem"
-    if not cert_pem.is_file():
-        return None, False
     try:
-        meta = parse_certificate(str(cert_pem))
+        st = cert_pem.stat()
+    except OSError:
+        return None, False
+    stamp = (st.st_mtime_ns, st.st_size)
+    path_key = str(cert_pem)
+    with _valid_to_memo_lock:
+        hit = _valid_to_memo.get(path_key)
+    if hit is not None and hit[0] == stamp:
+        return hit[1], True
+    try:
+        meta = parse_certificate(path_key)
         valid_to = meta.get("valid_to")
         if valid_to is not None and valid_to.tzinfo is None:
             valid_to = valid_to.replace(tzinfo=timezone.utc)
+        with _valid_to_memo_lock:
+            _valid_to_memo[path_key] = (stamp, valid_to)
         return valid_to, True
     except Exception as exc:
         log.warning("expirations: failed to parse cert %d (%s): %s",
@@ -171,25 +190,37 @@ def build_views_for_domain(domain_id: int | None) -> list[CertExpiryView]:
              .all())
     out: list[CertExpiryView] = []
     now = _utcnow()
+    # Audit P3 (2026-06-11): one grouped query for every cert's highest
+    # fired threshold instead of one SELECT per cert in the loop.
+    max_threshold_by_cert: dict[int, int] = {}
+    if certs:
+        rows = (
+            db.session.query(
+                CertExpirationNotification.certificate_id,
+                db.func.max(CertExpirationNotification.threshold_days),
+            )
+            .filter(
+                CertExpirationNotification.certificate_id.in_(
+                    [c.id for c in certs]),
+                CertExpirationNotification.status == "ok",
+            )
+            .group_by(CertExpirationNotification.certificate_id)
+            .all()
+        )
+        max_threshold_by_cert = {cid: mx for cid, mx in rows}
     for cert in certs:
         valid_to, on_disk = _read_valid_to(cert)
         if valid_to is not None:
             dte = (valid_to - now).days
         else:
             dte = None
-        max_threshold = (
-            db.session.query(db.func.max(CertExpirationNotification.threshold_days))
-            .filter(CertExpirationNotification.certificate_id == cert.id,
-                    CertExpirationNotification.status == "ok")
-            .scalar()
-        )
         out.append(CertExpiryView(
             cert=cert,
             valid_to=valid_to,
             days_to_expiry=dte,
             source_label=_source_label(cert),
             deployments_count=cert.deployments.count(),
-            last_notified_threshold=max_threshold,
+            last_notified_threshold=max_threshold_by_cert.get(cert.id),
             on_disk_present=on_disk,
         ))
     return out
@@ -229,28 +260,55 @@ def mark_swept_now() -> None:
     set_setting(SETTING_LAST_SWEEP_AT, _utcnow().isoformat())
 
 
+# Audit P1 (2026-06-11): the lazy sweep used to run inline in the
+# /tls/expirations request — N due alerts × up to 30 s SMTP timeout
+# each could stall the gunicorn worker. It now runs in a daemon
+# thread; the non-blocking module lock keeps two near-simultaneous
+# page loads from double-sweeping inside the same gate window.
+_sweep_thread_lock = threading.Lock()
+
+
 def ensure_lazy_expiration_sweep(
     *, triggered_by_user_email: str = "",
-) -> SweepReport | None:
-    """Run a sweep if the last one was more than ``SWEEP_INTERVAL`` ago.
+) -> bool:
+    """Spawn a background sweep if the last one was more than
+    ``SWEEP_INTERVAL`` ago. Returns True when a sweep was started.
 
-    Best-effort: failures log + return None. Called from the
+    Best-effort: failures log inside the worker. Called from the
     ``/tls/expirations`` route on every render so operator activity
-    drives the cadence.
+    drives the cadence; the request thread never waits on SMTP.
     """
     if was_swept_recently():
-        return None
+        return False
+    if not _sweep_thread_lock.acquire(blocking=False):
+        return False    # a sweep is already in flight
     try:
-        report = sweep_all_domains(triggered_by_user_email=triggered_by_user_email)
-        mark_swept_now()
-        return report
-    except Exception as exc:
-        log.warning("expirations sweep failed: %s", exc)
+        from flask import current_app
+        app = current_app._get_current_object()
+    except Exception:
+        _sweep_thread_lock.release()
+        return False
+
+    def _run():
         try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return None
+            with app.app_context():
+                try:
+                    sweep_all_domains(
+                        triggered_by_user_email=triggered_by_user_email)
+                    mark_swept_now()
+                except Exception as exc:
+                    log.warning("expirations sweep failed: %s", exc)
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+        finally:
+            _sweep_thread_lock.release()
+
+    threading.Thread(
+        target=_run, daemon=True, name="cert-expirations-sweep",
+    ).start()
+    return True
 
 
 def _due_threshold_for(cert: ManagedCertificate, days_to_expiry: int,

@@ -43,6 +43,7 @@ at ``active`` (the queue handler is careful about that — see
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
@@ -105,29 +106,54 @@ def mark_swept_now() -> None:
     set_setting(SETTING_LAST_SWEEP_AT, _utcnow().isoformat())
 
 
-def ensure_lazy_renewal_sweep(*, triggered_by_user_email: str = "") -> SweepReport | None:
-    """Run a renewal sweep if the last one was more than ``SWEEP_INTERVAL`` ago.
+# Audit P4 (2026-06-11): the sweep used to run inline in the
+# /tls/letsencrypt request — when SMC / certbot pushes were slow the
+# cert list page stalled behind them. It now spawns a daemon thread;
+# the non-blocking module lock prevents double-sweeps when two page
+# loads race inside the same gate window.
+_sweep_thread_lock = threading.Lock()
 
-    Best-effort: failures log + return None, never raise. Called from
-    the cert list route on every page load — operator visibility on
-    the cert list page is what keeps renewals fresh in lazy mode.
 
-    Returns the ``SweepReport`` when a sweep actually ran; ``None``
-    when the gate said "too soon".
+def ensure_lazy_renewal_sweep(*, triggered_by_user_email: str = "") -> bool:
+    """Spawn a background renewal sweep if the last one was more than
+    ``SWEEP_INTERVAL`` ago. Returns True when a sweep was started.
+
+    Best-effort: failures log inside the worker, never raise. Called
+    from the cert list route on every page load — operator visibility
+    on the cert list page is what keeps renewals fresh in lazy mode;
+    the request thread never waits on the sweep itself.
     """
     if was_swept_recently():
-        return None
+        return False
+    if not _sweep_thread_lock.acquire(blocking=False):
+        return False    # a sweep is already in flight
     try:
-        report = sweep_due_renewals(triggered_by_user_email=triggered_by_user_email)
-        mark_swept_now()
-        return report
-    except Exception as exc:
-        log.warning("LE renewal sweep failed: %s", exc)
+        from flask import current_app
+        app = current_app._get_current_object()
+    except Exception:
+        _sweep_thread_lock.release()
+        return False
+
+    def _run():
         try:
-            db.session.rollback()
-        except Exception:
-            pass
-        return None
+            with app.app_context():
+                try:
+                    sweep_due_renewals(
+                        triggered_by_user_email=triggered_by_user_email)
+                    mark_swept_now()
+                except Exception as exc:
+                    log.warning("LE renewal sweep failed: %s", exc)
+                    try:
+                        db.session.rollback()
+                    except Exception:
+                        pass
+        finally:
+            _sweep_thread_lock.release()
+
+    threading.Thread(
+        target=_run, daemon=True, name="letsencrypt-renewal-sweep",
+    ).start()
+    return True
 
 
 def sweep_due_renewals(*, triggered_by_user_email: str = "",

@@ -189,8 +189,17 @@ def _handle_uncaught_exception(e):
 
     log.exception("AJAX uncaught exception on %s %s",
                   request.method, request.path)
+    # Audit L1 (2026-06-11): only echo the Python class + message when
+    # debugging — a TypeError on an SQLAlchemy column could still leak
+    # a row value to the browser. Production callers get a generic
+    # message; the full traceback is always in the server log above.
+    if app.debug:
+        return jsonify(
+            error=f"{type(e).__name__}: {str(e)[:500]}",
+            code=500,
+        ), 500
     return jsonify(
-        error=f"{type(e).__name__}: {str(e)[:500]}",
+        error="Internal server error — check the server log for details.",
         code=500,
     ), 500
 
@@ -766,6 +775,18 @@ def version_info():
 #  PROFILE & DOMAIN SELECTION
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _warm_cache_for_profile(profile: dict) -> None:
+    """CE2 (2026-06-11): fire-and-forget SMC cache pre-warm for the
+    Domain the operator just activated. Never raises into the caller."""
+    try:
+        from webapp.cache_warmer import warm_active_domain_async
+        warm_active_domain_async(
+            app, ((profile or {}).get("tenant") or "").strip(),
+        )
+    except Exception as exc:
+        log.debug("cache warm skipped: %s", exc)
+
+
 @app.route("/select-profile", methods=["GET", "POST"])
 @login_required
 def select_profile():
@@ -795,6 +816,7 @@ def select_profile():
             "User %s selected profile '%s' (smc-domain '%s')",
             email, chosen.get("name"), session["active_domain"],
         )
+        _warm_cache_for_profile(chosen)
         return redirect(url_for("index"))
 
     return render_template("auth/select_profile.html", profiles=profiles)
@@ -835,6 +857,10 @@ def switch_domain():
     except Exception:
         pass
 
+    # CE2 (2026-06-11): re-warm for the new Domain so the post-switch
+    # landing page doesn't pay the cold-cache SMC roundtrip.
+    _warm_cache_for_profile(chosen)
+
     log.info("User %s switched to Domain '%s' (smc-domain '%s')",
              email, chosen.get("name"), session["active_domain"])
     flash(f"Switched to {chosen.get('name')}.", "success")
@@ -864,19 +890,10 @@ def select_domain():
     domains = []
     error = None
 
-    if request.method == "POST":
-        chosen = request.form.get("domain", "").strip()
-        if not chosen:
-            flash("Please select a domain.", "warning")
-        else:
-            session["active_domain"] = chosen
-            log.info(
-                "User %s selected domain '%s' on profile '%s'",
-                session["user"]["email"], chosen, profile["name"],
-            )
-            return redirect(url_for("index"))
-
-    # Fetch domain list from SMC
+    # Fetch domain list from SMC — needed for both the GET render and
+    # the POST validation (audit L3, 2026-06-11: only domain names SMC
+    # actually reports for this profile may enter the session; an
+    # operator-typed arbitrary string is refused).
     try:
         cfg = {
             "smc_url":    profile["smc_url"],
@@ -889,6 +906,26 @@ def select_domain():
         log.error("Could not fetch domains: %s", exc)
         error = str(exc)
         domains = [{"name": "Shared Domain", "href": ""}]
+
+    if request.method == "POST":
+        chosen = request.form.get("domain", "").strip()
+        valid_names = {(d.get("name") or "").strip() for d in domains}
+        if not chosen:
+            flash("Please select a domain.", "warning")
+        elif chosen not in valid_names:
+            log.warning(
+                "User %s tried to select unknown SMC domain %r on "
+                "profile '%s' — refused",
+                session["user"]["email"], chosen, profile["name"],
+            )
+            flash("That domain is not available on this profile.", "danger")
+        else:
+            session["active_domain"] = chosen
+            log.info(
+                "User %s selected domain '%s' on profile '%s'",
+                session["user"]["email"], chosen, profile["name"],
+            )
+            return redirect(url_for("index"))
 
     return render_template(
         "auth/select_domain.html",
@@ -1132,6 +1169,10 @@ def api_quick_search():
     q = (request.args.get("q") or "").strip().lower()
     if len(q) < 2:
         return jsonify(results=[])
+    # Audit L11 (2026-06-11): bound the query early — no legitimate
+    # element name needs more, and it caps the substring-scan cost.
+    if len(q) > 64:
+        return jsonify(results=[], error="query too long (max 64 chars)"), 400
 
     out: list[dict] = []
 
@@ -1385,15 +1426,8 @@ def migration_new():
     active_did = getattr(getattr(g, "domain", None), "id", None)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".conf") as tmp:
         file.save(tmp.name)
-        tmp_path = tmp.name
-
-    try:
         project = project_manager.create_project(
-            name, tmp_path, file.filename, domain_id=active_did)
-    finally:
-        # Clean up temp file after create_project copies it to data/projects/
-        if os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+            name, tmp.name, file.filename, domain_id=active_did)
 
     try:
         source_path = project_manager.get_source_path(project["id"])
@@ -2069,17 +2103,12 @@ def migration_import(project_id):
                     # Find every queued change in this batch (filter by
                     # correlation id explicitly so we don't push other
                     # rows from concurrent activity).
-                    active_dom = getattr(g, "domain", None)
-                    if active_dom is None:
-                        log.warning("DHCP bypass push skipped: g.domain is None")
-                        batch_ids = []
-                    else:
-                        batch_q = PendingChange.query.filter_by(
-                            domain_id=active_dom.id,
-                            state="queued", scope="main",
-                            source_correlation_id=corr,
-                        )
-                        batch_ids = [r.id for r in batch_q.all()]
+                    batch_q = PendingChange.query.filter_by(
+                        domain_id=getattr(g, "domain", None).id,
+                        state="queued", scope="main",
+                        source_correlation_id=corr,
+                    )
+                    batch_ids = [r.id for r in batch_q.all()]
                     if batch_ids:
                         from shared.queue_runner import push_batch
                         batch_result = push_batch(batch_ids)

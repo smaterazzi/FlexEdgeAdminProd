@@ -4,7 +4,37 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-05-31
+## [2.2.0-dev] - 2026-04-29 → 2026-06-11
+
+### Security & performance review #2 (2026-06-11) — four fix batches
+
+Three-agent review covering everything landed after the 2026-05-09 audit (LE.3/LE.4/LE.5, PFX import, SMTP alerts + expirations dashboard, factory reset) plus re-validation of the open audit tail. Full findings + per-item status in [TODO.md § Security & performance review #2](TODO.md). Most of the new code was verified clean (certbot argv lists, ACME challenge traversal defense, PFX password handling, backup ZIP paths, Fernet'd SMTP password, `_can_see()` Domain scoping). What changed:
+
+**Batch 1 — security.**
+
+- **S1 (High) — SSRF guard on the HTTP-01 reach-test** ([webapp/letsencrypt_certbot.py](webapp/letsencrypt_certbot.py)). The probe previously only rejected `/` in the FQDN; a cert row created against a hostile allowlist pattern (e.g. `169.254.169.254`) let FEA probe internal services. IP-literal FQDNs are now refused outright; the FQDN is resolved first and any non-global resolved address (`ipaddress.is_global`) refuses the probe — LE's validator can only reach public addresses, so nothing legitimate is lost.
+- **S2 (Med) — SMTP plain-mode gate** (new `plain_mode_refusal` in [webapp/smtp_sender.py](webapp/smtp_sender.py), wired into `smtp_config`). The documented-but-unimplemented rule now enforces: `plain` on ports 25/465/587 is only allowed when the host resolves entirely to private/loopback space.
+- **S3 (Low)** — the five new expirations/SMTP routes swapped from the legacy `admin_required` to `@domain_admin_required`.
+- **Small lows:** AJAX uncaught-exception responses redacted in production (L1); terminal resize cols/rows clamped to [1,1000] (L7); quick-search query capped at 64 chars (L11); scan single-IP validated up-front (L8); `_href_cache` thread-locked (L5); dhcpd.leases parser hardened — IP-validated block headers, 256-char field caps, 32-pair extras cap (M17); `credentials_apply` now takes the per-engine bootstrap lock so an Apply can't race a password rotation (L15).
+
+**Batch 2 — performance (new code).**
+
+- **P1 (High)** — the hourly cert-expiration sweep (SMTP sends, up to 30 s each) no longer runs inline in the `/tls/expirations` request: daemon thread + module lock, page renders immediately, outcomes land on the notification log.
+- **P4** — same offload for the LE.3 renewal sweep on `/tls/letsencrypt`.
+- **P2** — days-to-expiry X.509 parses memoised on cert.pem `(mtime_ns, size)`; unchanged files cost one `stat()` per render.
+- **P3** — expirations dashboard threshold lookup batched into one grouped query (was one SELECT per cert).
+- **P5** — four composite indexes added (models + idempotent boot migration): `managed_certificates(domain_id,status,next_renewal_after)`, `cert_expiration_notifications(certificate_id,status)`, `pending_changes(feature_source,domain_id,state)`, `engine_scan_records(domain_id,started_at)`.
+- **P6** — PFX import refuses uploads over 10 MB before buffering.
+
+**Batch 3 — legacy perf/hygiene tail.**
+
+- **M6 + L10** — scan-history count-mode retention ranks SQL-side (`ROW_NUMBER() OVER (PARTITION BY engine, iface)`) and deletes via chunked bulk `DELETE`s instead of materialising every row + per-row ORM cascade deletes.
+- **M9** — [cli/sweep_dhcp_logs.py](cli/sweep_dhcp_logs.py) now also runs the scan-history retention rule per Domain; one cron entry sweeps dhcp logs + platform_logs + scan history (documented in [docs/deployment-guide.md § Retention sweeps](docs/deployment-guide.md)).
+- **CE1** — scan picker no longer fetches `udp_services` (TCP-only chip labels); cold-cache picker render drops to 2 SMC fetches.
+- **CE2 (+M18)** — new [webapp/cache_warmer.py](webapp/cache_warmer.py): profile pick / login auto-select / Domain switch spawn a daemon thread pre-warming `engines` + `element_list.tcp_services`, so the first page load and the quick-search index are warm.
+- **L12** — queue runner's `push.start` audit rides the outcome transaction (commit=False), halving per-row audit commits on big migration pushes.
+
+**Batch 4 — housekeeping.** `/select-domain` POST validates the chosen name against the live SMC domain list before writing it into the session (L3); `register_handler` raises on a different function re-registering an operation (L6); enabling verbose log mode with retention ≥ 30 days flashes a table-growth warning (L13). TODO.md updated throughout: M12/M16/L2/L4/L9/L14 confirmed fixed-or-obsolete with evidence; stale duplicate TCP-scan entries closed.
 
 ### Engine SSH Credentials — "Re-push policy" no longer blocked by source drift (2026-05-31)
 

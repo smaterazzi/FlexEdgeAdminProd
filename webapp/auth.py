@@ -276,6 +276,17 @@ def callback():
         session["active_domain"] = (only.get("domain") or "").strip() or "Shared Domain"
         log.info("User %s auto-selected sole profile '%s' (smc-domain '%s')",
                  email, only.get("name"), session["active_domain"])
+        # CE2 (2026-06-11): pre-warm the SMC cache for this Domain in
+        # the background so the first page load is instant.
+        try:
+            from flask import current_app
+            from webapp.cache_warmer import warm_active_domain_async
+            warm_active_domain_async(
+                current_app._get_current_object(),
+                (only.get("tenant") or "").strip(),
+            )
+        except Exception:
+            pass
         return redirect(url_for("index"))
 
     return redirect(url_for("select_profile"))

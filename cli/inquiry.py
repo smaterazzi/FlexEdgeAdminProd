@@ -4,10 +4,8 @@ Query and filter objects in the SMC by type and name.
 """
 
 import argparse
-import json
 import urllib3
 from connect import connect, disconnect
-from utils import suppress_stdout
 
 # Suppress SSL warnings when verify_ssl is False
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -46,119 +44,8 @@ OBJECT_TYPES = {
     'master_engine': MasterEngine,
 }
 
-# Object types grouped by category (single source of truth for listings)
-OBJECT_CATEGORIES = {
-    'Network Elements': ['host', 'network', 'address_range', 'router', 'domain_name', 'zone', 'group'],
-    'Services': ['tcp_service', 'udp_service', 'icmp_service', 'ip_service', 'service_group'],
-    'Engines': ['firewall', 'firewall_cluster', 'layer2_firewall', 'ips', 'master_engine'],
-}
-
 # Engine types that have extended details
-ENGINE_TYPES = OBJECT_CATEGORIES['Engines']
-
-
-def _serialize_object(obj, object_type, verbose=False, details=False):
-    """
-    Serialize an SMC object to a dict for JSON output.
-
-    Args:
-        obj: The SMC object.
-        object_type: The type key from OBJECT_TYPES.
-        verbose: Include basic extra attributes.
-        details: Include full detail attributes.
-
-    Returns:
-        Dict representation of the object.
-    """
-    data = {"name": obj.name, "type": obj.typeof}
-
-    if hasattr(obj, 'href'):
-        data["href"] = obj.href
-
-    if verbose or details:
-        if hasattr(obj, 'address'):
-            data["address"] = obj.address
-        if hasattr(obj, 'ipv4_network'):
-            data["ipv4_network"] = str(obj.ipv4_network) if obj.ipv4_network else None
-        if hasattr(obj, 'ip_range'):
-            data["ip_range"] = obj.ip_range
-        if hasattr(obj, 'comment') and obj.comment:
-            data["comment"] = obj.comment
-
-    if details:
-        # Host details
-        if hasattr(obj, 'ipv6_address') and obj.ipv6_address:
-            data["ipv6_address"] = obj.ipv6_address
-        if hasattr(obj, 'secondary') and obj.secondary:
-            data["secondary"] = obj.secondary
-
-        # Network details
-        if hasattr(obj, 'ipv6_network') and obj.ipv6_network:
-            data["ipv6_network"] = str(obj.ipv6_network)
-
-        # Service details
-        if hasattr(obj, 'min_dst_port'):
-            data["min_dst_port"] = obj.min_dst_port
-        if hasattr(obj, 'max_dst_port') and obj.max_dst_port:
-            data["max_dst_port"] = obj.max_dst_port
-        if hasattr(obj, 'min_src_port') and obj.min_src_port:
-            data["min_src_port"] = obj.min_src_port
-        if hasattr(obj, 'max_src_port') and obj.max_src_port:
-            data["max_src_port"] = obj.max_src_port
-        if hasattr(obj, 'icmp_type'):
-            data["icmp_type"] = obj.icmp_type
-        if hasattr(obj, 'icmp_code'):
-            data["icmp_code"] = obj.icmp_code
-        if hasattr(obj, 'protocol_number'):
-            data["protocol_number"] = obj.protocol_number
-
-        # Group members
-        if hasattr(obj, 'members'):
-            try:
-                data["members"] = [
-                    {"name": m.name, "type": m.typeof}
-                    for m in obj.members
-                ]
-            except Exception:
-                data["members"] = []
-
-        # Engine details
-        if object_type in ENGINE_TYPES:
-            try:
-                engine = Engine(obj.name)
-                engine_data = {}
-                try:
-                    engine_data["nodes"] = [
-                        {"name": n.name, "nodeid": getattr(n, 'nodeid', None)}
-                        for n in engine.nodes
-                    ]
-                except Exception:
-                    pass
-                try:
-                    engine_data["interfaces"] = []
-                    for iface in engine.interface.all():
-                        iface_info = {"name": iface.name}
-                        if hasattr(iface, 'interface_id'):
-                            iface_info["interface_id"] = iface.interface_id
-                        if hasattr(iface, 'addresses'):
-                            iface_info["addresses"] = list(iface.addresses)
-                        engine_data["interfaces"].append(iface_info)
-                except Exception:
-                    pass
-                try:
-                    engine_data["routing"] = [str(r) for r in engine.routing.all()]
-                except Exception:
-                    pass
-                try:
-                    policy = engine.installed_policy
-                    engine_data["installed_policy"] = str(policy) if policy else None
-                except Exception:
-                    pass
-                data["engine"] = engine_data
-            except Exception:
-                pass
-
-    return data
+ENGINE_TYPES = ['firewall', 'firewall_cluster', 'layer2_firewall', 'ips', 'master_engine']
 
 
 def list_types():
@@ -166,12 +53,16 @@ def list_types():
     print("\nAvailable object types:")
     print("-" * 40)
 
-    for category, types in OBJECT_CATEGORIES.items():
+    categories = {
+        'Network Elements': ['host', 'network', 'address_range', 'router', 'domain_name', 'zone', 'group'],
+        'Services': ['tcp_service', 'udp_service', 'icmp_service', 'ip_service', 'service_group'],
+        'Engines': ['firewall', 'firewall_cluster', 'layer2_firewall', 'ips', 'master_engine'],
+    }
+
+    for category, types in categories.items():
         print(f"\n{category}:")
         for t in types:
             print(f"  - {t}")
-
-    return OBJECT_CATEGORIES
 
 
 def query_objects(object_type: str, name_filter: str = None, limit: int = None):
@@ -179,12 +70,12 @@ def query_objects(object_type: str, name_filter: str = None, limit: int = None):
     Query objects from SMC.
 
     Args:
-        object_type: Type of object to query (e.g., 'host', 'network').
-        name_filter: Optional name pattern to filter results.
-        limit: Maximum number of results to return.
+        object_type: Type of object to query (e.g., 'host', 'network')
+        name_filter: Optional name pattern to filter results
+        limit: Maximum number of results to return
 
     Returns:
-        List of matching objects.
+        List of matching objects
     """
     if object_type not in OBJECT_TYPES:
         print(f"Error: Unknown object type '{object_type}'")
@@ -196,8 +87,10 @@ def query_objects(object_type: str, name_filter: str = None, limit: int = None):
 
     try:
         if name_filter:
+            # Filter by name (partial match)
             objects = element_class.objects.filter(name_filter)
         else:
+            # Get all objects of this type
             objects = element_class.objects.all()
 
         for obj in objects:
@@ -217,6 +110,7 @@ def print_object_details(obj, verbose: bool = False):
     print(f"  Type: {obj.typeof}")
 
     if verbose:
+        # Print additional attributes based on object type
         if hasattr(obj, 'address'):
             print(f"  Address: {obj.address}")
         if hasattr(obj, 'ipv4_network'):
@@ -240,7 +134,7 @@ def get_engine_details(engine_name: str):
     Get comprehensive details for an engine/firewall.
 
     Args:
-        engine_name: Name of the engine to inspect.
+        engine_name: Name of the engine to inspect
     """
     try:
         engine = Engine(engine_name)
@@ -337,6 +231,7 @@ def get_engine_details(engine_name: str):
         try:
             if hasattr(engine, 'data'):
                 data = engine.data
+                # Print select important fields
                 important_fields = [
                     'antivirus', 'file_reputation', 'sidewinder_proxy_enabled',
                     'log_server_ref', 'location_ref', 'default_nat', 'dns',
@@ -507,8 +402,8 @@ def show_full_details(obj, object_type: str):
     Show full details for an object based on its type.
 
     Args:
-        obj: The SMC object.
-        object_type: The type key from OBJECT_TYPES.
+        obj: The SMC object
+        object_type: The type key from OBJECT_TYPES
     """
     if object_type in ENGINE_TYPES:
         get_engine_details(obj.name)
@@ -538,15 +433,9 @@ Examples:
   python inquiry.py --type firewall --verbose
   python inquiry.py --type firewall --name MyFirewall --details
   python inquiry.py --list-types
-
-  # JSON output
-  python inquiry.py --json --type host --name web
-  python inquiry.py --json --type firewall --details
         """
     )
 
-    parser.add_argument('--json', action='store_true',
-                        help='Output results as JSON (machine-readable)')
     parser.add_argument(
         '--type', '-t',
         help='Object type to query (e.g., host, network, firewall)'
@@ -577,14 +466,10 @@ Examples:
     )
 
     args = parser.parse_args()
-    json_mode = args.json
 
     # List types and exit
     if args.list_types:
-        if json_mode:
-            print(json.dumps(OBJECT_CATEGORIES, indent=2))
-        else:
-            list_types()
+        list_types()
         return
 
     # Require type parameter
@@ -595,48 +480,31 @@ Examples:
 
     # Connect to SMC
     try:
-        with suppress_stdout(json_mode):
-            connect()
+        connect()
     except Exception as e:
-        if json_mode:
-            print(json.dumps({"error": f"Connection failed: {e}"}, indent=2))
-        else:
-            print(f"Connection failed: {e}")
+        print(f"Connection failed: {e}")
         return
 
     try:
-        if json_mode:
-            with suppress_stdout(True):
-                results = query_objects(args.type, args.name, args.limit)
-            json_result = {
-                "type": args.type,
-                "filter": args.name,
-                "count": len(results),
-                "objects": [
-                    _serialize_object(obj, args.type, args.verbose, args.details)
-                    for obj in results
-                ],
-            }
-            print(json.dumps(json_result, indent=2, default=str))
-        else:
-            print(f"\nQuerying {args.type} objects" + (f" matching '{args.name}'" if args.name else "") + "...")
-            results = query_objects(args.type, args.name, args.limit)
+        # Query objects
+        print(f"\nQuerying {args.type} objects" + (f" matching '{args.name}'" if args.name else "") + "...")
+        results = query_objects(args.type, args.name, args.limit)
 
-            print(f"\nFound {len(results)} object(s):")
-            print("=" * 50)
+        # Print results
+        print(f"\nFound {len(results)} object(s):")
+        print("=" * 50)
 
-            for obj in results:
-                if args.details:
-                    show_full_details(obj, args.type)
-                else:
-                    print_object_details(obj, args.verbose)
+        for obj in results:
+            if args.details:
+                show_full_details(obj, args.type)
+            else:
+                print_object_details(obj, args.verbose)
 
-            if not results:
-                print("  No objects found.")
+        if not results:
+            print("  No objects found.")
 
     finally:
-        with suppress_stdout(json_mode):
-            disconnect()
+        disconnect()
 
 
 if __name__ == '__main__':

@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """
-FlexEdgeAdmin CLI — DHCP log retention sweep.
+FlexEdgeAdmin CLI — platform retention sweep (logs + scan history).
 
-Deletes ``dhcp_activity_logs`` and ``dhcp_deployments`` rows older than
-the configured retention window. Phase 0 validation rows are preserved
-regardless of age (they're the gate signal, not noise).
+Deletes ``dhcp_activity_logs``, ``dhcp_deployments`` and
+``platform_logs`` rows older than the configured retention window, and
+(audit M9, 2026-06-11) also runs the engine scan-history retention rule
+(``engine_scan_records`` / ``engine_scan_hosts``) per Domain using the
+mode configured at /engines/scans (count or days; starred rows exempt).
+Phase 0 validation rows are preserved regardless of age (they're the
+gate signal, not noise).
 
 Designed to run from cron inside the running Docker container, e.g.::
 
@@ -16,9 +20,9 @@ or from the host::
     docker compose exec flexedge-web python /app/cli/sweep_dhcp_logs.py
 
 Equivalent to clicking the "Sweep old" button on the DHCP Manager
-activity page, but doesn't require an HTTP session. Output is JSON to
-stdout so cron emails / log aggregators can parse it; non-zero exit
-status on failure.
+activity page plus the scan-history "Sweep now" button, but doesn't
+require an HTTP session. Output is JSON to stdout so cron emails / log
+aggregators can parse it; non-zero exit status on failure.
 """
 
 import argparse
@@ -54,6 +58,10 @@ def main() -> int:
              "want for shared retention; pass an explicit slug for "
              "targeted maintenance.",
     )
+    parser.add_argument(
+        "--skip-scan-history", action="store_true",
+        help="Skip the engine scan-history retention pass (logs only).",
+    )
     args = parser.parse_args()
 
     if args.retention <= 0:
@@ -75,6 +83,24 @@ def main() -> int:
     try:
         with app.app_context():
             from webapp.models import Domain
+
+            def _sweep_one(d):
+                s = sweep_old_logs(args.retention, domain_id=d.id)
+                s["domain_slug"] = d.slug
+                # M9 (2026-06-11): scan-history retention rides the same
+                # cron entry. Uses the operator-configured mode/value
+                # from /engines/scans, not --retention. Best-effort —
+                # a scan-history failure must not abort the log sweep.
+                if not args.skip_scan_history:
+                    try:
+                        from webapp.scan_history.retention import sweep_retention
+                        r = sweep_retention(d)
+                        s["scan_history_deleted"] = r.deleted
+                        s["scan_history_mode"] = f"{r.mode}={r.value}"
+                    except Exception as exc:
+                        s["scan_history_error"] = f"{type(exc).__name__}: {exc}"
+                return s
+
             if args.domain:
                 # Targeted Domain sweep.
                 d = Domain.query.filter_by(slug=args.domain).first()
@@ -83,18 +109,14 @@ def main() -> int:
                                       "error": f"unknown domain slug {args.domain!r}"}),
                           file=sys.stderr)
                     return 4
-                summary = sweep_old_logs(args.retention, domain_id=d.id)
-                summary["domain_slug"] = d.slug
-                summaries = [summary]
+                summaries = [_sweep_one(d)]
             else:
                 # Cross-Domain sweep — iterate every active Domain so each
                 # gets its own scoped pass (this fires per-Domain audit
                 # entries, instead of one global "wiped everything" row).
                 summaries = []
                 for d in Domain.query.filter_by(is_active=True).all():
-                    s = sweep_old_logs(args.retention, domain_id=d.id)
-                    s["domain_slug"] = d.slug
-                    summaries.append(s)
+                    summaries.append(_sweep_one(d))
     except Exception as exc:
         print(json.dumps({"ok": False,
                           "error": f"{type(exc).__name__}: {exc}"}),
@@ -110,6 +132,7 @@ def main() -> int:
             "activity_deleted": sum(s.get("activity_deleted", 0) for s in summaries),
             "deployments_deleted": sum(s.get("deployments_deleted", 0) for s in summaries),
             "platform_log_deleted": sum(s.get("platform_log_deleted", 0) for s in summaries),
+            "scan_history_deleted": sum(s.get("scan_history_deleted", 0) for s in summaries),
         },
         "per_domain": summaries,
     }

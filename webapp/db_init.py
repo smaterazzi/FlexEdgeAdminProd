@@ -504,27 +504,41 @@ def _phase_le_certs(db, app):
 def _phase_audit_indexes(db, app):
     """Add audit-driven indexes on existing tables. Idempotent.
 
-    Currently:
-      * `ix_platform_logs_domain_ts` on `platform_logs(domain_id, timestamp)`
-        — drives the /logs viewer. SQLite's `CREATE INDEX IF NOT EXISTS`
-        is a no-op when the index already exists, so this is safe to run
-        on every boot.
+    SQLite's `CREATE INDEX IF NOT EXISTS` is a no-op when the index
+    already exists, so this is safe to run on every boot.
+
+      * `ix_platform_logs_domain_ts` (M8, 2026-05-09) — /logs viewer.
+      * Four composites from audit P5 (2026-06-11) — LE.3 renewal
+        sweep, expirations dashboard + sweep, LE requests view, scan
+        time-graph feed. Fresh installs pick them up from the model
+        `__table_args__` via `db.create_all()`; this path covers
+        pre-existing DBs.
     """
     if not _is_sqlite(app):
         return
-    try:
-        db.session.execute(db.text(
-            "CREATE INDEX IF NOT EXISTS ix_platform_logs_domain_ts "
-            "ON platform_logs (domain_id, timestamp)"
-        ))
-        db.session.commit()
-    except Exception as exc:
-        log.warning("M8: composite log index creation failed (non-fatal): %s",
-                    exc)
+    statements = [
+        ("M8", "CREATE INDEX IF NOT EXISTS ix_platform_logs_domain_ts "
+               "ON platform_logs (domain_id, timestamp)"),
+        ("P5", "CREATE INDEX IF NOT EXISTS ix_managed_certs_domain_status_renewal "
+               "ON managed_certificates (domain_id, status, next_renewal_after)"),
+        ("P5", "CREATE INDEX IF NOT EXISTS ix_cert_notif_cert_status "
+               "ON cert_expiration_notifications (certificate_id, status)"),
+        ("P5", "CREATE INDEX IF NOT EXISTS ix_pending_changes_feature_domain_state "
+               "ON pending_changes (feature_source, domain_id, state)"),
+        ("P5", "CREATE INDEX IF NOT EXISTS ix_engine_scan_records_domain_date "
+               "ON engine_scan_records (domain_id, started_at)"),
+    ]
+    for tag, sql in statements:
         try:
-            db.session.rollback()
-        except Exception:
-            pass
+            db.session.execute(db.text(sql))
+            db.session.commit()
+        except Exception as exc:
+            log.warning("%s: index creation failed (non-fatal): %s — %s",
+                        tag, exc, sql)
+            try:
+                db.session.rollback()
+            except Exception:
+                pass
 
 
 # ── Multi-Domain Revamp — Phase A ────────────────────────────────────────

@@ -323,6 +323,13 @@ class ManagedCertificate(db.Model):
                                      foreign_keys=[pending_change_id])
     account = db.relationship("AcmeAccount")
 
+    # Audit P5 (2026-06-11): the LE.3 renewal sweep filters on all
+    # three columns — one index scan instead of a table walk.
+    __table_args__ = (
+        db.Index("ix_managed_certs_domain_status_renewal",
+                 "domain_id", "status", "next_renewal_after"),
+    )
+
     def __repr__(self):
         return f"<ManagedCertificate {self.domain!r} status={self.status}>"
 
@@ -546,6 +553,9 @@ class CertExpirationNotification(db.Model):
     __table_args__ = (
         db.UniqueConstraint("certificate_id", "threshold_days",
                             name="uq_cert_threshold"),
+        # Audit P5 (2026-06-11): the sweep + dashboard query
+        # (certificate_id, status) together on every render.
+        db.Index("ix_cert_notif_cert_status", "certificate_id", "status"),
     )
 
     def __repr__(self):
@@ -969,6 +979,11 @@ class EngineScanRecord(db.Model):
         db.Index("ix_engine_scan_records_scope",
                  "domain_id", "engine_name", "source_iface_label",
                  "started_at"),
+        # Audit P5 (2026-06-11): the graph feed often filters only on
+        # domain_id + started_at (engine / iface filters blank) — the
+        # 4-column scope index can't serve that ordering efficiently.
+        db.Index("ix_engine_scan_records_domain_date",
+                 "domain_id", "started_at"),
     )
 
     def __repr__(self):
@@ -1386,6 +1401,14 @@ class PendingChange(db.Model):
     depends_on = db.relationship(
         "PendingChange", remote_side=[id], foreign_keys=[scheduled_after],
         post_update=True,
+    )
+
+    # Audit P5 (2026-06-11): the LE requests view + the queue listing
+    # filter on (feature_source, domain_id, state) together — single
+    # composite beats three separate single-column index intersections.
+    __table_args__ = (
+        db.Index("ix_pending_changes_feature_domain_state",
+                 "feature_source", "domain_id", "state"),
     )
 
     def __repr__(self):

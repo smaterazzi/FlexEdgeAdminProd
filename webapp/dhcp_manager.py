@@ -3359,45 +3359,55 @@ def credentials_apply():
     if new_connect_ip_override:
         target_label += f" (real={new_hostname})"
 
-    # Live verify against the new target before committing. Apply must
-    # never silently break a previously-working credential — if the
-    # operator points us at an IP that doesn't actually accept this
-    # credential, refuse and tell them to use Overwrite.
-    target = SSHTarget(hostname=dial_host, port=new_port,
-                       username=new_username)
-    payload = SSHCredential(password=cred.encrypted_password,
-                            host_fingerprint=cred.host_fingerprint)
-    tcp_ok, tcp_reason = tcp_probe(target, timeout=8)
-    if not tcp_ok:
-        msg = (f"Apply refused: {new_hostname}:{new_port} TCP unreachable "
-               f"({tcp_reason}). Either the rule doesn't cover this IP "
-               f"or the engine isn't online — use Overwrite credential "
-               f"if you want to rotate the password.")
-        _log_activity("ssh", "apply", "failed", target_label, msg)
-        return _err(msg, http=200)
-    auth_ok, auth_reason = verify_credential(target, payload)
-    if not auth_ok:
-        msg = (f"Apply refused: SSH auth failed against "
-               f"{new_hostname}:{new_port} ({auth_reason}). The stored "
-               f"password doesn't match what's on this node — use "
-               f"Overwrite credential to rotate via SMC.")
-        _log_activity("ssh", "apply", "failed", target_label, msg)
-        return _err(msg, http=200)
+    # Audit L15 (2026-06-11): take the same per-engine lock as
+    # bootstrap / force-reset so an Apply racing a password rotation
+    # can't verify against the OLD password and commit "ok" metadata
+    # while the rotation invalidates it underneath.
+    try:
+        with engine_bootstrap_lock(engine_name):
+            # Live verify against the new target before committing. Apply
+            # must never silently break a previously-working credential —
+            # if the operator points us at an IP that doesn't actually
+            # accept this credential, refuse and tell them to use
+            # Overwrite.
+            target = SSHTarget(hostname=dial_host, port=new_port,
+                               username=new_username)
+            payload = SSHCredential(password=cred.encrypted_password,
+                                    host_fingerprint=cred.host_fingerprint)
+            tcp_ok, tcp_reason = tcp_probe(target, timeout=8)
+            if not tcp_ok:
+                msg = (f"Apply refused: {new_hostname}:{new_port} TCP unreachable "
+                       f"({tcp_reason}). Either the rule doesn't cover this IP "
+                       f"or the engine isn't online — use Overwrite credential "
+                       f"if you want to rotate the password.")
+                _log_activity("ssh", "apply", "failed", target_label, msg)
+                return _err(msg, http=200)
+            auth_ok, auth_reason = verify_credential(target, payload)
+            if not auth_ok:
+                msg = (f"Apply refused: SSH auth failed against "
+                       f"{new_hostname}:{new_port} ({auth_reason}). The stored "
+                       f"password doesn't match what's on this node — use "
+                       f"Overwrite credential to rotate via SMC.")
+                _log_activity("ssh", "apply", "failed", target_label, msg)
+                return _err(msg, http=200)
 
-    # All good — commit metadata.
-    now = datetime.now(timezone.utc)
-    old_summary = (f"hostname={cred.hostname!r} port={cred.ssh_port} "
-                   f"user={cred.ssh_username!r} "
-                   f"override={cred.connect_ip_override!r}")
-    cred.hostname = new_hostname
-    cred.ssh_port = new_port
-    cred.ssh_username = new_username
-    cred.connect_ip_override = new_connect_ip_override
-    cred.last_verified_at = now
-    cred.last_verify_status = "ok"
-    cred.last_error = ""
-    cred.state_refreshed_at = now
-    db.session.commit()
+            # All good — commit metadata.
+            now = datetime.now(timezone.utc)
+            old_summary = (f"hostname={cred.hostname!r} port={cred.ssh_port} "
+                           f"user={cred.ssh_username!r} "
+                           f"override={cred.connect_ip_override!r}")
+            cred.hostname = new_hostname
+            cred.ssh_port = new_port
+            cred.ssh_username = new_username
+            cred.connect_ip_override = new_connect_ip_override
+            cred.last_verified_at = now
+            cred.last_verify_status = "ok"
+            cred.last_error = ""
+            cred.state_refreshed_at = now
+            db.session.commit()
+    except RuntimeError as exc:
+        # engine_bootstrap_lock timeout — another op owns the engine.
+        return _err(str(exc), http=409)
 
     _log_activity(
         "ssh", "apply", "ok", target_label,

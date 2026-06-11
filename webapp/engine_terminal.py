@@ -155,8 +155,13 @@ class TerminalBridge:
         except Exception:
             return
         if data.get("type") == "resize":
-            cols = int(data.get("cols", 120))
-            rows = int(data.get("rows", 32))
+            # Audit L7 (2026-06-11): clamp client-supplied dimensions —
+            # a hostile frame must not hand paramiko absurd PTY sizes.
+            try:
+                cols = max(1, min(1000, int(data.get("cols", 120))))
+                rows = max(1, min(1000, int(data.get("rows", 32))))
+            except (TypeError, ValueError):
+                return
             try:
                 self.channel.resize_pty(width=cols, height=rows)
             except Exception:

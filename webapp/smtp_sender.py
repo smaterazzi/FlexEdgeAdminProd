@@ -70,6 +70,43 @@ class SmtpSettings:
     timeout: float = 30.0
 
 
+# Ports where an unencrypted login would transit the public internet
+# in cleartext. 25 = MTA relay, 465 = SMTPS, 587 = submission.
+_PUBLIC_SUBMISSION_PORTS = frozenset({25, 465, 587})
+
+
+def plain_mode_refusal(host: str, port: int) -> str:
+    """Enforce the documented ``plain`` restriction (audit S2, 2026-06-11).
+
+    Returns a human-readable refusal reason, or ``""`` when the
+    combination is acceptable. ``plain`` on a public submission port
+    is only allowed when every resolved address for ``host`` is
+    private/loopback (a self-hosted relay inside the ops network) —
+    otherwise the SMTP password would cross the internet unencrypted.
+    """
+    import ipaddress
+    import socket
+
+    if port not in _PUBLIC_SUBMISSION_PORTS:
+        return ""
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+        resolved = {info[4][0] for info in infos}
+    except OSError as exc:
+        return (f"could not resolve {host!r} to verify it is an internal "
+                f"relay ({exc}) — plain (no TLS) mode is only allowed for "
+                f"hosts inside the private network. Use STARTTLS or SSL.")
+    public = sorted(
+        a for a in resolved if ipaddress.ip_address(a).is_global
+    )
+    if public:
+        return (f"{host} resolves to public address(es) "
+                f"{', '.join(public)} — refusing plain (no TLS) mode on "
+                f"port {port}: the SMTP password would cross the internet "
+                f"unencrypted. Use STARTTLS or SSL instead.")
+    return ""
+
+
 def _dry_run_active() -> bool:
     return os.environ.get("FEA_SMTP_DRY_RUN", "").strip() in ("1", "true", "yes")
 

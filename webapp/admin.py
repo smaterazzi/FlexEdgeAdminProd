@@ -1127,6 +1127,7 @@ def log_settings():
         if action == "save":
             mode = (request.form.get("log_mode") or "normal").strip().lower()
             mode = "verbose" if mode == "verbose" else "normal"
+            previous_mode = current_log_mode()
             set_setting("log_mode", mode, by_email=me_email)
 
             try:
@@ -1134,6 +1135,14 @@ def log_settings():
             except ValueError:
                 days = 90
             set_setting("log_retention_days", str(days), by_email=me_email)
+
+            # Audit L13 (2026-06-11): verbose mode persists every op()
+            # call — with a long retention window the table grows fast.
+            if mode == "verbose" and previous_mode != "verbose" and days >= 30:
+                flash(f"Verbose log mode is ON with a {days}-day retention "
+                      f"window — platform_logs will grow quickly. Consider "
+                      f"lowering retention below 30 days while verbose is "
+                      f"active.", "warning")
 
             for feature in list_features():
                 key = f"feature_log_{feature['name']}"

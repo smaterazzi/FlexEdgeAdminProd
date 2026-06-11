@@ -23,9 +23,11 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 
+from sqlalchemy import func
+
 from shared.db import db
 from shared.logging import audit, get_setting, set_setting
-from webapp.models import EngineScanRecord
+from webapp.models import EngineScanHost, EngineScanRecord
 from webapp.scan_history import service
 
 log = logging.getLogger("scan_history.retention")
@@ -103,47 +105,71 @@ def sweep_retention(domain) -> SweepReport:
 
     if mode == "days":
         cutoff = _utcnow() - timedelta(days=value)
-        eligible = (EngineScanRecord.query
-                    .filter(EngineScanRecord.domain_id == domain.id,
-                            EngineScanRecord.starred.is_(False),
-                            EngineScanRecord.started_at < cutoff)
-                    .all())
+        eligible_ids = [
+            row[0] for row in
+            (EngineScanRecord.query
+             .filter(EngineScanRecord.domain_id == domain.id,
+                     EngineScanRecord.starred.is_(False),
+                     EngineScanRecord.started_at < cutoff)
+             .with_entities(EngineScanRecord.id)
+             .all())
+        ]
         kept_recent = (EngineScanRecord.query
                        .filter(EngineScanRecord.domain_id == domain.id,
                                EngineScanRecord.starred.is_(False),
                                EngineScanRecord.started_at >= cutoff)
                        .count())
     else:  # count mode — keep latest N per (engine, iface)
-        # Group by scope; for each scope, identify rows beyond rank N.
-        rows = (EngineScanRecord.query
-                .filter(EngineScanRecord.domain_id == domain.id)
-                .order_by(EngineScanRecord.engine_name.asc(),
-                          EngineScanRecord.source_iface_label.asc(),
-                          EngineScanRecord.started_at.desc())
-                .all())
-        eligible: list[EngineScanRecord] = []
-        kept_recent = 0
-        per_scope_count: dict[tuple[str, str], int] = {}
-        for r in rows:
-            scope = (r.engine_name or "", r.source_iface_label or "")
-            per_scope_count[scope] = per_scope_count.get(scope, 0) + 1
-            rank = per_scope_count[scope]
-            if r.starred:
-                continue
-            if rank <= value:
-                kept_recent += 1
-            else:
-                eligible.append(r)
+        # Audit M6 (2026-06-11): rank rows SQL-side with a window
+        # function instead of materialising every ORM row in memory.
+        # Rank counts ALL rows per scope (starred included — they
+        # occupy retention slots, same as the previous Python logic);
+        # only non-starred rows beyond rank N are deleted.
+        rk = func.row_number().over(
+            partition_by=(EngineScanRecord.engine_name,
+                          EngineScanRecord.source_iface_label),
+            order_by=EngineScanRecord.started_at.desc(),
+        ).label("rk")
+        ranked = (db.session.query(
+                      EngineScanRecord.id.label("id"),
+                      EngineScanRecord.starred.label("starred"),
+                      rk)
+                  .filter(EngineScanRecord.domain_id == domain.id)
+                  .subquery())
+        eligible_ids = [
+            row[0] for row in
+            db.session.query(ranked.c.id)
+            .filter(ranked.c.rk > value, ranked.c.starred.is_(False))
+            .all()
+        ]
+        nonstarred_total = (EngineScanRecord.query
+                            .filter(EngineScanRecord.domain_id == domain.id,
+                                    EngineScanRecord.starred.is_(False))
+                            .count())
+        kept_recent = nonstarred_total - len(eligible_ids)
 
+    # Audit L10 (2026-06-11): bulk DELETEs instead of per-row ORM
+    # deletes — the ORM path issued one child-host DELETE per scan via
+    # the cascade. Chunked to stay under SQLite's bind-parameter cap.
     deleted = 0
-    for r in eligible:
+    _CHUNK = 400
+    try:
+        for i in range(0, len(eligible_ids), _CHUNK):
+            chunk = eligible_ids[i:i + _CHUNK]
+            (db.session.query(EngineScanHost)
+             .filter(EngineScanHost.scan_id.in_(chunk))
+             .delete(synchronize_session=False))
+            deleted += (db.session.query(EngineScanRecord)
+                        .filter(EngineScanRecord.id.in_(chunk))
+                        .delete(synchronize_session=False))
+        if deleted:
+            db.session.commit()
+    except Exception as exc:
+        log.warning("retention bulk delete failed: %s", exc)
         try:
-            db.session.delete(r)
-            deleted += 1
-        except Exception as exc:
-            log.warning("delete scan #%s failed: %s", r.id, exc)
-    if deleted:
-        db.session.commit()
+            db.session.rollback()
+        except Exception:
+            pass
 
     audit(service.FEATURE, "retention.sweep",
           target=f"domain={domain.id}",

@@ -121,12 +121,31 @@ _HANDLERS: dict[str, Callable] = {}
 
 
 def register_handler(operation: str):
-    """Decorator to attach a handler to an operation type."""
+    """Decorator to attach a handler to an operation type.
+
+    Audit L6 (2026-06-11): a DIFFERENT function re-registering an
+    operation now raises instead of silently replacing — that was a
+    developer footgun (a copy-pasted handler name would hijack an
+    existing operation with only a log line to show for it).
+    Re-registering the *same* function stays a no-op so dual import
+    paths (``webapp.x`` vs ``x``) don't explode.
+    """
     def decorator(fn: Callable) -> Callable:
-        if operation in _HANDLERS:
-            log.warning("queue_runner: handler for operation=%s being "
-                        "replaced (was %s, now %s)",
-                        operation, _HANDLERS[operation].__name__, fn.__name__)
+        existing = _HANDLERS.get(operation)
+        if existing is not None:
+            # "Same function" = same source location — robust against the
+            # module being imported under two names (webapp.x vs x).
+            def _loc(f):
+                code = getattr(f, "__code__", None)
+                return (getattr(code, "co_filename", None),
+                        getattr(code, "co_firstlineno", None))
+            if _loc(existing) != _loc(fn):
+                raise ValueError(
+                    f"queue_runner: handler for operation={operation!r} "
+                    f"already registered ({existing.__name__}); refusing to "
+                    f"replace with {fn.__name__}. Pick a distinct operation "
+                    f"name or remove the stale registration."
+                )
         _HANDLERS[operation] = fn
         return fn
     return decorator
@@ -537,7 +556,13 @@ def push_one(change_id: int) -> PushResult:
         return PushResult(failed=True, change_id=change_id,
                           state="push_failed", error=msg)
 
-    _audit("push.start", change)
+    # Audit L12 (2026-06-11): commit=False — the push.start row rides
+    # the outcome transaction (_mark_pushed / _mark_push_failed both
+    # commit), halving the runner's per-row audit commits. On a
+    # process kill mid-handler the start marker is lost along with the
+    # outcome, but the stuck state='pushing' row already surfaces that
+    # case to operators (C7 UI).
+    _audit("push.start", change, commit=False)
 
     try:
         cfg = _smc_cfg_for_change(change)
@@ -551,15 +576,10 @@ def push_one(change_id: int) -> PushResult:
         from webapp.smc_tls_client import smc_session
         with smc_session(cfg):
             result: HandlerResult = handler(change, cfg)
-    except BaseException as exc:
-        # Catch BaseException to handle KeyboardInterrupt/SystemExit too —
-        # ensures the row is marked push_failed instead of stuck in "pushing".
+    except Exception as exc:
         log.exception("queue_runner: handler raised (change=#%s op=%s)",
                       change.id, change.operation)
         _mark_push_failed(change, f"Handler raised: {exc!s}")
-        # Re-raise KeyboardInterrupt/SystemExit so signals propagate properly.
-        if isinstance(exc, (KeyboardInterrupt, SystemExit)):
-            raise
         return PushResult(failed=True, change_id=change_id,
                           state="push_failed", error=str(exc))
 

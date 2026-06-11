@@ -10,8 +10,6 @@ Executes the full pipeline for a single TLSDeployment:
 """
 import logging
 from datetime import datetime, timezone
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
 
 from shared.db import db
 from webapp.models import (
@@ -63,23 +61,6 @@ def execute_deployment_inside_session(dep: TLSDeployment,
     expanded-detail view (Q19/b).
     """
     result = DeployResult()
-
-    # Pre-flight: check certificate is not expired
-    try:
-        cert = x509.load_pem_x509_certificate(
-            cert_fullchain.encode("utf-8"), default_backend())
-        now = datetime.now(timezone.utc)
-        if cert.not_valid_after_utc < now:
-            result.add_step("check_expiration", "failed",
-                            f"Certificate expired on {cert.not_valid_after_utc.isoformat()}")
-            result.error = f"Certificate expired on {cert.not_valid_after_utc.date()}"
-            return result
-        result.add_step("check_expiration", "ok",
-                        f"Valid until {cert.not_valid_after_utc.date()}")
-    except Exception as e:
-        result.add_step("check_expiration", "warning",
-                        f"Could not parse certificate: {e}")
-
     tls_cred_name = f"LE-{dep.service_name}"
     section_name = f"Service {dep.service_name} - TLS Protection"
 

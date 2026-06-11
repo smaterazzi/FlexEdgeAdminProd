@@ -51,15 +51,11 @@
     </div>
 {% endif %}
 
-{% if sweep_report %}
+{% if sweep_started %}
     <div class="alert alert-light border d-flex align-items-center small">
         <i class="bi bi-info-circle me-2"></i>
-        Lazy sweep ran {{ sweep_report.started_at.strftime('%Y-%m-%d %H:%M UTC') }} —
-        considered <strong>{{ sweep_report.certs_considered }}</strong> cert(s) across
-        <strong>{{ sweep_report.domains_considered }}</strong> Domain(s);
-        sent <strong>{{ sweep_report.sends_ok }}</strong> ok,
-        <strong>{{ sweep_report.sends_failed }}</strong> failed,
-        skipped <strong>{{ sweep_report.certs_no_threshold_due }}</strong> not-yet-due.
+        Hourly alert sweep started in the background — outcomes land on the
+        <a href="{{ url_for('tls.expirations_notifications') }}" class="ms-1">notification log</a>.
     </div>
 {% endif %}
 

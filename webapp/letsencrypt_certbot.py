@@ -406,7 +406,9 @@ def test_http01_reachability(*, fqdn: str,
     Always returns a ReachabilityResult; never raises. The operator
     sees one row per test in the audit log + an inline banner.
     """
+    import ipaddress
     import secrets
+    import socket
     import time
     from urllib.request import Request, urlopen
     from urllib.error import URLError, HTTPError
@@ -416,6 +418,37 @@ def test_http01_reachability(*, fqdn: str,
 
     if not fqdn or "/" in fqdn:
         out.error = "fqdn is required and must not contain '/'"
+        return out
+
+    # SSRF guard (audit S1, 2026-06-11): the FQDN comes from a cert row
+    # the Domain Admin controls (via their self-service allowlist), so
+    # without this check the probe doubles as an internal port scanner
+    # (127.0.0.1, 169.254.169.254, RFC1918). LE's validator can only
+    # ever reach public addresses, so refusing non-global targets loses
+    # nothing legitimate.
+    try:
+        ipaddress.ip_address(fqdn.strip("[]"))
+        out.error = ("fqdn is an IP literal — reach-test only probes "
+                     "public DNS names (Let's Encrypt would refuse an "
+                     "IP-based order too)")
+        return out
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(fqdn, 80, proto=socket.IPPROTO_TCP)
+        resolved = {info[4][0] for info in infos}
+    except OSError as exc:
+        out.error = (f"DNS resolution failed for {fqdn}: {exc}. "
+                     f"LE's validator would fail the same way.")
+        return out
+    non_global = sorted(
+        a for a in resolved if not ipaddress.ip_address(a).is_global
+    )
+    if non_global:
+        out.error = (f"{fqdn} resolves to non-public address(es) "
+                     f"{', '.join(non_global)} — refusing the probe. "
+                     f"LE's validator could never reach it, and probing "
+                     f"private address space from FEA is not allowed.")
         return out
 
     ensure_webroot()

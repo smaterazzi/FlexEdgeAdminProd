@@ -23,6 +23,7 @@ from flask import (
 )
 
 from shared.db import db
+from webapp.auth_roles import domain_admin_required
 from webapp.certbot_reader import discover_certificates, file_sha256
 from webapp.models import (
     ApiKey, ManagedCertificate, Tenant,
@@ -318,10 +319,18 @@ def certificates_import_pfx():
     password = request.form.get("password", "")
     domain_override = (request.form.get("domain_override") or "").strip().lower()
 
+    # Audit P6 (2026-06-11): cap the upload before buffering the whole
+    # bundle in memory. Real-world enterprise .pfx files are <100 KB;
+    # 10 MB is generous headroom for absurd CA chains.
+    _PFX_MAX_BYTES = 10 * 1024 * 1024
     try:
-        pfx_bytes = pfx_file.read()
+        pfx_bytes = pfx_file.read(_PFX_MAX_BYTES + 1)
     except Exception as exc:
         flash(f"Failed to read uploaded file: {exc}", "danger")
+        return redirect(url_for("tls.certificates_import_pfx"))
+    if len(pfx_bytes) > _PFX_MAX_BYTES:
+        flash("PFX file too large (max 10 MB) — that is not a valid "
+              "PKCS#12 bundle.", "danger")
         return redirect(url_for("tls.certificates_import_pfx"))
 
     try:
@@ -796,7 +805,7 @@ def hook_install():
 # ── Cert expirations dashboard + SMTP alerts (2026-05-31) ───────────────
 
 @tls_bp.route("/expirations")
-@admin_required
+@domain_admin_required
 def expirations_dashboard():
     """Per-Domain cert-expiration dashboard with auto-alert sweep."""
     from webapp import cert_expirations
@@ -805,7 +814,9 @@ def expirations_dashboard():
     views = cert_expirations.build_views_for_domain(domain_id)
     user_email = (session.get("user") or {}).get("email", "")
     # Lazy-sweep — fires once per hour from any visit; never raises.
-    sweep_report = cert_expirations.ensure_lazy_expiration_sweep(
+    # Runs in a background thread since audit P1 (2026-06-11) so the
+    # page render never waits on SMTP.
+    sweep_started = cert_expirations.ensure_lazy_expiration_sweep(
         triggered_by_user_email=user_email,
     )
     smtp_cfg = None
@@ -814,12 +825,12 @@ def expirations_dashboard():
         smtp_cfg = SmtpConfig.query.filter_by(domain_id=domain_id).first()
     return render_template(
         "tls/expirations.html",
-        views=views, sweep_report=sweep_report, smtp_cfg=smtp_cfg,
+        views=views, sweep_started=sweep_started, smtp_cfg=smtp_cfg,
     )
 
 
 @tls_bp.route("/expirations/notifications")
-@admin_required
+@domain_admin_required
 def expirations_notifications():
     """Audit-style log of every cert-expiration alert sent."""
     from webapp import cert_expirations
@@ -833,7 +844,7 @@ def expirations_notifications():
 
 
 @tls_bp.route("/expirations/sweep", methods=["POST"])
-@admin_required
+@domain_admin_required
 def expirations_sweep_now():
     """Operator-clicked manual sweep (bypasses the 1h gate)."""
     from webapp import cert_expirations
@@ -853,7 +864,7 @@ def expirations_sweep_now():
 
 
 @tls_bp.route("/smtp", methods=["GET", "POST"])
-@admin_required
+@domain_admin_required
 def smtp_config():
     """Per-Domain SMTP configuration CRUD."""
     from webapp.models import SmtpConfig
@@ -879,6 +890,12 @@ def smtp_config():
         security = (request.form.get("security") or "starttls").strip().lower()
         if security not in ("starttls", "ssl", "plain"):
             security = "starttls"
+        if security == "plain":
+            from webapp.smtp_sender import plain_mode_refusal
+            refusal = plain_mode_refusal(host, port) if host else ""
+            if refusal:
+                flash(f"Refusing plain (no TLS) mode: {refusal}", "danger")
+                return redirect(url_for("tls.smtp_config"))
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password", "")
         # Preserve existing password when the field is blank on edit —
@@ -945,7 +962,7 @@ def smtp_config():
 
 
 @tls_bp.route("/smtp/test", methods=["POST"])
-@admin_required
+@domain_admin_required
 def smtp_test():
     """Send a smoke-test email using the saved SMTP config."""
     from webapp.models import SmtpConfig

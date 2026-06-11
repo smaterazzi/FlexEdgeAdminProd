@@ -233,17 +233,16 @@ def list_certs():
     Best-effort: failures log + swallow so the cert list still
     renders even if SMC or the scheduler are unhealthy.
     """
-    # Trigger the lazy sweep BEFORE the list query so this Domain's
-    # operator sees any freshly-enqueued renewals immediately.
+    # Trigger the lazy sweep — runs in a background thread since audit
+    # P4 (2026-06-11) so the cert list never stalls behind certbot /
+    # queue pushes. Enqueued renewals surface on /tls/letsencrypt/requests
+    # and in the per-cert status on the next page load.
     try:
         from webapp.letsencrypt_scheduler import ensure_lazy_renewal_sweep
-        sweep_report = ensure_lazy_renewal_sweep(
-            triggered_by_user_email=_operator_email(),
-        )
-        if sweep_report and sweep_report.enqueued > 0:
-            flash(f"LE renewal sweep: enqueued {sweep_report.enqueued} due "
-                  f"cert(s) for renewal. See /tls/letsencrypt/requests for "
-                  f"per-cert status.", "info")
+        if ensure_lazy_renewal_sweep(triggered_by_user_email=_operator_email()):
+            flash("LE renewal sweep started in the background — any due "
+                  "certs get enqueued for renewal. See "
+                  "/tls/letsencrypt/requests for per-cert status.", "info")
     except Exception as exc:
         log.warning("LE renewal lazy-sweep skipped: %s", exc)
 
@@ -372,25 +371,11 @@ def cert_new():
         from webapp.letsencrypt_queue import (
             enqueue_cert_request, try_auto_push_for_admins,
         )
-        from sqlalchemy.exc import IntegrityError
-        try:
-            cert, change = enqueue_cert_request(
-                fqdn=fqdn, domain=domain, is_staging=is_staging,
-                requested_by_user_id=_current_user_id(),
-                account=account, challenge_type=challenge_type,
-            )
-        except IntegrityError:
-            # Race condition: another request created the cert between
-            # our duplicate check and commit.
-            db.session.rollback()
-            existing = ManagedCertificate.query.filter_by(domain=fqdn).first()
-            if existing:
-                flash(f"A certificate for {fqdn!r} was just created by another "
-                      f"request (id #{existing.id}).", "warning")
-                return redirect(url_for("letsencrypt.cert_detail",
-                                        cert_id=existing.id))
-            flash(f"Database constraint error for {fqdn!r}. Please retry.", "danger")
-            return _rerender()
+        cert, change = enqueue_cert_request(
+            fqdn=fqdn, domain=domain, is_staging=is_staging,
+            requested_by_user_id=_current_user_id(),
+            account=account, challenge_type=challenge_type,
+        )
         try:
             from shared.logging import audit
             audit(

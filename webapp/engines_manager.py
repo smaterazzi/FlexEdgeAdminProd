@@ -171,8 +171,15 @@ def list_tcp_services_for_picker(domain_id: int, cfg: dict) -> list[dict]:
     return out
 
 
-def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
+def resolve_port_services(domain_id: int, cfg: dict,
+                          tcp_only: bool = False) -> dict[int, str]:
     """Build a ``{port: service_name}`` map from cached SMC tcp/udp_services.
+
+    ``tcp_only=True`` (audit CE1, 2026-06-11) skips the udp_services
+    fetch — the scan picker only labels TCP chips, so paying a second
+    SMC roundtrip on a cold cache bought nothing there. The result page
+    keeps the default both-protocol map (shared-port services like
+    53/DNS get named from either list).
 
     Reuses the shared SMC Explorer cache sections (``element_list.tcp_services``
     / ``element_list.udp_services``) via ``domain_objects.elements`` so
@@ -200,7 +207,8 @@ def resolve_port_services(domain_id: int, cfg: dict) -> dict[int, str]:
 
     domain = Domain.query.get(domain_id)
     elements: list[dict] = []
-    for type_key in ("tcp_services", "udp_services"):
+    type_keys = ("tcp_services",) if tcp_only else ("tcp_services", "udp_services")
+    for type_key in type_keys:
         try:
             data, _cv = domain_objects.elements(
                 domain, cfg, type_key, "", False)
@@ -687,7 +695,10 @@ def tools_scan():
             domain_id = domain_obj.id if domain_obj else 0
             cfg = _user_cfg()
             tcp_services_for_picker = list_tcp_services_for_picker(domain_id, cfg)
-            picker_port_services_map = resolve_port_services(domain_id, cfg)
+            # CE1: TCP-only — the picker labels TCP chips exclusively,
+            # so the UDP fetch was a wasted cold-cache SMC roundtrip.
+            picker_port_services_map = resolve_port_services(
+                domain_id, cfg, tcp_only=True)
         except Exception as exc:
             log.warning("picker service lists failed: %s", exc)
 
@@ -829,6 +840,15 @@ def tools_scan_start():
         if target_mode == "single_ip":
             if not single_ip:
                 flash("Single-IP mode needs an IP.", "warning")
+                return redirect(url_for("engines.tools_scan"))
+            # Audit L8 (2026-06-11): validate up-front. shlex.quote
+            # downstream already neutralises injection — this just turns
+            # "noisy remote errors" into an immediate, clear refusal.
+            import ipaddress as _ipaddress
+            try:
+                _ipaddress.ip_address(single_ip)
+            except ValueError:
+                flash(f"'{single_ip}' is not a valid IP address.", "danger")
                 return redirect(url_for("engines.tools_scan"))
             ip_list = [single_ip]
             target_label = f"{engine_name}/{iface_label} → {single_ip}"
