@@ -69,7 +69,14 @@ from webapp.dhcp_bootstrap import (
 
 # Circular-safe: dhcp_manager imports THIS module at the bottom of its
 # file, so every name below already exists when this import executes.
-from webapp.dhcp_manager import (
+#
+# IMPORTANT: bare `dhcp_manager`, NOT `webapp.dhcp_manager`. app.py
+# registers the blueprint via `from dhcp_manager import dhcp_bp` (bare),
+# and under Python the bare and dotted module paths are TWO separate
+# module objects with TWO separate `dhcp_bp` instances. We must
+# decorate the SAME instance app.py registers, or every
+# /dhcp/credentials/* route 404s.
+from dhcp_manager import (
     dhcp_bp, admin_required,
     _log_activity, _smc_cfg,
     _check_stale_form_or_response,
