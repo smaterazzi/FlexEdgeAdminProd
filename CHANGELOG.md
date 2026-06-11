@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-06-11
+## [2.2.0-dev] - 2026-04-29 → 2026-06-12
+
+### Credential Manager extraction + caching close-out + docs coherence (2026-06-12)
+
+Three follow-ups from the post-review TODO triage, plus a documentation-coherence pass.
+
+**Credential Manager extracted from `dhcp_manager.py`.** The engine SSH credential feature — status-aware enrollment wizard, per-Domain + per-engine source-IP, node discovery, SSH-allow-rule lifecycle (install / policy push / source overwrite-add / remove), and per-node bootstrap / apply / verify / force-reset / delete — moved to a dedicated [webapp/credentials_manager.py](webapp/credentials_manager.py) (~1,880 lines). `dhcp_manager.py` shrank 5,311 → 2,985 lines. **Behaviour-preserving by contract:** the new module registers its routes on dhcp_manager's existing `dhcp_bp`, so every URL (`/dhcp/credentials/*`) and endpoint name (`dhcp.credentials_*`) is unchanged — no operator-bookmark or template `url_for` churn. The import is circular-safe (dhcp_manager imports credentials_manager at the bottom of its file, after `dhcp_bp` + shared helpers are defined); the three helpers `_cred_to_target` / `_cred_to_payload` / `_operator_email` stay in dhcp_manager because the leases viewer + subnet scan use them too. Verified by importing both modules and asserting all 15 `dhcp.credentials_*` endpoints attach.
+
+**Q11 — drift detector → cache invalidation (closes the caching plan).** After [shared/smc_drift.py](shared/smc_drift.py) `scan_domain_drift` flags rows `drifted`/`gone`, it now drops the matching read-cache sections for every drifted type; `reconcile_one` does the same when an operator accepts a drift. Out-of-band SMC changes become visible in FEA's listings on the next read instead of after TTL. Implemented via a new shared `shared/smc_cache.invalidate_for_smc_type()` + `SMC_TYPE_TO_BROWSE_KEY` map — which **also fixes a latent bug in the queue runner**: its post-push invalidation dropped `element_list.host` (singular `smc_type`), which never matched the real `element_list.hosts` section, so browse caches silently survived element pushes until TTL. Both paths now share one singular→plural mapping.
+
+**M10 — process-local cache invalidation closed (accepted-and-documented).** The Redis swap stays deferred; closed the actionable half — audited every cached page for a `?refresh=1` control and added the one missing case ([webapp/templates/policy_rules.html](webapp/templates/policy_rules.html) freshness badge + Refresh button). Standing rule reaffirmed in CLAUDE.md.
+
+**Documentation coherence.** New standing rule in CLAUDE.md § Documentation coherence: docs update in the same commit as the code, and **every primary process gets a Mermaid `.mmd` flow diagram** under [docs/flows/](docs/flows/). Seeded eight diagrams (credential enrollment, change-management queue, Let's Encrypt lifecycle, TLS deployment, SMC read cache, migration workflow, DHCP reservation deploy, drift detection) + an index/conventions README; all validated through mermaid-cli. Reconciled stale CLAUDE.md status markers (browser SSH terminal is landed, not "Phase B planned"; added `credentials_manager.py` + `cache_warmer.py` to the project tree).
 
 ### Security & performance review #2 (2026-06-11) — four fix batches
 
