@@ -484,6 +484,49 @@ def invalidate(section: str, key_parts=None) -> int:
         return 0
 
 
+# Registry smc_type (singular, as stored on `smc_objects.smc_type` and
+# `PendingChange` payloads) → browse type_key (plural, as baked into the
+# `element_list.<key>` / `element.<key>` section names by
+# `webapp.domain_objects.elements`). Q11 (2026-06-12): centralised here
+# because BOTH invalidation paths (queue push + drift detector) need it —
+# the queue runner previously dropped `element_list.host` (singular),
+# which never matched the real `element_list.hosts` section, so browse
+# caches silently survived pushes until TTL.
+SMC_TYPE_TO_BROWSE_KEY = {
+    "host":          "hosts",
+    "network":       "networks",
+    "address_range": "address_ranges",
+    "fqdn":          "domain_names",
+    "zone":          "zones",
+    "group":         "groups",
+    "service_group": "service_groups",
+    "tcp_service":   "tcp_services",
+    "udp_service":   "udp_services",
+    "ip_service":    "ip_services",
+    "icmp_service":  "icmp_services",
+}
+
+
+def invalidate_for_smc_type(smc_type: str) -> int:
+    """Drop the browse-cache sections backing a registry ``smc_type``.
+
+    Drops the whole ``element_list.<key>`` + ``element.<key>`` sections
+    (over-invalidation is cheap; per-name precision isn't worth the key
+    bookkeeping), plus ``dhcp_host`` for hosts (they back DHCP
+    reservations). Unknown types fall back to the raw name so a future
+    type at least invalidates *something*. Returns entries removed.
+    """
+    st = (smc_type or "").strip()
+    if not st:
+        return 0
+    key = SMC_TYPE_TO_BROWSE_KEY.get(st, st)
+    n = invalidate(f"element_list.{key}")
+    n += invalidate(f"element.{key}")
+    if st == "host":
+        n += invalidate("dhcp_host")
+    return n
+
+
 def peek(section: str, key_parts):
     """Return the cached payload for ``(section, key_parts)`` without
     triggering a fetch. Returns ``None`` on miss.

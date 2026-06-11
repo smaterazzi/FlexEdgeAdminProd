@@ -320,6 +320,26 @@ def scan_domain_drift(domain, progress_cb=None) -> DriftReport:
 
     report.finished_at = datetime.now(timezone.utc)
 
+    # Q11 (caching plan, landed 2026-06-12): an out-of-band SMC change
+    # was just confirmed for every drifted/gone row — the read cache for
+    # those element types is stale by definition. Drop the matching
+    # `element_list.<type>` / `element.<type>` sections (+ `dhcp_host`
+    # for hosts) so the next listing reads fresh. One drop per distinct
+    # type, after the loop. The manual Refresh-from-SMC button stays as
+    # the operator-facing override.
+    drifted_types = {
+        r.smc_type for r in report.rows
+        if r.state in ("drifted", "gone") and r.smc_type
+    }
+    if drifted_types:
+        try:
+            from shared.smc_cache import invalidate_for_smc_type
+            dropped = sum(invalidate_for_smc_type(t) for t in drifted_types)
+            log.info("drift scan: invalidated %d cache entry(ies) for "
+                     "drifted type(s) %s", dropped, ", ".join(sorted(drifted_types)))
+        except Exception as exc:
+            log.debug("drift scan: cache invalidation failed: %s", exc)
+
     # Best-effort top-level audit entry summarising the run.
     try:
         from shared.logging import audit
@@ -503,6 +523,14 @@ def reconcile_one(smc_object_id: int) -> bool:
     if live_name and row.smc_name != live_name:
         row.smc_name = live_name
     db.session.commit()
+
+    # Q11: accepting the drift means SMC's state is the new truth — the
+    # cached listings still show the pre-drift values, so drop them.
+    try:
+        from shared.smc_cache import invalidate_for_smc_type
+        invalidate_for_smc_type(row.smc_type or "")
+    except Exception as exc:
+        log.debug("reconcile_one: cache invalidation failed: %s", exc)
 
     try:
         from shared.logging import audit

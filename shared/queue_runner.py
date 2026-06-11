@@ -314,13 +314,19 @@ def _invalidate_cache_for_change(change):
         sections.append(("policy", None))
     elif smc_type:
         # Plain element types: drop the list + per-element detail so a
-        # freshly created/updated element shows up everywhere on next read.
-        sections.append((f"element_list.{smc_type}", None))
-        sections.append((f"element.{smc_type}", None))
-        # Hosts also back DHCP reservations — drop the per-host cache
-        # so the reservation editor sees the just-written values.
-        if smc_type == "host":
-            sections.append(("dhcp_host", None))
+        # freshly created/updated element shows up everywhere on next
+        # read. Q11 fix (2026-06-12): section names use the PLURAL
+        # browse key (`element_list.hosts`), not the registry's singular
+        # smc_type — `smc_cache.invalidate_for_smc_type` maps it (and
+        # also drops `dhcp_host` for hosts, which back reservations).
+        try:
+            n = smc_cache.invalidate_for_smc_type(smc_type)
+            if n:
+                log.debug("queue_runner: invalidated %d cache entry(ies) "
+                          "for smc_type=%s", n, smc_type)
+        except Exception as exc:
+            log.debug("queue_runner: cache invalidate failed for "
+                      "smc_type=%s: %s", smc_type, exc)
 
     for section, key_parts in sections:
         try:

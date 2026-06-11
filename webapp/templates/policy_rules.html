@@ -9,6 +9,28 @@
     {% if disabled_count %}
     <span class="badge bg-secondary">{{ disabled_count }} disabled</span>
     {% endif %}
+    {% if cache_meta %}
+    {# M10 (2026-06-12): freshness badge + Refresh — standing rule: every
+       cached page surfaces an unmistakable ?refresh=1 control. #}
+    <div class="d-flex align-items-center gap-2 small">
+      {% if cache_meta.served_from_cache %}
+        {% set mins = (cache_meta.age_minutes)|round(0)|int %}
+        <span class="text-muted" title="Served from process cache. Click Refresh to force a live SMC fetch.">
+          <i class="bi bi-database-check"></i>
+          cached · {{ mins if mins else '<1' }} min ago
+        </span>
+      {% else %}
+        <span class="text-success" title="Just fetched from SMC; cached for the next 1 hour.">
+          <i class="bi bi-cloud-download"></i> fresh from SMC
+        </span>
+      {% endif %}
+      <a href="{{ url_for('policy_rules', policy_name=policy_name, refresh=1) }}"
+         class="btn btn-sm btn-outline-secondary"
+         title="Force a live SMC fetch and repopulate the cache.">
+        <i class="bi bi-arrow-clockwise"></i> Refresh from SMC
+      </a>
+    </div>
+    {% endif %}
     <div class="ms-auto position-relative" style="min-width:280px;">
         <i class="bi bi-search position-absolute"
            style="top:50%; left:0.75rem; transform:translateY(-50%); color:#6c757d;"></i>
