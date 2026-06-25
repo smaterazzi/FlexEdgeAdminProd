@@ -371,11 +371,25 @@ def cert_new():
         from webapp.letsencrypt_queue import (
             enqueue_cert_request, try_auto_push_for_admins,
         )
-        cert, change = enqueue_cert_request(
-            fqdn=fqdn, domain=domain, is_staging=is_staging,
-            requested_by_user_id=_current_user_id(),
-            account=account, challenge_type=challenge_type,
-        )
+        from sqlalchemy.exc import IntegrityError
+        try:
+            cert, change = enqueue_cert_request(
+                fqdn=fqdn, domain=domain, is_staging=is_staging,
+                requested_by_user_id=_current_user_id(),
+                account=account, challenge_type=challenge_type,
+            )
+        except IntegrityError:
+            # Race condition: another request created the cert between
+            # our duplicate check and commit.
+            db.session.rollback()
+            existing = ManagedCertificate.query.filter_by(domain=fqdn).first()
+            if existing:
+                flash(f"A certificate for {fqdn!r} was just created by another "
+                      f"request (id #{existing.id}).", "warning")
+                return redirect(url_for("letsencrypt.cert_detail",
+                                        cert_id=existing.id))
+            flash(f"Database constraint error for {fqdn!r}. Please retry.", "danger")
+            return _rerender()
         try:
             from shared.logging import audit
             audit(

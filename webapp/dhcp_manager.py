@@ -3354,11 +3354,4 @@ def _validate_reservation(scope, name, address, mac, ipv6, secondary,
 # Must stay at the BOTTOM: credentials_manager imports dhcp_bp + helpers
 # defined above (circular-safe only in this order). Importing it executes
 # its @dhcp_bp.route decorators, attaching /dhcp/credentials/* here.
-#
-# Bare `import credentials_manager`, NOT `from webapp import ...`: app.py
-# loads this module via bare `from dhcp_manager import dhcp_bp`, so we
-# must keep credentials_manager on the same bare module path. Mixing bare
-# and dotted paths spawns a second dhcp_manager/credentials_manager pair
-# with a second (unregistered) dhcp_bp — the cause of the /dhcp/credentials
-# 404 after the 2026-06-12 extraction.
-import credentials_manager  # noqa: E402,F401
+from webapp import credentials_manager  # noqa: E402,F401

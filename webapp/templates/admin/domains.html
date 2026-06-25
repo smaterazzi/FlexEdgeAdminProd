@@ -91,6 +91,14 @@
                             </button>
                         </form>
                         {% endif %}
+                        <button type="button" class="btn btn-danger btn-sm py-0 px-2"
+                                title="Permanently delete (wipe all data)"
+                                data-bs-toggle="modal" data-bs-target="#hardDeleteModal"
+                                data-domain-id="{{ d.id }}"
+                                data-domain-slug="{{ d.slug }}"
+                                data-domain-name="{{ d.display_name }}">
+                            <i class="bi bi-x-octagon-fill"></i>
+                        </button>
                     </td>
                 </tr>
                 {% else %}
@@ -102,4 +110,81 @@
         </table>
     </div>
 </div>
+
+<!-- Hard-delete confirmation modal (shared, populated per-row via JS) -->
+<div class="modal fade" id="hardDeleteModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-dialog-centered">
+    <div class="modal-content bg-dark text-light border-danger">
+      <form method="POST" id="hardDeleteForm">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+        <div class="modal-header border-danger">
+          <h5 class="modal-title text-danger">
+            <i class="bi bi-exclamation-octagon-fill me-1"></i>Permanently delete Domain
+          </h5>
+          <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+        </div>
+        <div class="modal-body">
+          <p>You are about to <strong class="text-danger">irreversibly delete</strong>
+             the Domain <strong id="hdName"></strong> and <strong>all</strong> of its
+             feature data:</p>
+          <ul class="small text-muted">
+            <li>DHCP scopes, reservations, deployments, credentials &amp; SSH-allow rules</li>
+            <li>TLS deployments &amp; managed certificates</li>
+            <li>Engine scans, sgInfo archives, terminal-session records</li>
+            <li>Optimizer submissions, change-queue items &amp; the SMC object registry</li>
+            <li><strong>Operational</strong> log entries for this Domain</li>
+          </ul>
+          <p class="small mb-3">
+            <i class="bi bi-shield-check text-success me-1"></i>
+            <strong>Audit</strong> log entries are kept. Certbot certificate files on
+            disk and the parent API key are <strong>not</strong> touched.
+          </p>
+          <label class="form-label small mb-1">
+            Type the Domain slug <code id="hdSlugHint"></code> to confirm:
+          </label>
+          <input type="text" name="confirm_slug" id="hdSlugInput" autocomplete="off"
+                 class="form-control bg-dark text-light border-secondary"
+                 placeholder="domain-slug">
+        </div>
+        <div class="modal-footer border-secondary">
+          <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="submit" id="hdSubmitBtn" class="btn btn-danger" disabled>
+            <i class="bi bi-trash-fill me-1"></i>Permanently delete
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  const modal = document.getElementById('hardDeleteModal');
+  if (!modal) return;
+  const form = document.getElementById('hardDeleteForm');
+  const nameEl = document.getElementById('hdName');
+  const slugHint = document.getElementById('hdSlugHint');
+  const slugInput = document.getElementById('hdSlugInput');
+  const submitBtn = document.getElementById('hdSubmitBtn');
+  let expectedSlug = '';
+
+  modal.addEventListener('show.bs.modal', function (ev) {
+    const btn = ev.relatedTarget;
+    const id = btn.getAttribute('data-domain-id');
+    expectedSlug = btn.getAttribute('data-domain-slug') || '';
+    nameEl.textContent = btn.getAttribute('data-domain-name') || '';
+    slugHint.textContent = expectedSlug;
+    slugInput.value = '';
+    slugInput.placeholder = expectedSlug;
+    submitBtn.disabled = true;
+    form.action = '/admin/domains/' + id + '/hard-delete';
+  });
+
+  slugInput.addEventListener('input', function () {
+    submitBtn.disabled = (slugInput.value.trim() !== expectedSlug);
+  });
+
+  modal.addEventListener('shown.bs.modal', function () { slugInput.focus(); });
+})();
+</script>
 {% endblock %}

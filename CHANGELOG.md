@@ -4,7 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-06-12
+## [2.2.0-dev] - 2026-04-29 → 2026-06-25
+
+### Domain hard-delete (irreversible per-Domain purge) (2026-06-25)
+
+Added a Super-Admin **hard-delete** alongside the existing soft-delete (deactivate) on `/admin/domains`. The trash button still flips `is_active=False` and keeps all data; the new red octagon button irreversibly wipes every feature row keyed to the Domain.
+
+- **New module** [webapp/domain_purge.py](webapp/domain_purge.py) (`purge_domain(domain) -> PurgeReport`), modelled on `factory_reset.py`. FK-safe ordered bulk-delete scoped to one `domain_id`: indirect children with no `domain_id` of their own (dhcp_reservations, dhcp_deployments, engine_scan_hosts, tls_deployment_logs, cert_expiration_notifications, engine_terminal_sessions) are removed via their domain-scoped parent's id list **before** the parents; then the domain-scoped parents (tls_deployments, managed_certificates, dhcp_scopes, scan_records, sginfo_collections, credentials, ssh_access, optimizer submissions, pending_changes, smc_objects, feature_bypass_settings, cert_patterns, smtp_configs, user_domain_access); then the Domain row last. Works whether or not the FK cascade would fire — explicit deletes give per-table counts in `PurgeReport`.
+- **Logs:** deletes the legacy `dhcp_activity_logs` + `tls_activity_logs` rows and the **operational (`level='op'`) `platform_logs`** rows for the Domain; **keeps the audit-level `platform_logs`** rows (operator decision). Those audit rows get `domain_id` SET-NULL'd by the FK when the Domain row is deleted, so they render as "system" in `/logs` afterwards.
+- **Untouched:** certbot lineages on disk (`/config/letsencrypt`, reissue-free — same default as the LE delete flow) and the parent `ApiKey`/`Tenant` (shared across Domains). On-disk sgInfo archive dirs (`/config/sginfo/<id>/`) for the purged collections ARE removed (best-effort, after the DB commit).
+- **Route** `POST /admin/domains/<id>/hard-delete` ([webapp/admin.py](webapp/admin.py), `@super_admin_required`). Guarded by a typed-confirmation: the operator must type the exact Domain slug into a Bootstrap modal ([webapp/templates/admin/domains.html](webapp/templates/admin/domains.html)); the submit button stays disabled until it matches. After the purge it calls `smc_cache.invalidate_all()` and writes an `admin/domain.hard_delete` audit row recording rows-deleted / audit-logs-kept / archives-removed.
 
 ### Credential Manager extraction + caching close-out + docs coherence (2026-06-12)
 

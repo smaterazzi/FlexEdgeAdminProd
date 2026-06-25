@@ -274,6 +274,72 @@ def domain_reactivate(id):
     return redirect(url_for("admin.domains"))
 
 
+@admin_bp.route("/domains/<int:id>/hard-delete", methods=["POST"])
+@super_admin_required
+def domain_hard_delete(id):
+    """**Irreversible** wipe of a Domain + every feature row keyed to it.
+
+    Unlike `domain_delete` (which only deactivates), this destroys all
+    DHCP / TLS / Engines / Optimizer / change-management data for the
+    Domain and the OPERATIONAL platform_logs rows. AUDIT-level logs are
+    retained (they survive as "system" once the Domain row is gone).
+    Certbot lineages on disk and the parent ApiKey/Tenant are untouched.
+
+    Guarded: operator must type the exact Domain slug into `confirm_slug`.
+    """
+    from webapp import domain_purge
+
+    domain = Domain.query.get_or_404(id)
+    name = domain.display_name
+    slug = domain.slug or ""
+    confirm = (request.form.get("confirm_slug") or "").strip()
+
+    if confirm != slug:
+        flash(
+            f"Hard-delete aborted: the confirmation text did not match the "
+            f"Domain slug '{slug}'. Nothing was deleted.",
+            "danger",
+        )
+        return redirect(url_for("admin.domains"))
+
+    try:
+        report = domain_purge.purge_domain(domain)
+    except Exception as exc:
+        flash(_friendly_db_error(exc, "hard-delete the Domain"), "danger")
+        return redirect(url_for("admin.domains"))
+
+    # Cached SMC reads belonged to the now-deleted Domain — drop everything
+    # process-local so no stale entry can resolve against the freed id.
+    try:
+        from shared import smc_cache
+        smc_cache.invalidate_all()
+    except Exception:
+        pass
+
+    # Audit the destruction itself. This row lands AFTER the Domain row is
+    # gone, so it carries no domain_id (renders as "system") — intentional.
+    try:
+        from shared.logging import audit
+        audit(
+            feature="admin", action="domain.hard_delete",
+            target=f"{name} ({slug})",
+            detail=(f"rows_deleted={report.total_rows_deleted} "
+                    f"audit_logs_kept={report.audit_logs_kept} "
+                    f"sginfo_archives_deleted={len(report.files_deleted)}"),
+            status="ok",
+        )
+    except Exception:
+        pass
+
+    flash(
+        f"Domain '{name}' permanently deleted — {report.total_rows_deleted} "
+        f"feature row(s) wiped, {report.audit_logs_kept} audit-log row(s) "
+        f"kept, {len(report.files_deleted)} sginfo archive(s) removed.",
+        "warning",
+    )
+    return redirect(url_for("admin.domains"))
+
+
 # ── Users ───────────────────────────────────────────────────────────────
 
 @admin_bp.route("/users")

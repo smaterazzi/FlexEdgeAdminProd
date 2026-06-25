@@ -39,9 +39,23 @@ def generate_key_file(path: str = None) -> bytes:
     path = path or KEY_FILE
     key = Fernet.generate_key()
 
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "wb") as f:
-        f.write(MAGIC + VERSION + key)
+    dir_path = os.path.dirname(os.path.abspath(path))
+    os.makedirs(dir_path, exist_ok=True)
+
+    # Atomic write: create temp file, write, then rename.
+    # This prevents corrupted key files if the process crashes mid-write.
+    import tempfile
+    fd, tmp_path = tempfile.mkstemp(dir=dir_path, prefix=".key_")
+    try:
+        os.write(fd, MAGIC + VERSION + key)
+        os.fsync(fd)
+        os.close(fd)
+        os.rename(tmp_path, path)
+    except Exception:
+        os.close(fd) if fd else None
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
 
     try:
         os.chmod(path, 0o600)
