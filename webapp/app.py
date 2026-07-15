@@ -315,7 +315,14 @@ app.register_blueprint(acme_challenge_bp)
 
 # ── DHCP Manager ─────────────────────────────────────────────────────────
 
-from dhcp_manager import dhcp_bp, init_dhcp_manager
+# NOTE: use the `webapp.`-prefixed path (NOT bare `dhcp_manager`). The
+# credentials feature ([webapp/credentials_manager.py]) attaches its
+# `/dhcp/credentials/*` routes to `webapp.dhcp_manager.dhcp_bp`. A bare
+# `from dhcp_manager import dhcp_bp` loads a SECOND, distinct module
+# (webapp/ is on sys.path) with its own blueprint object — the app would
+# then register a `dhcp_bp` that never received the credentials routes,
+# 500ing the DHCP dashboard on `url_for('dhcp.credentials_list')`.
+from webapp.dhcp_manager import dhcp_bp, init_dhcp_manager
 init_dhcp_manager(app)
 app.register_blueprint(dhcp_bp)
 

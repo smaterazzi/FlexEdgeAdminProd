@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-06-25
 
+### Fix: DHCP dashboard + credentials 500 (blueprint dual-identity) (2026-06-25)
+
+`/dhcp/` and `/dhcp/credentials` returned `Internal Server Error`. Root cause: the credential-manager extraction (2026-06-12) attaches its `/dhcp/credentials/*` routes to `webapp.dhcp_manager.dhcp_bp`, but [webapp/app.py](webapp/app.py) registered the blueprint via a **bare** `from dhcp_manager import dhcp_bp` — because `webapp/` is on `sys.path` (Docker/gunicorn), that bare import loads a *second, distinct* `dhcp_manager` module object with its own blueprint. The app registered the copy that never received the credentials routes, so `/dhcp/credentials/*` 404'd and the dashboard 500'd on `url_for('dhcp.credentials_list')` (`werkzeug BuildError`). The 2026-06-12 verification imported both modules via the consistent `webapp.`-prefixed path, so the split never showed there. Fix: app.py now imports `from webapp.dhcp_manager import dhcp_bp, init_dhcp_manager` — the same module identity `credentials_manager`, `dhcp_pusher`, and dhcp_manager's own bottom-of-file import already use, so the app registers the blueprint the credentials routes decorate. Verified: 15 `dhcp.credentials_*` endpoints attach (47 total dhcp endpoints, was 31) and both pages return 200. Standing note added to the CLAUDE.md credential-manager compatibility contract.
+
 ### Domain hard-delete (irreversible per-Domain purge) (2026-06-25)
 
 Added a Super-Admin **hard-delete** alongside the existing soft-delete (deactivate) on `/admin/domains`. The trash button still flips `is_active=False` and keeps all data; the new red octagon button irreversibly wipes every feature row keyed to the Domain.
