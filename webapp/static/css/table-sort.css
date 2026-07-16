@@ -1,0 +1,23 @@
+/*
+ * FlexEdgeAdmin — styling for the generic sortable-table feature.
+ * See webapp/static/js/table-sort.js. Any `table.sortable-table` gets
+ * clickable headers with a ▲/▼ indicator on the active sort column.
+ */
+table.sortable-table th.fe-sortable {
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+table.sortable-table th.fe-sortable:hover {
+  color: var(--accent, #0d6efd);
+}
+table.sortable-table th .fe-sort-indicator {
+  display: inline-block;
+  width: 1em;
+  margin-left: .15em;
+  text-align: center;
+  opacity: .6;
+  font-size: .85em;
+}
+table.sortable-table th.fe-sort-asc  .fe-sort-indicator::before { content: "\25B2"; color: var(--accent, #0d6efd); }  /* ▲ */
+table.sortable-table th.fe-sort-desc .fe-sort-indicator::before { content: "\25BC"; color: var(--accent, #0d6efd); }  /* ▼ */

@@ -2,13 +2,6 @@
 {% block title %}DHCP Manager — Scopes{% endblock %}
 
 {% block content %}
-<style>
-  #scopes-table th.sortable { cursor: pointer; user-select: none; white-space: nowrap; }
-  #scopes-table th.sortable:hover { color: #0d6efd; }
-  #scopes-table th .sort-indicator { display: inline-block; width: 1em; text-align: center; opacity: .6; }
-  #scopes-table th.sort-asc  .sort-indicator::before { content: "▲"; color: #0d6efd; }
-  #scopes-table th.sort-desc .sort-indicator::before { content: "▼"; color: #0d6efd; }
-</style>
 <div class="p-4">
 <h2 class="mb-4"><i class="bi bi-diagram-3"></i> DHCP Scopes</h2>
 
@@ -93,31 +86,21 @@
   {% endif %}
   {% if scopes %}
   <div class="table-responsive">
-    <table class="table table-hover mb-0" id="scopes-table">
+    <table class="table table-hover mb-0 sortable-table">
       <thead>
         <tr>
-          <th class="sortable" data-sort-key="engine"    data-sort-type="text">Engine      <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="interface" data-sort-type="text">Interface   <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="subnet"    data-sort-type="ip">Subnet        <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="pool"      data-sort-type="ip">Pool          <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="enabled"   data-sort-type="text">Enabled     <span class="sort-indicator"></span></th>
-          <th class="sortable" data-sort-key="synced"    data-sort-type="text">Last synced <span class="sort-indicator"></span></th>
-          <th></th>
+          <th>Engine</th><th>Interface</th><th>Subnet</th>
+          <th data-sort-type="ip">Pool</th><th>Enabled</th><th>Last synced</th>
+          <th data-no-sort></th>
         </tr>
       </thead>
       <tbody>
         {% for s in scopes %}
-        <tr class="scope-row"
-            data-engine="{{ (s.engine_name or '')|lower }}"
-            data-interface="{{ (s.interface_id or '')|lower }}"
-            data-subnet="{{ (s.subnet_cidr or '').split('/')[0] }}"
-            data-pool="{{ s.dhcp_pool_start or '' }}"
-            data-enabled="{{ '1' if s.enabled_in_flexedge else '0' }}"
-            data-synced="{{ s.last_synced_from_smc_at.isoformat() if s.last_synced_from_smc_at else '' }}">
+        <tr>
           <td>{{ s.engine_name }}</td>
           <td>{{ s.interface_id }}{% if s.interface_label %} <small class="text-muted">— {{ s.interface_label }}</small>{% endif %}</td>
           <td><code>{{ s.subnet_cidr }}</code></td>
-          <td class="small">
+          <td class="small" data-sort-value="{{ s.dhcp_pool_start or '' }}">
             {% if s.dhcp_pool_start %}{{ s.dhcp_pool_start }} — {{ s.dhcp_pool_end }}{% else %}—{% endif %}
           </td>
           <td>
@@ -204,68 +187,5 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   })();
 });
-
-// ── Click-to-sort on the Tracked scopes table ───────────────────────────
-// Same pattern as the leases viewer: click a header to sort, click again
-// to toggle direction. Subnet + Pool use a numeric octet comparator so
-// 192.168.1.6 sorts before 192.168.1.69; other columns sort as strings
-// (ISO date for Last synced sorts chronologically as text).
-(function attachScopeSort() {
-  const table = document.getElementById("scopes-table");
-  if (!table) return;
-  const tbody = table.querySelector("tbody");
-  if (!tbody) return;
-  const headers = table.querySelectorAll("th.sortable");
-  let activeKey = null;
-  let activeDir = "asc";
-
-  function ipKey(s) {
-    if (!s) return [0, 0, 0, 0];
-    const parts = s.split(".");
-    if (parts.length !== 4) return [0, 0, 0, 0];
-    return parts.map(p => parseInt(p, 10) || 0);
-  }
-  function cmp(a, b) {
-    if (Array.isArray(a) && Array.isArray(b)) {
-      for (let i = 0; i < Math.max(a.length, b.length); i++) {
-        const da = a[i] ?? 0, db = b[i] ?? 0;
-        if (da !== db) return da - db;
-      }
-      return 0;
-    }
-    if (a < b) return -1;
-    if (a > b) return 1;
-    return 0;
-  }
-  function rowKey(row, sortKey, sortType) {
-    const v = row.dataset[sortKey] || "";
-    if (sortType === "ip") return ipKey(v);
-    return v;
-  }
-  function sort(sortKey, sortType, direction) {
-    const rows = Array.from(tbody.querySelectorAll("tr.scope-row"));
-    rows.sort((a, b) => {
-      const r = cmp(rowKey(a, sortKey, sortType), rowKey(b, sortKey, sortType));
-      return direction === "desc" ? -r : r;
-    });
-    rows.forEach(r => tbody.appendChild(r));
-  }
-
-  headers.forEach(th => {
-    th.addEventListener("click", () => {
-      const key = th.dataset.sortKey;
-      const type = th.dataset.sortType || "text";
-      if (activeKey === key) {
-        activeDir = (activeDir === "asc") ? "desc" : "asc";
-      } else {
-        activeKey = key;
-        activeDir = "asc";
-      }
-      headers.forEach(h => h.classList.remove("sort-asc", "sort-desc"));
-      th.classList.add(activeDir === "asc" ? "sort-asc" : "sort-desc");
-      sort(key, type, activeDir);
-    });
-  });
-})();
 </script>
 {% endblock %}

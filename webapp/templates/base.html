@@ -13,6 +13,7 @@
        fiddling. #}
     <link href="{{ url_for('static', filename='vendor/bootstrap/css/bootstrap.min.css') }}?v={{ app_version }}" rel="stylesheet">
     <link href="{{ url_for('static', filename='vendor/bootstrap-icons/bootstrap-icons.min.css') }}?v={{ app_version }}" rel="stylesheet">
+    <link href="{{ url_for('static', filename='css/table-sort.css') }}?v={{ app_version }}" rel="stylesheet">
     <style>
         :root {
             --accent: #0d6efd;
@@ -641,6 +642,7 @@
     </div>
 
     <script src="{{ url_for('static', filename='vendor/bootstrap/js/bootstrap.bundle.min.js') }}?v={{ app_version }}"></script>
+    <script src="{{ url_for('static', filename='js/table-sort.js') }}?v={{ app_version }}"></script>
     <script>
     // CSRF helpers — read the token from the meta tag and attach it to
     // every same-origin POST/PUT/PATCH/DELETE made via fetch().
