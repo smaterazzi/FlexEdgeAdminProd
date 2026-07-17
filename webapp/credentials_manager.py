@@ -667,16 +667,38 @@ def credentials_discover_nodes():
         # Aggregate destination-IP picker for the rule install:
         # node-initiated → all candidate IPs across the cluster
         # SMC-initiated  → just the primary_mgt IP per node
+        # Each entry carries `suggested`: the template pre-checks it (see
+        # credentials.html). SMC-initiated → all real IPs suggested (rule
+        # covers the whole cluster). Node-initiated → only the PUBLIC
+        # contact (NAT-exit) IPs are suggested: when FEA is public it
+        # reaches the nodes on those addresses, so they're the natural rule
+        # destination. The nodes' real interface IPs stay available (un-
+        # suggested) for topologies where 1:1 NAT rewrites the destination
+        # to the private interface IP — the operator ticks those instead.
         rule_destinations = []
         seen = set()
         for n in nodes:
             if node_initiated:
                 for a in n.addresses:
+                    # Public contact address(es) — the NAT exit IP FEA dials.
+                    # Suggested destination for node-initiated + public FEA.
+                    for ca in a.contact_addresses:
+                        pub = (ca.get("address") or "").strip()
+                        if ca.get("is_public") and pub and pub not in seen:
+                            rule_destinations.append({
+                                "address": pub,
+                                "label": f"node {n.node_index} ({n.name}) — {a.interface_id} — {pub} [public / NAT exit]",
+                                "suggested": True,
+                            })
+                            seen.add(pub)
+                    # Real interface IP — kept as a selectable (un-suggested)
+                    # fallback for NAT topologies that rewrite the destination.
                     if a.address and a.address not in seen:
                         rule_destinations.append({
                             "address": a.address,
                             "label": f"node {n.node_index} ({n.name}) — {a.interface_id} — {a.address}"
                                      + (" [primary mgt]" if a.is_primary_mgt else ""),
+                            "suggested": False,
                         })
                         seen.add(a.address)
             else:
@@ -684,6 +706,7 @@ def credentials_discover_nodes():
                     rule_destinations.append({
                         "address": n.primary_address,
                         "label": f"node {n.node_index} ({n.name}) — {n.primary_address} [primary mgt]",
+                        "suggested": True,
                     })
                     seen.add(n.primary_address)
 
