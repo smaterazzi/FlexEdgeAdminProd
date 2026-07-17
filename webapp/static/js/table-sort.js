@@ -111,15 +111,39 @@
   function headerCells(table) {
     var thead = table.tHead;
     if (!thead || !thead.rows.length) return [];
-    // Use the last header row (some tables have a group row above).
-    var row = thead.rows[thead.rows.length - 1];
-    return Array.prototype.slice.call(row.cells);
+    // Use the last header row that ISN'T the per-column filter row injected
+    // by table-search.js (some tables also have a group row above).
+    var rows = Array.prototype.slice.call(thead.rows).filter(function (r) {
+      return !r.classList.contains("fe-filter-row");
+    });
+    if (!rows.length) return [];
+    return Array.prototype.slice.call(rows[rows.length - 1].cells);
   }
 
-  function sortableRows(tbody, colCount) {
-    return Array.prototype.slice.call(tbody.rows).filter(function (r) {
-      return r.children.length === colCount && !r.hasAttribute("data-no-sort");
+  // Partition tbody rows into:
+  //   * leading  — non-sortable rows before the first data row (kept on top)
+  //   * groups   — each { lead: <data row>, extra: [<detail rows>] }, where a
+  //                detail row is any following row that ISN'T itself a data row
+  //                (e.g. a `<td colspan>` SMC-error row under a push_failed
+  //                reservation). Detail rows travel WITH their lead row so
+  //                sorting never orphans them or floats them to the top.
+  // A "data row" has exactly colCount cells and no data-no-sort.
+  function partitionRows(tbody, colCount) {
+    var leading = [];
+    var groups = [];
+    var current = null;
+    Array.prototype.forEach.call(tbody.rows, function (r) {
+      var isData = r.children.length === colCount && !r.hasAttribute("data-no-sort");
+      if (isData) {
+        current = { lead: r, extra: [] };
+        groups.push(current);
+      } else if (current) {
+        current.extra.push(r);
+      } else {
+        leading.push(r);
+      }
     });
+    return { leading: leading, groups: groups };
   }
 
   function enhance(table) {
@@ -143,11 +167,12 @@
       th.appendChild(indicator);
 
       th.addEventListener("click", function () {
-        var rows = sortableRows(tbody, colCount);
-        if (!rows.length) return;
+        var parts = partitionRows(tbody, colCount);
+        var groups = parts.groups;
+        if (!groups.length) return;
 
         var type = th.dataset.sortType ||
-                   detectType(rows.map(function (r) { return cellValue(r, colIndex); }));
+                   detectType(groups.map(function (g) { return cellValue(g.lead, colIndex); }));
         var base = makeComparator(type);
 
         if (state.key === colIndex) {
@@ -158,8 +183,8 @@
         }
         var mul = state.dir === "asc" ? 1 : -1;
 
-        rows.sort(function (ra, rb) {
-          var va = cellValue(ra, colIndex), vb = cellValue(rb, colIndex);
+        groups.sort(function (ga, gb) {
+          var va = cellValue(ga.lead, colIndex), vb = cellValue(gb.lead, colIndex);
           var ea = isEmptyVal(va), eb = isEmptyVal(vb);
           if (ea && eb) return 0;
           if (ea) return 1;      // empties always sink to the bottom …
@@ -167,7 +192,13 @@
           return mul * base(va, vb);
         });
 
-        rows.forEach(function (r) { tbody.appendChild(r); });
+        // Reassemble: leading anchors first (original order), then each data
+        // row immediately followed by its own detail rows.
+        parts.leading.forEach(function (r) { tbody.appendChild(r); });
+        groups.forEach(function (g) {
+          tbody.appendChild(g.lead);
+          g.extra.forEach(function (e) { tbody.appendChild(e); });
+        });
 
         headers.forEach(function (h) {
           h.classList.remove("fe-sort-asc", "fe-sort-desc");

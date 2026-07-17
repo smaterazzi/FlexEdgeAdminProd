@@ -21,3 +21,17 @@ table.sortable-table th .fe-sort-indicator {
 }
 table.sortable-table th.fe-sort-asc  .fe-sort-indicator::before { content: "\25B2"; color: var(--accent, #0d6efd); }  /* ▲ */
 table.sortable-table th.fe-sort-desc .fe-sort-indicator::before { content: "\25BC"; color: var(--accent, #0d6efd); }  /* ▼ */
+
+/* ── Table search (table-search.js) ──────────────────────────────────── */
+.fe-table-search { flex-wrap: wrap; }
+.fe-table-search .fe-global-search { max-width: 24rem; }
+.fe-table-search .fe-search-count { white-space: nowrap; }
+
+/* Per-column filter row injected into <thead>. */
+table.sortable-table tr.fe-filter-row th { padding: .2rem .35rem; }
+table.sortable-table tr.fe-filter-row .fe-col-search {
+  min-width: 4rem;
+  font-weight: 400;
+}
+/* The filter-row header cells must not look/behave like sortable headers. */
+table.sortable-table tr.fe-filter-row th.fe-sortable { cursor: default; }

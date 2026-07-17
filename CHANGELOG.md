@@ -6,12 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-16
 
+### Table search — reusable standard (2026-07-16)
+
+Client-side search is now a platform standard on the same `class="sortable-table"` marker — sort + search together are the "managed table" treatment, zero extra markup.
+
+- **New shared asset:** [webapp/static/js/table-search.js](webapp/static/js/table-search.js) (styles in [webapp/static/css/table-sort.css](webapp/static/css/table-sort.css)), loaded globally from base.html; auto-inits every `table.sortable-table`, `window.FEATableSearch.enhance(el)` for AJAX tables.
+- **Two searches per table** (per operator decision — global box + per-column row): a **global box** above the table matching across ALL data columns at once, plus a **per-column filter row** (`<tr class="fe-filter-row">` under the header) with one input per data column for selective per-field filtering. Active per-column filters combine with AND.
+- **Token grammar** (both the global box and each column box): whitespace separates tokens; **default logical OR** (match any token), a **capital `AND`** token switches that box to **logical AND** (match every token); lowercase "and" is a literal term. Case-insensitive substring. Live "M of N" counter by the global box.
+- **Column opt-out:** `data-no-sort` columns (checkbox / Actions) get no filter input and are excluded from the global match, so search never keys off button labels.
+- **Interop:** table-sort.js skips the injected `fe-filter-row`; detail/continuation rows (e.g. a `push_failed` reservation's `colspan` error row) hide/show with their parent. Verified end-to-end with jsdom (global OR/AND, per-column AND, detail-row visibility, sort coexistence).
+- **Existing search audited:** none of the retrofitted listing tables had a client-side row-search widget to replace. `/logs` has a *server-side* filter form (feature/level/status/time) that narrows the DB query before pagination — a different mechanism, left intact; the client-side search layers on the current page. Bespoke-search tables (leases, scan tool, scan-history detail, cluster-detail, rules viewer) keep their specialised search.
+- Caveat (same as sort): client-side over rendered rows → on server-paginated tables it searches the current page only. Standing rule added to CLAUDE.md § Table search.
+
 ### Sortable data tables — reusable standard (2026-07-16)
 
 Click-to-sort is now a platform standard, not a per-page copy-paste. A table opts in with a single class: `class="sortable-table"`.
 
 - **New shared assets:** [webapp/static/js/table-sort.js](webapp/static/js/table-sort.js) + [webapp/static/css/table-sort.css](webapp/static/css/table-sort.css), loaded globally from [webapp/templates/base.html](webapp/templates/base.html) (cache-busted `?v={{ app_version }}`, vendored locally — no CDN, per M11). Auto-inits every `table.sortable-table` on load; `window.FEATableSort.enhance(el)` re-runs it on AJAX-injected tables.
-- **Zero-config, auto-typed:** every non-empty header becomes clickable (▲/▼ indicator, click toggles asc/desc). Column type is auto-detected per column — **ip** (octet-aware: `192.168.1.6` before `192.168.1.69`, CIDR respected), **num**, **date**, else **text** (locale/numeric). Empty / `—` cells always sort to the bottom. Only the first `<tbody>` is sorted; `colspan` placeholder rows are left in place.
+- **Zero-config, auto-typed:** every non-empty header becomes clickable (▲/▼ indicator, click toggles asc/desc). Column type is auto-detected per column — **ip** (octet-aware: `192.168.1.6` before `192.168.1.69`, CIDR respected), **num**, **date**, else **text** (locale/numeric). Empty / `—` cells always sort to the bottom. Only the first `<tbody>` is sorted.
+- **Detail-row aware:** interleaved non-data rows (e.g. the `<td colspan>` SMC-error row rendered under a `push_failed` reservation on the DHCP scope-detail table) travel *with* their parent data row when sorting — they're never orphaned or floated to the top. Rows are grouped by column count: a data row plus any following non-data rows sort as a unit.
 - **Overrides:** `<th data-no-sort>` (or an empty `<th>`) skips a column (Actions/checkbox); `<th data-sort-type=…>` forces a type; `<td data-sort-value=…>` sorts by a canonical value behind a different display (e.g. ISO date behind "2 days ago", start-IP behind a "x — y" range).
 - **Retrofitted** ~20 listing tables: DHCP scopes / scope-detail (reservations + deployments) / history / activity, all four Admin tables, Engines clusters + sgInfo history, TLS certificates / history / expirations / notifications / LE list + requests, change queue + drift, logs, scan history, browse, optimizer submissions. The three tables with bespoke sorters + extra behaviour (leases viewer, engine scan tool, scan-history detail) were intentionally left untouched.
 - Caveat noted for server-paginated tables (change queue, reservations, logs): client-side sort covers the current page only.
