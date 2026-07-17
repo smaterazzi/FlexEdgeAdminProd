@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-16
 
+### Node-initiated clusters — public IPs suggested as SSH-rule destinations (2026-07-16)
+
+Fixes "the SSH-allow rule only covers one node on a multi-node node-initiated cluster." Root cause: for node-initiated clusters the destination-IP picker only offered the nodes' **real interface IPs** and pre-checked **none** (by design, since FEA can't assume which private IPs it can reach), so an operator typically ticked just the one node they were enrolling → the rule got one destination.
+
+- **[webapp/credentials_manager.py](webapp/credentials_manager.py)** `rule_destinations` builder now, for node-initiated clusters, also lists each node's **public contact (NAT-exit) IP** (`is_public` via `_classify_public`), tagged `suggested=True`. The nodes' real interface IPs remain listed as unchecked fallbacks.
+- **[webapp/templates/dhcp/credentials.html](webapp/templates/dhcp/credentials.html)** pre-checks the `suggested` (public) candidates for node-initiated clusters — so a single Install covers **every** node FEA can reach on its public IP — adds a `suggested` badge, and shows a caveat note: untick the public IP and pick the private interface IP when a 1:1 NAT rewrites the destination. SMC-initiated clusters unchanged (all real IPs pre-checked).
+- The rule-creation path was already correct (one `<rule>-dst-<i>` Host per submitted IP in `create_or_update_ssh_rule`); the deficit was purely in what the picker offered/pre-selected.
+- **Root-cause fix — cluster node grouping ([webapp/smc_dhcp_client.py](webapp/smc_dhcp_client.py) `_walk_node_interfaces` / `list_cluster_nodes`).** The picker was suggesting a public IP for *only the first node* because `list_cluster_nodes` groups NDI addresses by `nodeid`, and on some SMC/SDK combos the `node_interface` payloads come back **without `nodeid`** (all `0`) — so every node's address collapsed onto node 1 (nodeid `0 → 1`) and node 2+ were handed **empty** address groups. That single defect also explains the earlier "rule only gets one destination IP." Fix: each `node_interface` now gets a **synthetic nodeid from its position** within the interface (cluster NDIs are listed in node order, consistently across interfaces) whenever SMC omits the real `nodeid`; the real `nodeid` is still preferred when present, so this is a no-op on payloads that already carry it. Proven with a nodeid-less 2-node payload: node addresses + their public contact IPs now split correctly across nodes. Added an always-on per-node diagnostic log (`list_cluster_nodes(<engine>): node0 … addrs=N public=M | node1 …`) so any remaining under-population (e.g. SMC genuinely having no public contact for a node's IP) is immediately visible.
+- Docs: CLAUDE.md § DHCP credentials → P1 + § Scope discovery updated. The `connect_ip_override` dial-vs-destination split ([webapp/dhcp_ssh.py](webapp/dhcp_ssh.py)) is unchanged and still governs the TCP socket FEA opens.
+
 ### Table search — reusable standard (2026-07-16)
 
 Client-side search is now a platform standard on the same `class="sortable-table"` marker — sort + search together are the "managed table" treatment, zero extra markup.

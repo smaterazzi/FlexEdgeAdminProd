@@ -896,6 +896,17 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
     out: list[NodeAddress] = []
     iface_id = parent_iface_id or str(level_payload.get("interface_id") or "")
 
+    # Position of each node_interface within THIS interface level, in the
+    # order SMC lists them (= node order). Used as a *synthetic* nodeid when
+    # the payload omits `nodeid` — observed on some SMC/SDK combos, where the
+    # previous code then collapsed EVERY node's address onto node 1 (nodeid
+    # defaulted to 0 → grouped as 1) and left node 2+ with empty groups. That
+    # is exactly why a multi-node cluster only got ONE destination IP / only
+    # the first node's public IP was ever suggested. Incremented for every
+    # node_interface slot (even address-less ones) so the ordinal stays
+    # aligned to the same node across all physical interfaces.
+    ndi_ordinal = 0
+
     # Direct interfaces on this level (each entry wraps a single_node_interface
     # or node_interface; cluster_virtual_interface is the CVI which we skip)
     for entry in level_payload.get("interfaces", []) or []:
@@ -904,11 +915,18 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                 continue
             if not isinstance(inner, dict):
                 continue
+            if inner_kind == "node_interface":
+                ndi_ordinal += 1
             address = inner.get("address") or ""
             network = inner.get("network_value") or ""
             is_dynamic = bool(inner.get("dynamic"))
             if not address and not is_dynamic:
                 continue
+            # Prefer SMC's real nodeid; fall back to the positional ordinal
+            # for cluster NDIs when it's missing so nodes never collapse.
+            raw_nodeid = int(inner.get("nodeid") or 0)
+            effective_nodeid = raw_nodeid or (
+                ndi_ordinal if inner_kind == "node_interface" else 0)
             # P1 — inline contact addresses (2026-05-12). SMC stores
             # contact addresses in TWO places:
             #   (a) engine-level via `engine.contact_addresses` — the
@@ -933,7 +951,7 @@ def _walk_node_interfaces(level_payload: dict, parent_iface_id: str = ""
                 interface_id=iface_id,
                 address=address,
                 network_value=network,
-                nodeid=int(inner.get("nodeid") or 0),
+                nodeid=effective_nodeid,
                 is_primary_mgt=bool(inner.get("primary_mgt")),
                 is_outgoing=bool(inner.get("outgoing")),
                 is_dynamic=is_dynamic,
@@ -1249,6 +1267,26 @@ def list_cluster_nodes(engine_name: str) -> list[DhcpClusterNode]:
                 nodeid=nid, addresses=[a for a in group if a.address],
                 primary_address=primary,
             ))
+
+    # Always-on diagnostic: per-node address + public-contact counts. If a
+    # multi-node cluster shows every node but one with addrs=0 the grouping
+    # collapsed (nodeid missing upstream); if a node has addrs>0 but
+    # public=0 then SMC simply has no public contact address for that node's
+    # interface IP. Either way this line pinpoints why the destination picker
+    # under-populated for that cluster.
+    try:
+        logger.info(
+            "list_cluster_nodes(%s): %d node(s) — %s",
+            engine_name, len(out),
+            " | ".join(
+                f"node{n.node_index}({n.name}) nodeid={n.nodeid} "
+                f"addrs={len(n.addresses)} "
+                f"public={sum(1 for a in n.addresses for c in a.contact_addresses if c.get('is_public'))}"
+                for n in out
+            ) or "(none)",
+        )
+    except Exception:
+        pass
     return out
 
 
