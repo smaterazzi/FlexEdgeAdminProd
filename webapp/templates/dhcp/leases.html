@@ -305,7 +305,11 @@
     </div>
   </div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0" id="leases-table">
+    {# `exportable-table` opts into table-export.js WITHOUT the sort/search
+       treatment — this table ships its own IP-aware sorter and filter
+       buttons. The export follows whatever they leave visible. #}
+    <table class="table table-sm table-hover mb-0 exportable-table" id="leases-table"
+           data-export-name="dhcp-leases-{{ scope.engine_name }}-{{ scope.interface_id }}">
       <thead>
         <tr>
           <th style="width:32px">
@@ -456,7 +460,8 @@
     </span>
   </div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0">
+    <table class="table table-sm table-hover mb-0 exportable-table"
+           data-export-name="dhcp-scan-discovered-{{ scope.engine_name }}-{{ scope.interface_id }}">
       <thead>
         <tr>
           <th>IP</th>

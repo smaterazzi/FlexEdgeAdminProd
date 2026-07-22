@@ -35,3 +35,10 @@ table.sortable-table tr.fe-filter-row .fe-col-search {
 }
 /* The filter-row header cells must not look/behave like sortable headers. */
 table.sortable-table tr.fe-filter-row th.fe-sortable { cursor: default; }
+
+/* ── Table export (table-export.js) ──────────────────────────────────── */
+/* The button group docks into the search bar when one exists (ms-auto
+   pushes it to the right); otherwise it gets its own thin bar above the
+   table. Nothing here should shift layout when the table has no export. */
+.fe-table-export-bar { line-height: 1; }
+.fe-table-export .btn { white-space: nowrap; }

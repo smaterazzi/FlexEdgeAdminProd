@@ -4,7 +4,21 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
-## [2.2.0-dev] - 2026-04-29 → 2026-07-16
+## [2.2.0-dev] - 2026-04-29 → 2026-07-22
+
+### Table Excel/CSV export — reusable standard (2026-07-22)
+
+Operator ask: an Excel export from the DHCP scope manager's **View Leases** and **Scan Subnet results** — available on every table in the platform, without the code going redundant.
+
+- **New shared asset:** [webapp/static/js/table-export.js](webapp/static/js/table-export.js) (styles appended to [webapp/static/css/table-sort.css](webapp/static/css/table-sort.css)), loaded globally from base.html **after** table-search.js so it can dock its buttons into that module's search bar. Auto-inits every `table.sortable-table` (all ~22 listing tables get export for free) plus `table.exportable-table`, the opt-in marker for tables that want export *without* the sort/search treatment. `window.FEATableExport.enhance(el)` for AJAX tables.
+- **Exports exactly what the operator sees** — current sort order (rows read in DOM order) and every active filter. This works uniformly because every filter mechanism on the platform hides rows the same way (`style.display="none"`): the global/per-column search boxes *and* the leases viewer's bespoke lease-state / discovery-state filter chips. **That's the anti-redundancy decision** — no server route has to re-derive the operator's filter state, so one client-side implementation serves every table instead of one export endpoint per view.
+- **Genuine `.xlsx`**, not a renamed CSV: a minimal OOXML workbook packed by a store-only (uncompressed) ZIP writer with an inline CRC-32 — no vendored spreadsheet library, no CDN (M11 rule, satisfied by vendoring nothing at all). Bold + frozen header row, autoFilter over the used range, and numeric-looking cells written as real numbers so Excel can sum/sort. CSV offered alongside (UTF-8 with BOM).
+- **CSV-injection guard** mirroring [shared/csv_safe.py](shared/csv_safe.py) applied client-side to *both* formats — a cell starting `= + - @ TAB CR` gets an `'` prefix. This matters more for the .xlsx than the CSV, since that's the file Excel opens directly.
+- **Column/row rules reuse the existing markers:** `data-no-sort` / empty `<th>` (checkbox + Actions columns) are omitted, `data-no-export` for explicit exclusion, `<td data-export-value>` (falling back to `data-sort-value`, then cell text) for a canonical value behind a formatted display, and `colspan` detail/placeholder rows are skipped by the same cell-count test sort and search use. Whitespace is collapsed so badge/icon markup exports as one clean value.
+- **DHCP leases page** ([webapp/templates/dhcp/leases.html](webapp/templates/dhcp/leases.html)): both tables marked `exportable-table` with `data-export-name` derived from engine + interface, so files land as `dhcp-leases-<engine>-<iface>_<date>.xlsx` / `dhcp-scan-discovered-<engine>-<iface>_<date>.xlsx`.
+- The engine scan-tool result table keeps its existing server-side `/engines/tools/scan/<id>/csv` route (exports the full scan, not the filtered view); adding a second CSV button there would be exactly the redundancy this standard avoids.
+- **Verified with jsdom + openpyxl**: button injection / docking into the search bar / idempotent re-enhance / headerless-table skip; and the produced workbook loads in openpyxl with **no warnings** — correct sheet name, frozen panes, autofilter, bold header, `int` typing on numeric cells, UTF-8 preserved, formula guard applied, hidden + detail + checkbox/Actions content all correctly absent. `unzip -t` reports no CRC errors.
+- Caveat (same as sort/search): client-side over rendered rows → on a server-paginated table it exports the current page only. Standing rule added to CLAUDE.md § Table Excel/CSV export.
 
 ### Node-initiated clusters — public IPs suggested as SSH-rule destinations (2026-07-16)
 
