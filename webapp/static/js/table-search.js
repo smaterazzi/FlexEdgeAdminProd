@@ -1,7 +1,8 @@
 /*
  * FlexEdgeAdmin — generic search for tables. Pairs with table-sort.js and
- * keys off the SAME marker: any `table.sortable-table` automatically gets
- * search too (sort + search = the standard "managed table" treatment).
+ * table-export.js off the SAME marker: any `table.managed-table` gets all
+ * three (see table-core.js for the contract). A table with its own bespoke
+ * search opts this pillar out with a table-level `data-no-search`.
  *
  * Two searches per table (see CLAUDE.md § Table search):
  *
@@ -29,6 +30,12 @@
  * (matched by column count, e.g. a push_failed reservation's colspan error
  * row) are hidden/shown together with their parent data row.
  *
+ * Row visibility goes through FERowFilter under the key "search" rather
+ * than writing `row.style.display` directly, so a page that ALSO filters
+ * with its own controls (leases state chips, scan reachability buttons,
+ * TLS activity status buttons) composes with this search instead of
+ * overwriting it. See table-core.js.
+ *
  * Caveat: like sort, this is client-side over the rendered rows — on a
  * server-paginated table it searches the current page only.
  *
@@ -38,6 +45,23 @@
   "use strict";
 
   var DEBOUNCE_MS = 120;
+
+  // Several managed tables live INSIDE a <form> (the leases viewer sits in
+  // the "Add to reservations" form). A bare Enter in one of our injected
+  // inputs would submit that form — on the leases page that would create
+  // reservations. Swallow Enter; the inputs carry no `name`, so they are
+  // never submitted as fields either.
+  function makeInput(cls, placeholder) {
+    var el = document.createElement("input");
+    el.type = "search";
+    el.className = "form-control form-control-sm " + cls;
+    el.placeholder = placeholder;
+    el.autocomplete = "off";
+    el.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter") ev.preventDefault();
+    });
+    return el;
+  }
 
   function parseQuery(q) {
     var raw = (q || "").trim();
@@ -60,30 +84,13 @@
     return parsed.tokens.some(function (t) { return hay.indexOf(t) !== -1; });
   }
 
-  function headerRow(table) {
-    var thead = table.tHead;
-    if (!thead) return null;
-    var rows = Array.prototype.slice.call(thead.rows).filter(function (r) {
-      return !r.classList.contains("fe-filter-row");
-    });
-    return rows.length ? rows[rows.length - 1] : null;
-  }
+  var headerRow = function (t) { return window.FETable.headerRow(t); };
+  var partition = function (tb, n) { return window.FETable.partition(tb, n); };
 
   function isSearchable(th) {
-    return !th.hasAttribute("data-no-sort") && (th.textContent || "").trim() !== "";
-  }
-
-  // Mirror table-sort.js: group each data row with the non-data rows that
-  // follow it, so a detail row hides/shows with its parent.
-  function partition(tbody, colCount) {
-    var leading = [], groups = [], current = null;
-    Array.prototype.forEach.call(tbody.rows, function (r) {
-      var isData = r.children.length === colCount && !r.hasAttribute("data-no-sort");
-      if (isData) { current = { lead: r, extra: [] }; groups.push(current); }
-      else if (current) { current.extra.push(r); }
-      else { leading.push(r); }
-    });
-    return { leading: leading, groups: groups };
+    return !th.hasAttribute("data-no-sort") &&
+           !th.hasAttribute("data-no-export") &&
+           (th.textContent || "").trim() !== "";
   }
 
   function enhance(table) {
@@ -103,10 +110,7 @@
     headers.forEach(function (th, idx) {
       var cell = document.createElement("th");
       if (isSearchable(th)) {
-        var inp = document.createElement("input");
-        inp.type = "search";
-        inp.className = "form-control form-control-sm fe-col-search";
-        inp.placeholder = "filter…";
+        var inp = makeInput("fe-col-search", "filter…");
         inp.setAttribute("aria-label",
           "Filter by " + (th.textContent || "").trim());
         cell.appendChild(inp);
@@ -134,10 +138,7 @@
       ? table.parentElement : table;
     var bar = document.createElement("div");
     bar.className = "fe-table-search d-flex align-items-center gap-2 mb-2";
-    var gbox = document.createElement("input");
-    gbox.type = "search";
-    gbox.className = "form-control form-control-sm fe-global-search";
-    gbox.placeholder = "Search all columns…";
+    var gbox = makeInput("fe-global-search", "Search all columns…");
     gbox.title = "Space-separated tokens match with OR by default; " +
                  "include a capital AND to require every token.";
     var counter = document.createElement("span");
@@ -165,8 +166,8 @@
             }
           }
         }
-        g.lead.style.display = ok ? "" : "none";
-        g.extra.forEach(function (e) { e.style.display = ok ? "" : "none"; });
+        // Veto under our own key — a page's own filter buttons keep theirs.
+        window.FERowFilter.setGroup(g, "search", ok);
         if (ok) visible++;
       });
       counter.textContent = anyActive
@@ -184,9 +185,7 @@
   }
 
   function enhanceAll(root) {
-    var scope = root || document;
-    Array.prototype.forEach.call(
-      scope.querySelectorAll("table.sortable-table"), enhance);
+    window.FETable.eachTable(root, "search", enhance);
   }
 
   window.FEATableSearch = { enhance: enhance, enhanceAll: enhanceAll };

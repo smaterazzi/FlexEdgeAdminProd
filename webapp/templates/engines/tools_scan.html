@@ -171,7 +171,7 @@
     </div>
   </div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0" id="scan-results-table">
+    <table class="table table-sm table-hover mb-0 managed-table" data-no-sort" id="scan-results-table">
       <thead>
         <tr>
           <th class="sortable" data-sort-key="ip"     data-sort-type="ip">IP <span class="sort-indicator"></span></th>
@@ -1091,7 +1091,8 @@
     document.querySelectorAll("[data-filter]").forEach(b =>
       b.classList.toggle("active", b.dataset.filter === mode));
     tbody.querySelectorAll("tr.result-row").forEach(r => {
-      r.style.display = matches(r, mode) ? "" : "none";
+      // Arbitrated so the standard search box composes with these buttons.
+      FERowFilter.set(r, "resultState", matches(r, mode));
     });
   }
 

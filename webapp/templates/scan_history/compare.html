@@ -40,7 +40,7 @@
 
 <div class="card">
   <div class="table-responsive" style="max-height: calc(100vh - 220px); overflow: auto;">
-    <table class="table table-sm table-hover compare-table mb-0 align-middle">
+    <table class="table table-sm table-hover compare-table mb-0 align-middle managed-table">
       <thead class="position-sticky top-0 bg-body-tertiary" style="z-index: 2;">
         <tr>
           <th class="position-sticky start-0 bg-body-tertiary" style="min-width: 160px; z-index: 3;">
@@ -149,7 +149,8 @@
     sw.addEventListener("change", () => {
       const on = sw.checked;
       document.querySelectorAll(".host-row").forEach(tr => {
-        tr.style.display = (!on || tr.dataset.changed === "1") ? "" : "none";
+        // Arbitrated so the standard search box composes with this toggle.
+        FERowFilter.set(tr, "diffOnly", !on || tr.dataset.changed === "1");
       });
     });
   })();

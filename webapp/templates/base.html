@@ -642,6 +642,10 @@
     </div>
 
     <script src="{{ url_for('static', filename='vendor/bootstrap/js/bootstrap.bundle.min.js') }}?v={{ app_version }}"></script>
+    {# Managed-table stack. table-core.js owns the marker contract, the
+       shared table anatomy helpers, and the row-visibility arbiter, so it
+       MUST load before the three pillars that build on it. #}
+    <script src="{{ url_for('static', filename='js/table-core.js') }}?v={{ app_version }}"></script>
     <script src="{{ url_for('static', filename='js/table-sort.js') }}?v={{ app_version }}"></script>
     <script src="{{ url_for('static', filename='js/table-search.js') }}?v={{ app_version }}"></script>
     {# Loaded last of the three: it docks its Export buttons into the search

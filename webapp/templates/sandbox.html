@@ -154,7 +154,7 @@
     <div class="card mb-4">
         <div class="card-header text-danger"><i class="bi bi-exclamation-diamond"></i> Unresolved References</div>
         <div class="card-body p-0">
-            <table class="table table-sm mb-0">
+            <table class="table table-sm mb-0 managed-table">
                 <thead><tr><th>Rule</th><th>Field</th><th>Value</th></tr></thead>
                 <tbody>
                     {% for ref in report.unresolved_refs %}
@@ -180,7 +180,7 @@
         </div>
         <div class="card-body p-0">
             <div class="table-responsive">
-                <table class="table table-sm table-hover align-middle mb-0">
+                <table class="table table-sm table-hover align-middle mb-0 managed-table">
                     <thead>
                         <tr>
                             <th style="width:40px;">#</th>

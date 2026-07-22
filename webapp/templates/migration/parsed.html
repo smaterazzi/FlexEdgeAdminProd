@@ -59,7 +59,7 @@
     <!-- Tab content -->
     {% if tab == 'policies' %}
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr>
                 <th>ID</th><th>Name</th><th>Status</th><th>SrcIntf</th><th>DstIntf</th>
                 <th>SrcAddr</th><th>DstAddr</th><th>Service</th><th>Action</th><th>NAT</th><th>Label</th>
@@ -108,7 +108,7 @@
 
     {% elif tab == 'addresses' %}
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>Type</th><th>Value</th><th>Built-in</th><th>Comment</th></tr></thead>
             <tbody>
             {% for a in parsed.addresses %}
@@ -133,7 +133,7 @@
 
     {% elif tab == 'services' %}
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>Protocol</th><th>Ports</th><th>Built-in</th><th>Category</th></tr></thead>
             <tbody>
             {% for s in parsed.services %}
@@ -160,7 +160,7 @@
     {% elif tab == 'zones' %}
     <h6>Security Zones</h6>
     <div class="table-responsive mb-4">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Zone Name</th><th>Interfaces</th><th>Intrazone</th></tr></thead>
             <tbody>
             {% for z in parsed.zones %}
@@ -176,7 +176,7 @@
 
     <h6>Interfaces</h6>
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>IP</th><th>Mask</th><th>Type</th><th>Role</th><th>VDOM</th></tr></thead>
             <tbody>
             {% for i in parsed.interfaces %}
@@ -196,7 +196,7 @@
     {% elif tab == 'groups' %}
     <h6>Address Groups</h6>
     <div class="table-responsive mb-4">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>Members</th></tr></thead>
             <tbody>
             {% for g in parsed.address_groups %}
@@ -215,7 +215,7 @@
 
     <h6>Service Groups</h6>
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>Members</th><th>Built-in</th></tr></thead>
             <tbody>
             {% for g in parsed.service_groups %}
@@ -235,7 +235,7 @@
 
     {% elif tab == 'vips' %}
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>External IP</th><th>Mapped IP</th><th>Interface</th><th>Port Forward</th></tr></thead>
             <tbody>
             {% for v in parsed.vips %}
@@ -258,7 +258,7 @@
     {% elif tab == 'nat' %}
     <h6>IP Pools (SNAT)</h6>
     <div class="table-responsive mb-4">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>Type</th><th>Start IP</th><th>End IP</th><th>Comment</th></tr></thead>
             <tbody>
             {% for p in parsed.get('ip_pools', []) %}
@@ -279,7 +279,7 @@
 
     <h6>VIPs (DNAT)</h6>
     <div class="table-responsive mb-4">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>Name</th><th>External IP</th><th>Mapped IP</th><th>Interface</th><th>Port Forward</th></tr></thead>
             <tbody>
             {% for v in parsed.vips %}
@@ -304,7 +304,7 @@
 
     <h6>NAT Policies</h6>
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table">
             <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Source</th><th>Destination</th><th>Service</th><th>Pool / VIP</th></tr></thead>
             <tbody>
             {% for p in parsed.policies if p.nat or p.get('has_dnat') %}
@@ -380,7 +380,7 @@
             {% if tunnel.phase2_entries %}
             <details class="mt-3">
                 <summary class="text-muted">Phase 2 SA Details ({{ tunnel.phase2_entries | length }})</summary>
-                <table class="table table-sm table-dark mt-2">
+                <table class="table table-sm table-dark mt-2 managed-table">
                     <thead><tr><th>Name</th><th>Source</th><th>Destination</th><th>Auto-negotiate</th></tr></thead>
                     <tbody>
                     {% for p2 in tunnel.phase2_entries %}
@@ -508,7 +508,7 @@
             {% if srv.reservations %}
             <h6 class="mt-3 mb-2">Reservations ({{ srv.reservations | length }})</h6>
             <div class="table-responsive">
-                <table class="table table-sm table-hover table-dark mb-0">
+                <table class="table table-sm table-hover table-dark mb-0 managed-table">
                     <thead><tr>
                         <th style="width:6%;">FG id</th>
                         <th style="width:18%;">IP</th>

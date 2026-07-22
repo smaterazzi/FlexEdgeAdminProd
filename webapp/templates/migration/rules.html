@@ -48,7 +48,7 @@
     {% endwith %}
 
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table" data-no-sort">
             <thead>
                 <tr>
                     <th style="width:40px;"><input type="checkbox" id="selectAllCb" checked onchange="selectAll(this.checked)"></th>
@@ -128,7 +128,7 @@
         <span class="badge bg-secondary ms-2">{{ converted.nat_rules | length }}</span>
     </h5>
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table" data-no-sort">
             <thead>
                 <tr>
                     <th style="width:40px;"><input type="checkbox" id="selectAllNatCb" checked onchange="selectAllNat(this.checked)"></th>
@@ -212,7 +212,7 @@
         <span class="badge bg-secondary ms-2">{{ converted.vpn_configs | length }}</span>
     </h5>
     <div class="table-responsive">
-        <table class="table table-sm table-hover table-dark">
+        <table class="table table-sm table-hover table-dark managed-table" data-no-sort">
             <thead><tr>
                 <th style="width:30px;">
                     <input type="checkbox" class="form-check-input" id="vpnSelectAll"

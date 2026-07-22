@@ -2,16 +2,16 @@
  * FlexEdgeAdmin — generic Excel / CSV export for tables.
  *
  * STANDARD (third pillar of the "managed table" treatment, alongside
- * table-sort.js and table-search.js): any `table.sortable-table` gets an
- * Export button automatically. Tables that want export WITHOUT the
- * sort/search treatment (the leases viewer, the engine scan results —
- * they ship bespoke sorters) opt in with `class="exportable-table"`.
+ * table-sort.js and table-search.js): any `table.managed-table` gets an
+ * Export button automatically — see table-core.js for the marker contract
+ * and the table-level `data-no-export` opt-out.
  *
  * What gets exported is WHAT THE OPERATOR SEES:
  *   - current sort order (rows are read in DOM order),
- *   - every active filter — the global/per-column search boxes, and any
- *     bespoke per-page filter buttons, because they all hide rows the
- *     same way (`style.display = "none"`).
+ *   - every active filter — the global/per-column search boxes and any
+ *     page-specific filter controls, because visibility is arbitrated in
+ *     one place (FERowFilter, table-core.js) rather than each source
+ *     writing `style.display` behind the others' backs.
  * That is the whole point of doing this client-side: no server route has
  * to re-derive the operator's filter state, so there is exactly one
  * export implementation for all ~25 tables instead of one per view.
@@ -64,29 +64,14 @@
     return raw.replace(/\s+/g, " ").trim();
   }
 
+  // Net visibility across every filter source (standard search + any
+  // page-specific controls) — see FERowFilter in table-core.js.
   function isVisible(row) {
-    return row.style.display !== "none" && !row.hidden;
+    return window.FERowFilter.visible(row) && !row.hidden;
   }
 
-  function headerRow(table) {
-    var thead = table.tHead;
-    if (!thead) return null;
-    var rows = Array.prototype.slice.call(thead.rows).filter(function (r) {
-      return !r.classList.contains("fe-filter-row");   // table-search.js input row
-    });
-    return rows.length ? rows[rows.length - 1] : null;
-  }
-
-  function exportableColumns(hr) {
-    var cols = [];
-    Array.prototype.forEach.call(hr.cells, function (th, idx) {
-      if (th.hasAttribute("data-no-sort") || th.hasAttribute("data-no-export")) return;
-      var label = (th.textContent || "").replace(/\s+/g, " ").trim();
-      if (!label) return;                              // checkbox column
-      cols.push({ index: idx, label: label });
-    });
-    return cols;
-  }
+  var headerRow = function (t) { return window.FETable.headerRow(t); };
+  var exportableColumns = function (hr) { return window.FETable.dataColumns(hr); };
 
   // Rows are read in DOM order (= current sort), skipping hidden ones and
   // any row whose cell count doesn't match the header — that's how both
@@ -418,8 +403,7 @@
 
   function enhanceAll(root) {
     var scope = root || document;
-    Array.prototype.forEach.call(
-      scope.querySelectorAll("table.sortable-table, table.exportable-table"), enhance);
+    window.FETable.eachTable(scope, "export", enhance);
   }
 
   window.FEATableExport = {

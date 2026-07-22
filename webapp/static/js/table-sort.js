@@ -1,8 +1,11 @@
 /*
  * FlexEdgeAdmin — generic click-to-sort for tables.
  *
- * STANDARD (use this on every new data table): add `class="sortable-table"`
- * to the <table>. That's it. Every non-empty header becomes clickable;
+ * STANDARD (use this on every new data table): add `class="managed-table"`
+ * to the <table> — that marker turns on sort + search + export together
+ * (see table-core.js for the contract and the `data-no-sort` table-level
+ * opt-out for tables with a bespoke sorter). Every non-empty header
+ * becomes clickable;
  * click to sort, click again to toggle asc/desc. A ▲/▼ indicator marks the
  * active column. Column type (ip / number / date / text) is auto-detected
  * from the cell values, so IP and numeric columns sort naturally
@@ -109,42 +112,14 @@
   }
 
   function headerCells(table) {
-    var thead = table.tHead;
-    if (!thead || !thead.rows.length) return [];
-    // Use the last header row that ISN'T the per-column filter row injected
-    // by table-search.js (some tables also have a group row above).
-    var rows = Array.prototype.slice.call(thead.rows).filter(function (r) {
-      return !r.classList.contains("fe-filter-row");
-    });
-    if (!rows.length) return [];
-    return Array.prototype.slice.call(rows[rows.length - 1].cells);
+    var hr = window.FETable.headerRow(table);
+    return hr ? Array.prototype.slice.call(hr.cells) : [];
   }
 
-  // Partition tbody rows into:
-  //   * leading  — non-sortable rows before the first data row (kept on top)
-  //   * groups   — each { lead: <data row>, extra: [<detail rows>] }, where a
-  //                detail row is any following row that ISN'T itself a data row
-  //                (e.g. a `<td colspan>` SMC-error row under a push_failed
-  //                reservation). Detail rows travel WITH their lead row so
-  //                sorting never orphans them or floats them to the top.
-  // A "data row" has exactly colCount cells and no data-no-sort.
-  function partitionRows(tbody, colCount) {
-    var leading = [];
-    var groups = [];
-    var current = null;
-    Array.prototype.forEach.call(tbody.rows, function (r) {
-      var isData = r.children.length === colCount && !r.hasAttribute("data-no-sort");
-      if (isData) {
-        current = { lead: r, extra: [] };
-        groups.push(current);
-      } else if (current) {
-        current.extra.push(r);
-      } else {
-        leading.push(r);
-      }
-    });
-    return { leading: leading, groups: groups };
-  }
+  // Row grouping (a data row + the detail rows that follow it) lives in
+  // table-core.js — sort, search and export must agree on what a data row
+  // is, so there is exactly one implementation.
+  var partitionRows = window.FETable.partition;
 
   function enhance(table) {
     if (!table || table.__feSortWired) return;
@@ -209,9 +184,7 @@
   }
 
   function enhanceAll(root) {
-    var scope = root || document;
-    var tables = scope.querySelectorAll("table.sortable-table");
-    Array.prototype.forEach.call(tables, enhance);
+    window.FETable.eachTable(root, "sort", enhance);
   }
 
   window.FEATableSort = { enhance: enhance, enhanceAll: enhanceAll };

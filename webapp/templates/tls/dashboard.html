@@ -47,7 +47,7 @@
         <a href="{{ url_for('tls.deploy_form') }}" class="btn btn-sm btn-primary"><i class="bi bi-plus-lg"></i> New</a>
     </div>
     <div class="table-responsive">
-        <table class="table table-hover mb-0">
+        <table class="table table-hover mb-0 managed-table">
             <thead>
                 <tr>
                     <th>Service</th><th>Tenant</th><th>Engine</th>
@@ -108,7 +108,7 @@
     </div>
     {% if activity_logs %}
     <div class="table-responsive">
-        <table class="table table-sm table-hover mb-0">
+        <table class="table table-sm table-hover mb-0 managed-table">
             <thead>
                 <tr>
                     <th style="width:150px">Time</th>
@@ -168,7 +168,16 @@
 <script>
 function filterLogs(status) {
     document.querySelectorAll('.log-row').forEach(row => {
-        row.style.display = (status === 'all' || row.dataset.status === status) ? '' : 'none';
+        const show = (status === 'all' || row.dataset.status === status);
+        // Arbitrated under our own key so the standard search box composes
+        // with these buttons instead of overwriting them (table-core.js).
+        FERowFilter.set(row, 'logStatus', show);
+        // The collapsible detail row must follow its parent — it used to
+        // linger on screen after its log row was filtered away.
+        const detail = row.nextElementSibling;
+        if (detail && detail.classList.contains('log-detail')) {
+            FERowFilter.set(detail, 'logStatus', show);
+        }
     });
 }
 </script>

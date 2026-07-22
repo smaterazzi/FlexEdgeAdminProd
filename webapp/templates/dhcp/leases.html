@@ -305,10 +305,10 @@
     </div>
   </div>
   <div class="table-responsive">
-    {# `exportable-table` opts into table-export.js WITHOUT the sort/search
-       treatment — this table ships its own IP-aware sorter and filter
-       buttons. The export follows whatever they leave visible. #}
-    <table class="table table-sm table-hover mb-0 exportable-table" id="leases-table"
+    {# Managed table minus sorting — this one ships its own IP-aware sorter.
+       It still gets the standard search + export; the lease-state filter
+       chips compose with the search via FERowFilter (table-core.js). #}
+    <table class="table table-sm table-hover mb-0 managed-table" data-no-sort id="leases-table"
            data-export-name="dhcp-leases-{{ scope.engine_name }}-{{ scope.interface_id }}">
       <thead>
         <tr>
@@ -460,7 +460,7 @@
     </span>
   </div>
   <div class="table-responsive">
-    <table class="table table-sm table-hover mb-0 exportable-table"
+    <table class="table table-sm table-hover mb-0 managed-table"
            data-export-name="dhcp-scan-discovered-{{ scope.engine_name }}-{{ scope.interface_id }}">
       <thead>
         <tr>
@@ -655,7 +655,9 @@ function _matchesFilter(row, mode) {
 function filterLeases(mode) {
   document.querySelectorAll(".lease-row").forEach(row => {
     const show = _matchesFilter(row, mode);
-    row.style.display = show ? "" : "none";
+    // Veto under our own key so the standard search box (key "search")
+    // and these state chips compose instead of clobbering each other.
+    FERowFilter.set(row, "leaseState", show);
     // Hidden rows must not contribute to the submit set, even if checked —
     // disabling the checkbox keeps the user's selection intact when they
     // toggle filters back on, while ensuring the form never sees it.
@@ -672,7 +674,7 @@ function filterLeases(mode) {
     if (mode.startsWith("d-")) {
       show = _matchesFilter(row, mode);
     }
-    row.style.display = show ? "" : "none";
+    FERowFilter.set(row, "leaseState", show);
   });
   // Visually mark the active filter button.
   document.querySelectorAll("[data-filter]").forEach(b => {
