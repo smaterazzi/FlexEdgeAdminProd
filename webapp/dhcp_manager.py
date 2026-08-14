@@ -1979,22 +1979,30 @@ def scope_leases(scope_id):
     # completion, at which point the full lease read happens.
     if scan_running is not None:
         now = datetime.now(timezone.utc)
+        # Derive the subnet view from the (possibly just-backfilled at
+        # line ~1913) scope CIDR. Previously this branch hardcoded
+        # subnet_filter_cidr="", which tripped the template's "no
+        # parseable subnet_cidr — didn't have enough anchors" warning
+        # for the whole duration of a scan on a scope that actually HAS
+        # a good CIDR. The warning then vanished when the scan finished
+        # and the normal render (which does read scope.subnet_cidr) took
+        # over — confusing, and its stated cause was wrong.
         subnet_size_running = 0
+        subnet_cidr_running = ""
         if scope.subnet_cidr:
             try:
                 import ipaddress as _ipa
-                subnet_size_running = max(
-                    0,
-                    _ipa.ip_network(scope.subnet_cidr,
-                                    strict=False).num_addresses - 2,
-                )
+                _net_running = _ipa.ip_network(scope.subnet_cidr, strict=False)
+                subnet_size_running = max(0, _net_running.num_addresses - 2)
+                subnet_cidr_running = str(_net_running)
             except Exception:
                 subnet_size_running = 0
+                subnet_cidr_running = ""
         return render_template(
             "dhcp/leases.html",
             scope=scope, leases=[], nodes=creds, fetch_errors={},
             now=now, lease_file_path=LEASE_FILE,
-            leases_other_subnets=0, subnet_filter_cidr="",
+            leases_other_subnets=0, subnet_filter_cidr=subnet_cidr_running,
             scan_report=None, scan_running=scan_running,
             untracked_rows=[],
             subnet_size=subnet_size_running,

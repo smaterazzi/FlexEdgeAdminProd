@@ -194,7 +194,8 @@
   We tried to derive a CIDR from saved
   gateway=<code>{{ scope.gateway or '∅' }}</code>
   pool=<code>{{ scope.dhcp_pool_start or '∅' }}</code>–<code>{{ scope.dhcp_pool_end or '∅' }}</code>
-  but didn't have enough anchors. Re-run scope discovery, or use the
+  but couldn't (missing anchors, or the range only spanned a single host).
+  Re-run scope discovery, or use the
   <strong>Custom range</strong> scan mode (it does not require a CIDR).
 </div>
 {% endif %}
