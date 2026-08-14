@@ -82,6 +82,21 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 # before certbot finishes. Operators on faster networks can reduce this
 # back to 120 via compose override; the warning logs in
 # letsencrypt_manager.account_view name the constraint.
-CMD ["gunicorn", "--preload", "-w", "2", "-k", "gthread", "--threads", "8", \
+# ONE worker, many threads (was `-w 2 --threads 8`; changed 2026-07-22).
+# Several subsystems keep state in PROCESS-LOCAL memory and assume a single
+# worker process:
+#   * webapp/scan_jobs.py `_JOBS` — DHCP subnet scan + Engines scan tool
+#     job registry. With 2 workers the POST that starts a scan registers
+#     the job in worker A, but the redirect + every /scan/status poll
+#     round-robins across workers; when a poll hits worker B the scan
+#     reads as "not found" and the page bounces back to the scope summary.
+#   * shared/smc_cache.py — process-local TTL cache + in-flight coalescing.
+#   * the browser SSH terminal + Flask-Sock sessions.
+# The SMC SDK session is a module-level singleton serialised process-wide
+# by shared/smc_lock.py anyway, so a second worker bought little for this
+# admin-scale tool while breaking the scan feature. `--threads 16` keeps
+# the same 16-concurrent-socket budget the terminal feature was sized for,
+# now all in one process with correct shared state.
+CMD ["gunicorn", "--preload", "-w", "1", "-k", "gthread", "--threads", "16", \
      "-b", "0.0.0.0:8088", "--timeout", "360", \
      "--chdir", "/app/webapp", "app:app"]

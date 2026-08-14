@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-22
 
+### Fix — subnet scan bounced straight back to the scope summary (2026-07-22)
+
+Starting a DHCP subnet scan (and, latently, an Engines → Tools → Scan) appeared to launch and then immediately return the operator to the scope summary with no watcher and no results.
+
+- **Root cause: multi-worker deployment vs. process-local job state.** [webapp/scan_jobs.py](webapp/scan_jobs.py)'s `_JOBS` registry lives in process memory and its module docstring assumes a single worker. But [docker/Dockerfile](docker/Dockerfile) ran gunicorn `-w 2`. The POST that starts a scan registered the job in worker A and spawned its thread there; the redirect to `/leases?scan_id=X` and every `/scan/status` poll then round-robined across both workers. Whenever a poll landed on worker B — which has its own empty `_JOBS` — `get_status` returned `None`, the route flashed "Scan job not found or expired", and fell through to the plain scope/leases view.
+- **Fix:** [docker/Dockerfile](docker/Dockerfile) now runs **`-w 1 --threads 16`** instead of `-w 2 --threads 8`. Same 16-concurrent-socket budget (the figure the browser-terminal feature was sized for), now in a single process with correct shared state. `-w 1` is the layout every process-local subsystem already assumes — the scan-job registry, the `smc_cache` TTL cache + in-flight coalescing, and the terminal/WebSocket sessions. The process-wide `smc_global_lock` already serialised SMC ops per process, so the second worker bought little for this admin-scale tool while breaking the scan feature outright.
+- **Requires a rebuild to take effect** (the worker count is baked into the image CMD): `make dev` / `make prod`, or `./deploy.sh`. A future multi-worker deployment would need an out-of-process job store (Redis / SQLite-backed queue).
+- Docs corrected in the same commit — CLAUDE.md (terminal stack note), [docs/DHCP-SubnetScan.md](docs/DHCP-SubnetScan.md) (which had wrongly claimed `-w 2` still "serves the polls in practice"), and [docs/CachingReview.md](docs/CachingReview.md) (the cross-worker cache-staleness caveat is moot under one worker).
+
+
 ### Managed tables — sort + search + export everywhere (2026-07-22)
 
 Operator ask: search on every table, and make sortable columns + search + CSV/xlsx export the standing treatment for every table generated from now on. Delivered as **one marker and one shared core**, not three parallel mechanisms.
