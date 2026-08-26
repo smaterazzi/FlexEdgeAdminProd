@@ -3,6 +3,14 @@ flask-sqlalchemy>=3.1
 flask-wtf>=1.2
 cachetools>=5.3
 fp-NGFW-SMC-python>=1.0.32
+# Required BY the SMC SDK, which imports `distutils` and falls back to
+# `packaging` (smc/compat.py). Python 3.12 removed distutils from the
+# stdlib (PEP 632), and current python:3.12-slim images no longer
+# preinstall setuptools (which used to provide a distutils shim). With
+# neither present the SDK raises ImportError at import time, gunicorn's
+# --preload master dies, and the container crash-loops. The SDK does not
+# declare this dependency itself, so we must. (Diagnosed 2026-08-26.)
+packaging>=23.0
 cryptography>=42.0
 pyyaml
 gunicorn>=22.0

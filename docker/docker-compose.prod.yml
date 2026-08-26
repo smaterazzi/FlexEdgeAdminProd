@@ -33,13 +33,23 @@ services:
       - "80:80"
       - "443:443"
     volumes:
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Mounted as a TEMPLATE, not a finished config: the nginx image's
+      # 20-envsubst-on-templates.sh renders /etc/nginx/templates/*.template
+      # into /etc/nginx/conf.d/ at boot, substituting ${DOMAIN}. nginx.conf
+      # itself has no shell-style expansion, so a literal ${DOMAIN:-localhost}
+      # in the config was a parse error ("closing bracket ... missing").
+      - ./nginx.conf:/etc/nginx/templates/default.conf.template:ro
       - certbot-data:/etc/letsencrypt:ro
       - certbot-webroot:/var/www/certbot:ro
     depends_on:
       - flexedge-web
     environment:
+      # The :- default is applied HERE by compose (shell syntax is valid in
+      # a compose file), so the template only ever sees a plain ${DOMAIN}.
       - DOMAIN=${DOMAIN:-localhost}
+      # Restrict envsubst to DOMAIN so nginx's own $host / $request_uri /
+      # $remote_addr are never touched during rendering.
+      - NGINX_ENVSUBST_FILTER=DOMAIN
 
   certbot:
     image: certbot/certbot

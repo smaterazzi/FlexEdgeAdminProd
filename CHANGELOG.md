@@ -6,6 +6,30 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-22
 
+### Fix — container crash-loop on rebuild: missing `packaging` dependency (2026-08-26)
+
+`flexedge-admin` restarted continuously after a rebuild. gunicorn exited 1 before serving a single request; with `--preload` the app is imported in the master, so an import error kills the whole container rather than one worker.
+
+```
+File "/usr/local/lib/python3.12/site-packages/smc/compat.py", line 27, in <module>
+    raise ImportError("Neither 'packaging' nor 'distutils' modules are available.")
+```
+
+- **Root cause — a three-way drift, none of it in our code.** The SMC SDK (`fp-NGFW-SMC-python`) imports `distutils` and falls back to `packaging`. Python 3.12 **removed `distutils`** from the stdlib (PEP 632), and current `python:3.12-slim` images no longer preinstall **`setuptools`** (which historically provided a `distutils` shim). `packaging` was never in `requirements.txt` because the SDK doesn't declare it either. Verified inside the built image: `packaging`, `setuptools` and `distutils` all MISSING on Python 3.12.14.
+- **Why now:** `requirements.txt` and the `python:3.12-slim` base tag are both **unpinned**, so the fix is invisible until a rebuild re-resolves them. Nothing had to change in the repo for this to break — it was latent, waiting for the next `docker build` on a machine without a warm pip layer.
+- **Not** caused by the `-w 2` → `-w 1` change: the failure is at app import in the gunicorn master, before any worker forks. It reproduced identically at either worker count.
+- **Fix:** added `packaging>=23.0` to [requirements.txt](requirements.txt) with a comment recording why the SDK needs it. Verified: the rebuilt image imports `webapp.app` cleanly and the container comes up **healthy**, serving HTTP 200 on `/login`.
+- **Follow-up worth doing (not done here):** pin the dependency set and the base-image tag. Every one of the 20 requirements uses `>=` or is bare, so any rebuild can silently pull a breaking major.
+
+### Fix — nginx prod overlay: invalid shell expansion in nginx.conf (2026-08-26)
+
+Uncovered while diagnosing the above; `flexedge-nginx` was crash-looping too — first as a cascade (`host not found in upstream "flexedge-web"` while the app was down), then on its own config.
+
+- **Root cause:** [docker/nginx.conf](docker/nginx.conf) used `${DOMAIN:-localhost}` in the `ssl_certificate` paths. That's **shell** parameter-expansion syntax; nginx has none, and parsed it as a variable named `DOMAIN:-localhost`, failing with `the closing bracket in "DOMAIN" variable is missing`. Nothing in `deploy.sh` ever substituted it, so the Docker+nginx TLS path was broken as written.
+- **Fix:** the config is now mounted as `/etc/nginx/templates/default.conf.template` so the nginx image's own `20-envsubst-on-templates.sh` renders it at boot, and the placeholders are plain `${DOMAIN}`. The `:-localhost` default moved to the compose `environment:` block, where shell syntax *is* valid. Added `NGINX_ENVSUBST_FILTER=DOMAIN` so envsubst can never touch nginx's own `$host` / `$request_uri` / `$remote_addr`.
+- Verified: envsubst runs and the config parses. nginx then stops at `cannot load certificate /etc/letsencrypt/live/<domain>/fullchain.pem` — the correct, expected behaviour when no certificate has been issued yet (step 3 of the TLS setup in the compose header). Unrelated to Coolify deployments, which use Traefik and never load this file.
+
+
 ### Fix — subnet scan bounced straight back to the scope summary (2026-07-22)
 
 Starting a DHCP subnet scan (and, latently, an Engines → Tools → Scan) appeared to launch and then immediately return the operator to the scope summary with no watcher and no results.
