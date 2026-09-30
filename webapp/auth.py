@@ -192,7 +192,20 @@ def login():
     if "user" in session:
         return redirect(url_for("index"))
     redirect_uri = url_for("auth.callback", _external=True)
-    return oauth.microsoft.authorize_redirect(redirect_uri)
+    # `authorize_redirect` fetches the OIDC discovery document from
+    # login.microsoftonline.com on every call (Authlib caches nothing
+    # across requests). A transient 4xx/5xx or a network hiccup there
+    # used to escape the view and surface as a bare "Internal Server
+    # Error" page — most visibly right after /logout, which lands here.
+    # Render the sign-in card with the reason instead so the operator
+    # can simply retry with the button (2026-09-17).
+    try:
+        return oauth.microsoft.authorize_redirect(redirect_uri)
+    except Exception as exc:
+        log.exception("Could not start the Entra ID sign-in redirect")
+        flash(f"Could not reach Microsoft Entra ID to start sign-in: {exc}",
+              "danger")
+        return render_template("auth/login.html"), 503
 
 
 @auth_bp.route("/auth/callback")
@@ -292,10 +305,71 @@ def callback():
     return redirect(url_for("select_profile"))
 
 
+def _entra_end_session_url(post_logout_redirect_uri: str) -> str:
+    """Build the Entra ID RP-initiated logout URL.
+
+    Prefers the ``end_session_endpoint`` advertised in the OIDC discovery
+    document; falls back to the well-known v2.0 path when the discovery
+    fetch fails (we're logging out — don't let a metadata hiccup turn
+    into a 500). Returns "" when no Azure tenant is configured.
+    """
+    from urllib.parse import urlencode
+
+    endpoint = ""
+    try:
+        endpoint = (oauth.microsoft.load_server_metadata() or {}).get(
+            "end_session_endpoint") or ""
+    except Exception as exc:
+        log.warning("OIDC metadata unavailable for logout (%s) — using the "
+                    "well-known Entra ID end-session URL", exc)
+    if not endpoint:
+        tenant = _aad_tenant_id()
+        if not tenant:
+            return ""
+        endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/logout"
+    return endpoint + "?" + urlencode(
+        {"post_logout_redirect_uri": post_logout_redirect_uri})
+
+
 @auth_bp.route("/logout")
 def logout():
-    """Clear the session and return to the login page."""
+    """Clear the local session AND end the Entra ID session.
+
+    Before 2026-09-17 this only cleared the Flask cookie and bounced to
+    /login — which immediately redirected to Microsoft, whose SSO
+    cookie was still alive, so the callback silently signed the same
+    user straight back in. Logout looked like it did nothing.
+
+    Now: clear the cookie, then send the browser to Entra ID's
+    end-session endpoint with ``post_logout_redirect_uri`` pointing at
+    /logged-out — a page that does NOT auto-start a new sign-in. The
+    Azure App Registration must list that URI as a redirect URI
+    (``scripts/azure-setup.sh`` registers it); if it isn't listed,
+    Microsoft still signs the user out but shows its own "you're signed
+    out" page instead of returning here.
+    """
     email = session.get("user", {}).get("email", "")
     session.clear()
     log.info("User logged out: %s", email)
-    return redirect(url_for("auth.login"))
+    target = _entra_end_session_url(url_for("auth.logged_out", _external=True))
+    if not target:
+        # No Azure tenant configured (dev bypass / misconfigured env):
+        # nothing upstream to end, just land on the signed-out page.
+        return redirect(url_for("auth.logged_out"))
+    return redirect(target)
+
+
+@auth_bp.route("/logged-out")
+def logged_out():
+    """Post-logout landing page — the sign-in card, no auto-redirect.
+
+    Entra ID returns here after ending its session. Unlike /login this
+    view never starts a new authorization flow on its own, so the
+    operator gets an explicit "Sign in with Microsoft" button instead of
+    being bounced back through SSO.
+    """
+    if "user" in session:
+        return redirect(url_for("index"))
+    session.clear()
+    flash("You have been signed out.", "info")
+    return render_template("auth/login.html")

@@ -243,7 +243,7 @@ The installer sets up Docker, Traefik, the Coolify dashboard, and a persistent d
 
 7. Click **Deploy** — Coolify pulls the repo, builds the image, starts the container, and provisions TLS
 
-8. **Important Azure AD step**: before users can log in, set the redirect URI in your App Registration to `https://admin.yourcompany.com/auth/callback` (if not already configured by `azure-setup.sh --domain`)
+8. **Important Azure AD step**: before users can log in, set the redirect URIs in your App Registration to `https://admin.yourcompany.com/auth/callback` **and** `https://admin.yourcompany.com/logged-out` (if not already configured by `azure-setup.sh --domain`). The second one is the `post_logout_redirect_uri` — without it, Logout still ends the Microsoft session but the browser stays on Microsoft's "you're signed out" page instead of returning to FlexEdgeAdmin.
 
 ### 3d. First-run setup
 
@@ -812,7 +812,7 @@ Common issues:
 
 The app runs behind a reverse proxy in all three options. The proxy must set `X-Forwarded-Proto: https` and `X-Forwarded-For` headers. The app includes `ProxyFix` middleware to handle this — nginx, Traefik/Coolify, and Apache all set these headers by default.
 
-If Azure AD reports "redirect URI mismatch": confirm the exact URL in the App Registration matches what the app generates. For Coolify, it must be `https://<your-domain>/auth/callback`.
+If Azure AD reports "redirect URI mismatch": confirm the exact URL in the App Registration matches what the app generates. For Coolify, it must be `https://<your-domain>/auth/callback`. Register `https://<your-domain>/logged-out` alongside it so Logout returns to the sign-in page.
 
 ### Setup wizard doesn't appear
 

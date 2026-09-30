@@ -145,10 +145,15 @@ if [[ -z "$DOMAIN" ]]; then
     ask "Production domain (leave empty for dev-only)" "" DOMAIN
 fi
 
-# Build redirect URIs
-REDIRECT_URIS="http://localhost:${PORT}/auth/callback"
+# Build redirect URIs.
+# /auth/callback  — OIDC sign-in callback.
+# /logged-out     — post_logout_redirect_uri for RP-initiated logout; Entra
+#                   ID only honours it when it is a registered redirect URI
+#                   (otherwise it signs the user out but shows its own
+#                   "you're signed out" page instead of returning to FEA).
+REDIRECT_URIS="http://localhost:${PORT}/auth/callback http://localhost:${PORT}/logged-out"
 if [[ -n "$DOMAIN" ]]; then
-    REDIRECT_URIS="${REDIRECT_URIS} https://${DOMAIN}/auth/callback"
+    REDIRECT_URIS="${REDIRECT_URIS} https://${DOMAIN}/auth/callback https://${DOMAIN}/logged-out"
 fi
 
 echo ""

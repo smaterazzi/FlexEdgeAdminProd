@@ -28,7 +28,8 @@ Routes
 ------
   /login                         Microsoft Entra ID redirect
   /auth/callback                 OIDC callback
-  /logout                        Clear session
+  /logout                        Clear session + Entra ID end-session redirect
+  /logged-out                    Post-logout landing (no auto sign-in)
   /select-profile                Pick an SMC API profile
   /select-domain                 Pick an SMC admin domain
   /                              Dashboard
