@@ -67,6 +67,55 @@ def parse_networks(raw: str) -> List[str]:
     return nets
 
 
+def _iface_network(address: str, network_value: str):
+    """SMC NDI `network_value` is normally the CIDR ("10.1.0.0/24"); fall back
+    to address + dotted mask. None when nothing usable."""
+    nv = (network_value or "").strip()
+    try:
+        if "/" in nv:
+            return ipaddress.ip_network(nv, strict=False)
+        if address and nv:
+            return ipaddress.ip_interface(f"{address.strip()}/{nv}").network
+    except ValueError:
+        return None
+    return None
+
+
+def interface_networks(clusters) -> List[dict]:
+    """Subnets attached to firewall interfaces — candidates for an agent's
+    reachable networks (the New-agent picker).
+
+    `clusters` is an iterable of `(engine_name, cluster_dict)` where
+    `cluster_dict` is the cached `domain_objects.cluster` shape: `interfaces[]`
+    and `nodes[].interfaces[]`, each `{interface_id, vlan_id, zone,
+    addresses: [{address, network_value}]}`. Host routes (/32, /128),
+    loopback, link-local and unspecified networks are dropped.
+
+    Returns `[{"network": "10.1.0.0/24", "sources": ["FW01 1.42 · Inside", …]}]`
+    sorted by address family, then network."""
+    found = {}
+    for engine_name, detail in clusters:
+        detail = detail or {}
+        ifaces = list(detail.get("interfaces") or [])
+        for node in detail.get("nodes") or []:
+            ifaces.extend(node.get("interfaces") or [])
+        for iface in ifaces:
+            label = str(iface.get("interface_id") or "?")
+            if iface.get("vlan_id"):
+                label += f".{iface['vlan_id']}"
+            source = f"{engine_name} {label}" + (f" · {iface['zone']}" if iface.get("zone") else "")
+            for addr in iface.get("addresses") or []:
+                net = _iface_network(addr.get("address", ""), addr.get("network_value", ""))
+                if (net is None or net.prefixlen == net.max_prefixlen or net.is_loopback
+                        or net.is_link_local or net.is_unspecified):
+                    continue
+                sources = found.setdefault(net, [])
+                if source not in sources:
+                    sources.append(source)
+    ordered = sorted(found, key=lambda n: (n.version, int(n.network_address), n.prefixlen))
+    return [{"network": str(n), "sources": found[n]} for n in ordered]
+
+
 def covers(cidrs: Iterable[str], ip: str) -> bool:
     """True when `ip` falls inside any of `cidrs`. Bad entries are skipped."""
     try:

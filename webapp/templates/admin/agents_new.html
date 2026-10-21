@@ -58,6 +58,22 @@
                     <textarea class="form-control bg-dark text-light border-secondary font-monospace" name="reachable_networks"
                               rows="4" placeholder="10.0.0.0/24&#10;10.20.0.0/16">{{ form.reachable_networks }}</textarea>
                     <div class="form-text">One CIDR per line. Declared by you, never by the agent: tasks whose targets all fall inside are eligible for this agent.</div>
+
+                    <div id="inv-nets" class="border border-secondary rounded p-2 mt-2 small d-none">
+                        <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-1">
+                            <span><i class="bi bi-diagram-3"></i> Subnets on this Domain's firewall interfaces
+                                <span id="inv-meta" class="text-muted"></span></span>
+                            <span>
+                                <button type="button" class="btn btn-link btn-sm p-0 me-2" id="inv-all">Select all</button>
+                                <button type="button" class="btn btn-link btn-sm p-0 me-2" id="inv-none">Clear</button>
+                                <button type="button" class="btn btn-link btn-sm p-0" id="inv-refresh"><i class="bi bi-arrow-clockwise"></i> Refresh from SMC</button>
+                            </span>
+                        </div>
+                        <div id="inv-status" class="text-muted"></div>
+                        <div id="inv-list" class="row row-cols-1 row-cols-md-2 g-1"></div>
+                        <div class="text-muted mt-1">Ticking adds the subnet to the list above; you can still type others by hand.
+                            Only tick the networks the agent's machine can actually reach.</div>
+                    </div>
                 </div>
 
                 <div class="mb-3">
@@ -79,4 +95,77 @@
         </div>
     </div>
 </div>
+<script>
+(function () {
+    // Reachable-network picker: subnets on the chosen Domain's firewall
+    // interfaces (from the cached SMC inventory). The textarea stays the source
+    // of truth — ticking adds a line, unticking removes it, typed lines are kept.
+    var base = "{{ url_for('agents_admin.domain_networks', domain_id=0) }}".replace(/0$/, "");
+    var sel = document.querySelector('select[name="domain_id"]');
+    var ta = document.querySelector('textarea[name="reachable_networks"]');
+    var box = document.getElementById("inv-nets"), list = document.getElementById("inv-list");
+    var status = document.getElementById("inv-status"), meta = document.getElementById("inv-meta");
+    var seq = 0;
+
+    function lines() { return ta.value.split(/[\s,]+/).filter(Boolean); }
+    function setLines(arr) { ta.value = arr.join("\n"); }
+    function boxes() { return list.querySelectorAll('input[type="checkbox"]'); }
+    function syncChecks() {
+        var have = new Set(lines());
+        boxes().forEach(function (cb) { cb.checked = have.has(cb.value); });
+    }
+    function toggle(net, on) {
+        var cur = lines().filter(function (l) { return l !== net; });
+        if (on) cur.push(net);
+        setLines(cur);
+    }
+
+    function load(refresh) {
+        var id = sel.value, my = ++seq;
+        list.textContent = ""; meta.textContent = "";
+        if (!id) { box.classList.add("d-none"); return; }
+        box.classList.remove("d-none");
+        status.textContent = refresh ? "Refreshing from SMC…" : "Loading firewall inventory…";
+        fetch(base + id + (refresh ? "?refresh=1" : ""), {headers: {"Accept": "application/json"}})
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (my !== seq) return;                 // a newer Domain was picked meanwhile
+                if (!d.ok) { status.textContent = d.error || "Inventory unavailable."; return; }
+                var nets = d.networks || [];
+                meta.textContent = "· " + nets.length + " subnet(s) on " + d.engines + " firewall(s)"
+                    + (d.cached && d.age_seconds != null ? " · cached " + Math.round(d.age_seconds / 60) + " min ago" : " · fresh");
+                status.textContent = nets.length ? "" : "No interface subnets found for this Domain.";
+                if (d.errors && d.errors.length) status.textContent += " Skipped: " + d.errors.join("; ");
+                nets.forEach(function (n) {
+                    var col = document.createElement("div"), lab = document.createElement("label");
+                    var cb = document.createElement("input"), code = document.createElement("code");
+                    var src = document.createElement("span");
+                    col.className = "col"; lab.className = "form-check mb-0";
+                    cb.type = "checkbox"; cb.className = "form-check-input"; cb.value = n.network;
+                    cb.addEventListener("change", function () { toggle(n.network, cb.checked); });
+                    code.textContent = n.network;
+                    src.className = "text-muted ms-1"; src.textContent = "— " + n.sources.join(", ");
+                    lab.appendChild(cb); lab.appendChild(document.createTextNode(" ")); lab.appendChild(code); lab.appendChild(src);
+                    col.appendChild(lab); list.appendChild(col);
+                });
+                syncChecks();
+            })
+            .catch(function () { if (my === seq) status.textContent = "Could not load the firewall inventory."; });
+    }
+
+    sel.addEventListener("change", function () { load(false); });
+    ta.addEventListener("input", syncChecks);
+    document.getElementById("inv-refresh").addEventListener("click", function () { load(true); });
+    document.getElementById("inv-all").addEventListener("click", function () {
+        var cur = lines();
+        boxes().forEach(function (cb) { if (cur.indexOf(cb.value) < 0) cur.push(cb.value); });
+        setLines(cur); syncChecks();
+    });
+    document.getElementById("inv-none").addEventListener("click", function () {
+        var mine = new Set(Array.prototype.map.call(boxes(), function (cb) { return cb.value; }));
+        setLines(lines().filter(function (l) { return !mine.has(l); })); syncChecks();
+    });
+    if (sel.value) load(false);                        // re-render after a validation error
+})();
+</script>
 {% endblock %}

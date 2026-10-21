@@ -466,3 +466,46 @@ def agents_settings():
         offline_after_s=pool.cfg.offline_after_s,
         heartbeat_every_s=pool.cfg.heartbeat_every_s,
     )
+
+
+# ── New-agent picker: subnets on the Domain's firewall interfaces ────────
+
+@agents_admin_bp.route("/domain-networks/<int:domain_id>")
+@super_admin_required
+def domain_networks(domain_id):
+    """JSON for the New-agent form: every subnet attached to an interface of
+    the chosen Domain's firewalls, as reachable-network candidates.
+
+    Reads through the shared `engines` + `cluster` caches (Loose TTL, the
+    same entries /engines/clusters fills) with THAT Domain's API key — the
+    Super Admin creating the agent may have another Domain active.
+    `?refresh=1` refetches from SMC. One engine failing doesn't hide the
+    others; its error is reported alongside."""
+    domain = Domain.query.get(domain_id)
+    if domain is None or not domain.is_active:
+        return jsonify({"ok": False, "error": "unknown or inactive Domain"}), 404
+    from webapp import domain_objects
+    from webapp.dhcp_manager import _smc_cfg_dict
+    refresh = request.args.get("refresh") == "1"
+    try:
+        cfg = _smc_cfg_dict(domain)
+        engines, cv = domain_objects.engines(domain, cfg, refresh=refresh)
+    except Exception as exc:  # noqa: BLE001 — SMC down / bad key: tell the form, don't 500
+        log.warning("domain_networks(%s): engine list failed: %s", domain.slug, exc)
+        return jsonify({"ok": False, "error": f"SMC inventory unavailable: {exc}"}), 502
+    clusters, errors = [], []
+    for eng in engines:
+        try:
+            _detail, ccv = domain_objects.cluster(domain, cfg, eng.name, refresh=refresh)
+            clusters.append((eng.name, (ccv.data if ccv else None) or {}))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{eng.name}: {exc}")
+    return jsonify({
+        "ok": True,
+        "domain": domain.slug,
+        "engines": len(engines),
+        "networks": agent_router.interface_networks(clusters),
+        "errors": errors,
+        "cached": bool(cv and cv.served_from_cache) and not refresh,
+        "age_seconds": int(cv.age_seconds) if cv and cv.age_seconds is not None else None,
+    })

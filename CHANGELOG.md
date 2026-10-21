@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-22
 
+### Remote agents — New-agent form suggests the Domain's firewall subnets (2026-10-21)
+
+Operators had to type every reachable network by hand, although FlexEdge already knows the networks behind the Domain's firewalls. Picking the Domain on **Admin → Agents → New agent** now loads a checklist of every subnet attached to an interface of that Domain's engines, labelled with where it comes from (`FW01 1.42 · Inside`); ticking adds the CIDR to the textarea, unticking removes it, typed entries are kept, *Select all* / *Clear* / *Refresh from SMC* included.
+
+- **[shared/agent_router.py](shared/agent_router.py) `interface_networks(clusters)`** — pure helper over the cached `domain_objects.cluster` dicts (cluster-level and per-node interfaces): CIDR from `network_value`, falling back to address + dotted mask; de-duplicated across engines and nodes; host routes, loopback, link-local and unspecified networks dropped; output re-parses through `parse_networks`.
+- **`GET /admin/agents/domain-networks/<domain_id>`** (Super Admin, JSON) — reads the shared `engines` + `cluster` caches (Loose TTL, the entries `/engines/clusters` fills) with **the chosen Domain's** API key, not the Super Admin's active one; `?refresh=1` refetches; one failing engine is listed in `errors` instead of hiding the rest; SMC unreachable → 502 with the reason, never a 500.
+- The picker writes SMC-supplied labels with `textContent` only. Tests: `test_router.py` +4 (84 total); route + form harness 9/9 (chosen-Domain key used, per-engine error, refresh, 404 / 502, picked + typed networks persisted on create).
+
 ### Remote agents — production-readiness fixes (2026-10-21)
 
 Found while preparing the first production test; all three would have bitten on the first deploy.
