@@ -474,7 +474,9 @@ the customer's side. Four things the deployment must provide:
    pull the new compose file and redeploy — the mount is new, so agents
    enrolled before it existed (none, if you are upgrading from a release
    without agents) would have lived in the container layer. Losing the
-   mount means every agent must be re-enrolled.
+   mount means every agent must be re-enrolled. `/admin/backup` includes
+   `agents.json` (as `data/agents/agents.json`), so restoring a backup keeps
+   agents authenticating; Factory Reset revokes and removes every agent.
 4. **`/agent/*` reachable without authentication.** These routes authenticate
    the *machine* (`X-Agent-Key` + `X-Agent-Device`) and are deliberately
    outside the session + CSRF layer. `POST /agent/enroll`, `GET /agent/script`,

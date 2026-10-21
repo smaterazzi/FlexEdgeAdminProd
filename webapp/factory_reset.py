@@ -103,6 +103,9 @@ def build_backup_zip(prefix: str = "flexedge-backup") -> tuple[bytes, str]:
       Restore reinstates the on-disk PEM files alongside the
       ``ManagedCertificate`` rows that point at them — no re-upload
       from the operator required.
+    * ``data/agents/agents.json`` — remote-agent registry (key/token
+      hashes + device bindings, no plaintext keys) so restored agents
+      keep authenticating without re-enrollment.
 
     The caller picks the filename prefix — ``"flexedge-backup"`` for
     ``/admin/backup`` downloads; ``"flexedge-pre-reset-backup"`` for
@@ -137,7 +140,7 @@ def build_backup_zip(prefix: str = "flexedge-backup") -> tuple[bytes, str]:
         pfx_dir = ""
 
     buf = io.BytesIO()
-    counts = {"letsencrypt": 0, "projects": 0, "pfx": 0}
+    counts = {"letsencrypt": 0, "projects": 0, "pfx": 0, "agents": 0}
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         if os.path.isfile(db_path):
             zf.write(db_path, "flexedge.db")
@@ -157,9 +160,22 @@ def build_backup_zip(prefix: str = "flexedge-backup") -> tuple[bytes, str]:
         counts["pfx"] = _walk_dir_into_zip(
             zf, pfx_dir, "imported-certs",
         )
+        # Remote-agent registry: key/token hashes + device bindings (no
+        # plaintext keys). Without it a restore forces every agent to
+        # re-enroll. The task-state mirror is transient and skipped.
+        try:
+            from webapp.agents_manager import _resolve_data_dir
+            registry = _resolve_data_dir() / "agents.json"
+            if registry.is_file():
+                zf.write(str(registry), "data/agents/agents.json")
+                counts["agents"] = 1
+        except Exception as exc:
+            log.warning("Backup: could not add agent registry: %s", exc)
 
-    log.info("Backup ZIP built: %d LE files, %d project files, %d PFX files",
-             counts["letsencrypt"], counts["projects"], counts["pfx"])
+    log.info("Backup ZIP built: %d LE files, %d project files, %d PFX files, "
+             "agent registry %s",
+             counts["letsencrypt"], counts["projects"], counts["pfx"],
+             "included" if counts["agents"] else "absent")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     return buf.getvalue(), f"{prefix}-{timestamp}.zip"
 
@@ -292,6 +308,16 @@ def perform_reset(*, invoking_user_id: int) -> ResetReport:
     except Exception:
         db.session.rollback()
         raise
+
+    # ── Remote agents (best-effort) ──────────────────────────────────
+    # remote_agents rows went with their Domains (ON DELETE CASCADE), but
+    # the pool registry (data/agents/agents.json) is a file: without this
+    # every agent key would keep authenticating after the reset.
+    try:
+        from webapp.agents_manager import retire_all_agents
+        report.rows_deleted["agent_pool_registry"] = retire_all_agents()
+    except Exception as exc:
+        log.warning("factory_reset: retiring remote agents failed: %s", exc)
 
     # ── Filesystem wipe (best-effort) ────────────────────────────────
     _wipe_filesystem(report)

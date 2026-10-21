@@ -202,13 +202,14 @@ def purge_domain(domain: Domain) -> PurgeReport:
     # ── Best-effort filesystem cleanup (after commit) ────────────────────
     _wipe_sginfo_archives(sginfo_records, report)
     # Remote agents: the pool registry (data/agents/agents.json) holds the
-    # key hashes + device bindings under the same names — drop those too.
+    # key hashes + device bindings under the same names — revoke + drop
+    # those too (retire_agent revokes first; a bare delete_agent refuses
+    # a live agent and would leave its key working).
     if agent_names:
         try:
-            from webapp.agents_manager import get_pool
-            pool = get_pool()
+            from webapp.agents_manager import retire_agent
             for name in agent_names:
-                pool.delete_agent(name)
+                retire_agent(name)
         except Exception:  # noqa: BLE001 — best-effort, DB purge already committed
             log.exception("domain_purge: pool delete_agent failed for %s", agent_names)
 

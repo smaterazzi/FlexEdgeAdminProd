@@ -61,6 +61,25 @@ def _resolve_data_dir() -> Path:
 _pool = None
 
 
+def retire_agent(name: str) -> bool:
+    """Remove an agent from the pool for good: revoke (the kit's
+    `delete_agent` refuses a live agent, which used to leave a deleted
+    agent's key working), delete the registry record, drop its pending
+    secret refs. Idempotent; returns True when the record is gone."""
+    pool = get_pool()
+    pool.revoke_agent(name)            # no-op when already revoked / unknown
+    ok, _err = pool.delete_agent(name)
+    revoke_refs_for_agent(name)
+    return ok or pool.get_agent(name) is None
+
+
+def retire_all_agents() -> int:
+    """Factory reset: retire every agent in the pool registry, including
+    ones with no `remote_agents` row. Returns how many were removed."""
+    names = [a.get("name") for a in get_pool().list_agents() if a.get("name")]
+    return sum(1 for n in names if retire_agent(n))
+
+
 def get_pool() -> AgentPool:
     global _pool
     if _pool is None:
@@ -298,7 +317,7 @@ def agent_new():
             db.session.commit()
         except Exception as exc:  # noqa: BLE001
             db.session.rollback()
-            pool.delete_agent(name)
+            retire_agent(name)
             log.exception("remote_agents insert failed for %s", name)
             flash(f"Could not create agent: {exc}", "danger")
             return render_template("admin/agents_new.html", domains=domains, form=form)
@@ -377,8 +396,7 @@ def agent_delete(agent_id):
         db.session.rollback()
         flash(f"Could not delete agent: {exc}", "danger")
         return redirect(url_for("agents_admin.agents_list"))
-    get_pool().delete_agent(name)
-    revoke_refs_for_agent(name)
+    retire_agent(name)
     audit("agents", "agent.delete", target=name, status="warning")
     flash(f"'{name}' deleted.", "success")
     return redirect(url_for("agents_admin.agents_list"))

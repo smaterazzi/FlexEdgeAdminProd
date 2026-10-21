@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-22
 
+### Remote agents — deleting an agent now kills its key; backup + factory reset cover the registry (2026-10-21)
+
+- **Security fix: Delete left the agent's key working.** The kit's `AgentPool.delete_agent` refuses an agent that isn't revoked (`"revoke the agent first"`), and the admin **Delete** button, Domain hard-delete (`domain_purge`) and the create-rollback path all called it without revoking and ignored the refusal. Result: the `remote_agents` row disappeared from the UI while the pool record — and the key — kept authenticating on `/agent/*`. New `webapp.agents_manager.retire_agent(name)` (revoke → delete → drop pending secret refs, idempotent) is now the only removal path.
+- **Factory Reset retires every agent.** `remote_agents` rows already cascaded away with their Domains, but `data/agents/agents.json` is a file the reset never touched, so every agent kept a valid key afterwards. `perform_reset` now calls `retire_all_agents()` (reported as `agent_pool_registry` in the reset summary).
+- **`/admin/backup` includes `data/agents/agents.json`** (key/token hashes + device bindings, no plaintext keys). Before, a restore forced every agent to re-enroll. The transient task mirror is still skipped.
+- Tests: `tests/agents/test_retire.py` (+4, 88 total) — live agent's key dies and stays dead after a reload from disk, secret refs dropped, idempotent, retire-all includes never-enrolled agents. Smoke on a scratch DB: backup ZIP lists `data/agents/agents.json`; after reset the enrolled key no longer resolves and the pool is empty.
+
 ### Remote agents — New-agent form suggests the Domain's firewall subnets (2026-10-21)
 
 Operators had to type every reachable network by hand, although FlexEdge already knows the networks behind the Domain's firewalls. Picking the Domain on **Admin → Agents → New agent** now loads a checklist of every subnet attached to an interface of that Domain's engines, labelled with where it comes from (`FW01 1.42 · Inside`); ticking adds the CIDR to the textarea, unticking removes it, typed entries are kept, *Select all* / *Clear* / *Refresh from SMC* included.
