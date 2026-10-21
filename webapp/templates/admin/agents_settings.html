@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Agent Settings{% endblock %}
+
+{% block content %}
+<div class="p-4">
+
+  <div class="d-flex justify-content-between align-items-center mb-3">
+    <h2 class="mb-0"><i class="bi bi-diagram-3"></i> Remote Agents — Settings</h2>
+    <a href="{{ url_for('agents_admin.agents_list') }}" class="btn btn-sm btn-outline-secondary">
+      <i class="bi bi-arrow-left"></i> Back to Agents
+    </a>
+  </div>
+
+  {% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, msg in messages %}
+  <div class="alert alert-{{ category }}" role="alert">{{ msg }}</div>
+  {% endfor %}
+  {% endwith %}
+
+  <div class="card mb-3">
+    <div class="card-body small">
+      <p class="mb-2">
+        The router decides where a task runs from the <strong>IPs it will
+        touch</strong>: first an online agent of the Domain whose
+        <em>reachable networks</em> cover every target (shortest queue
+        wins); otherwise, if the networks below cover every target, the
+        task runs <strong>locally on this FlexEdge server</strong> in a
+        background thread — <em>pure local execution</em>, same code path,
+        no agent; otherwise it is refused with a message naming the
+        uncovered addresses.
+      </p>
+      <p class="mb-0">
+        Declare here only networks this server can actually reach (its own
+        LAN, routed VPN subnets). An agent is never consulted for addresses
+        outside its own list, and a task is never split across executors.
+      </p>
+    </div>
+  </div>
+
+  <form method="POST">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <div class="card mb-3">
+      <div class="card-header"><strong>Networks reachable from this FlexEdge server</strong></div>
+      <div class="card-body">
+        <div class="row g-3">
+          <div class="col-md-6">
+            <label class="form-label small text-muted" for="server_reachable_networks">
+              One CIDR per line
+            </label>
+            <textarea class="form-control bg-dark text-light border-secondary font-monospace"
+                      id="server_reachable_networks" name="server_reachable_networks"
+                      rows="8" placeholder="10.0.0.0/24&#10;10.8.0.0/16">{{ server_networks|join('\n') }}</textarea>
+            <div class="text-muted small mt-1">
+              Currently:
+              {% for n in server_networks %}<span class="badge bg-info text-dark me-1">{{ n }}</span>{% else %}<em>none — tasks never run locally</em>{% endfor %}
+            </div>
+          </div>
+          <div class="col-md-6 d-flex align-items-end">
+            <button type="submit" class="btn btn-primary">
+              <i class="bi bi-save"></i> Save
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </form>
+
+  <div class="card">
+    <div class="card-header"><strong>Pool timings</strong> <span class="text-muted small">(read-only in this phase)</span></div>
+    <div class="card-body small">
+      <div class="row">
+        <div class="col-md-4">
+          <span class="text-muted">Long-poll wait</span><br>
+          <strong>{{ poll_wait_s|int }} s</strong>
+          <div class="text-muted">Each online agent parks one server thread for this long per poll.</div>
+        </div>
+        <div class="col-md-4">
+          <span class="text-muted">Heartbeat every</span><br>
+          <strong>{{ heartbeat_every_s|int }} s</strong>
+          <div class="text-muted">Advertised to agents at enrollment / registration.</div>
+        </div>
+        <div class="col-md-4">
+          <span class="text-muted">Offline after</span><br>
+          <strong>{{ offline_after_s|int }} s</strong>
+          <div class="text-muted">No contact for this long → agent shown offline, not routable.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+{% endblock %}

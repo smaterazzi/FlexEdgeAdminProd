@@ -1,0 +1,82 @@
+{% extends "base.html" %}
+{% block title %}New Remote Agent{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('agents_admin.agents_list') }}">Remote Agents</a></li>
+            <li class="breadcrumb-item active">New</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4" style="max-width: 760px;">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <div class="card bg-dark border-secondary">
+        <div class="card-header"><i class="bi bi-hdd-network"></i> New remote agent</div>
+        <div class="card-body">
+            <form method="POST">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+
+                <div class="mb-3">
+                    <label class="form-label">Name <span class="text-danger">*</span></label>
+                    <input type="text" class="form-control bg-dark text-light border-secondary font-monospace"
+                           name="name" value="{{ form.name }}" required maxlength="40"
+                           pattern="[A-Za-z0-9][A-Za-z0-9_\-]{0,39}" placeholder="site-a-nuc">
+                    <div class="form-text">Letters, digits, <code>_</code> or <code>-</code>; max 40. Globally unique — prefix with the Domain slug.</div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">Display name</label>
+                    <input type="text" class="form-control bg-dark text-light border-secondary"
+                           name="display_name" value="{{ form.display_name }}" maxlength="128" placeholder="Site A — rack NUC">
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">Domain <span class="text-danger">*</span></label>
+                    <select class="form-select bg-dark text-light border-secondary" name="domain_id" required>
+                        <option value="">— pick a Domain —</option>
+                        {% for d in domains %}
+                        <option value="{{ d.id }}" {% if form.domain_id == d.id|string %}selected{% endif %}>{{ d.display_name }} ({{ d.slug }})</option>
+                        {% endfor %}
+                    </select>
+                    <div class="form-text">An agent belongs to exactly one Domain. A customer with two sites enrolls two agents.</div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">Reachable networks</label>
+                    <textarea class="form-control bg-dark text-light border-secondary font-monospace" name="reachable_networks"
+                              rows="4" placeholder="10.0.0.0/24&#10;10.20.0.0/16">{{ form.reachable_networks }}</textarea>
+                    <div class="form-text">One CIDR per line. Declared by you, never by the agent: tasks whose targets all fall inside are eligible for this agent.</div>
+                </div>
+
+                <div class="mb-3">
+                    <label class="form-label">Notes</label>
+                    <textarea class="form-control bg-dark text-light border-secondary" name="notes" rows="2">{{ form.notes }}</textarea>
+                </div>
+
+                <div class="alert alert-info small">
+                    <i class="bi bi-info-circle"></i>
+                    The next page shows the enrollment token <strong>once</strong> together with the one-line
+                    installer to paste on the agent machine. The token expires in 15 minutes.
+                </div>
+
+                <div class="d-flex gap-2">
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-plus-circle me-1"></i>Create and show token</button>
+                    <a href="{{ url_for('agents_admin.agents_list') }}" class="btn btn-secondary">Cancel</a>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endblock %}

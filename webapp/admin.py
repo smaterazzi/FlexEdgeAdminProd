@@ -76,9 +76,13 @@ def dashboard():
     users = User.query.filter_by(is_active=True).count()
     api_keys = ApiKey.query.filter_by(is_active=True).count()
     domains = Domain.query.filter_by(is_active=True).count()
+    from webapp.models import RemoteAgent, NetSightConnection
+    agents = RemoteAgent.query.count()
+    netsight = NetSightConnection.query.count()
     return render_template("admin/dashboard.html",
                            tenant_count=tenants, user_count=users,
-                           key_count=api_keys, domain_count=domains)
+                           key_count=api_keys, domain_count=domains,
+                           agent_count=agents, netsight_count=netsight)
 
 
 # ── Tenants ─────────────────────────────────────────────────────────────

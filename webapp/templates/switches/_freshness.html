@@ -1,0 +1,26 @@
+{# Cache-freshness badge + Refresh button — same pattern as engines/clusters.html.
+   Expects `cache_meta` (CachedValue or None) and `refresh_url`. #}
+{% if cache_meta %}
+<div class="d-flex align-items-center gap-2 small">
+  {% if cache_meta.served_from_cache %}
+    {% set mins = (cache_meta.age_minutes)|round(0)|int %}
+    <span class="text-muted" title="Served from process cache. Click Refresh to query NetSight again.">
+      <i class="bi bi-database-check"></i>
+      cached · {{ mins if mins else '<1' }} min ago
+    </span>
+  {% else %}
+    <span class="text-success" title="Just fetched from NetSight (locally or via a remote agent).">
+      <i class="bi bi-cloud-download"></i>
+      fresh from NetSight
+    </span>
+  {% endif %}
+  <a href="{{ refresh_url }}" class="btn btn-sm btn-outline-secondary"
+     title="Query NetSight again and repopulate the cache.">
+    <i class="bi bi-arrow-clockwise"></i> Refresh from NetSight
+  </a>
+</div>
+{% elif refresh_url %}
+<a href="{{ refresh_url }}" class="btn btn-sm btn-outline-secondary">
+  <i class="bi bi-arrow-clockwise"></i> Retry
+</a>
+{% endif %}

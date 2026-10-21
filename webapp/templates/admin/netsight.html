@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}NetSight Connections{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">NetSight</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <p class="text-muted small mb-3">
+        <i class="bi bi-info-circle"></i>
+        One <strong>Extreme Site Engine</strong> (NetSight) per Domain. The client secret is stored
+        encrypted and never leaves this server; the certificate fingerprint is pinned because Site
+        Engine's self-signed certificate cannot pass normal verification. <strong>Test</strong> resolves
+        the host and asks the agent router whether this server or a remote agent reaches it — only
+        the local case runs today (remote execution lands in RA-C).
+    </p>
+
+    <div class="table-responsive">
+        <table class="table table-dark table-sm table-hover managed-table align-middle" id="netsight-table"
+               data-export-name="netsight-connections">
+            <thead>
+                <tr>
+                    <th>Domain</th>
+                    <th>Site Engine</th>
+                    <th>Client ID</th>
+                    <th>Cert pin</th>
+                    <th data-sort-type="date">Last OK</th>
+                    <th>Last error</th>
+                    <th data-no-sort data-no-export style="width:170px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for it in items %}{% set d = it.domain %}{% set c = it.conn %}
+                <tr>
+                    <td>
+                        <span class="badge bg-secondary">{{ d.display_name }}</span>
+                        <code class="small text-muted">{{ d.slug }}</code>
+                        {% if not d.is_active %}<span class="badge bg-warning text-dark ms-1">inactive</span>{% endif %}
+                    </td>
+                    {% if c %}
+                    <td><code>{{ c.host }}:{{ c.port }}</code></td>
+                    <td class="small">{{ c.client_id }}</td>
+                    <td class="small font-monospace" data-export-value="{{ c.cert_sha256 }}" title="{{ c.cert_sha256 }}">{{ c.cert_sha256_short }}</td>
+                    <td class="small" data-sort-value="{{ c.last_ok_at.isoformat() if c.last_ok_at else '' }}">
+                        {% if c.last_ok_at %}<span class="text-success">{{ c.last_ok_at.strftime('%Y-%m-%d %H:%M') }} UTC</span>{% else %}<span class="text-muted">never</span>{% endif %}
+                    </td>
+                    <td class="small">{% if c.last_error %}<span class="text-danger">{{ c.last_error[:160] }}</span>{% else %}<span class="text-muted">—</span>{% endif %}</td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <a class="btn btn-outline-info" href="{{ url_for('netsight_admin.netsight_edit', domain_id=d.id) }}" title="Edit"><i class="bi bi-pencil"></i></a>
+                            <form method="POST" action="{{ url_for('netsight_admin.netsight_test', domain_id=d.id) }}" class="d-inline">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-success" title="Test — login + probe every NBI root (routing-aware)"><i class="bi bi-broadcast"></i></button>
+                            </form>
+                            <form method="POST" action="{{ url_for('netsight_admin.netsight_delete', domain_id=d.id) }}" class="d-inline"
+                                  data-name="{{ d.display_name }}"
+                                  onsubmit="return confirm('Delete the NetSight connection for ' + this.dataset.name + '? The stored client secret is wiped.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </div>
+                    </td>
+                    {% else %}
+                    <td colspan="5" class="text-muted small">not configured</td>
+                    <td>
+                        <a class="btn btn-outline-primary btn-sm" href="{{ url_for('netsight_admin.netsight_edit', domain_id=d.id) }}">
+                            <i class="bi bi-plus-circle me-1"></i>Configure
+                        </a>
+                    </td>
+                    {% endif %}
+                </tr>
+                {% else %}
+                <tr><td colspan="7" class="text-center text-muted py-4">No Domains yet — create one under <a href="{{ url_for('admin.domains') }}">Domains</a> first.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+{% endblock %}

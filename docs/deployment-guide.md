@@ -449,6 +449,50 @@ The web UI sends a CSRF token in every form via the `<meta name="csrf-token">` i
 
 ---
 
+## Remote agents
+
+Remote agents (see [RemoteAgents.md](RemoteAgents.md)) are customer-side Python
+processes that **dial out** to FlexEdgeAdmin; nothing inbound is ever opened on
+the customer's side. Four things the deployment must provide:
+
+1. **A public origin agents can dial.** Set `PUBLIC_URL=https://admin.example.com`
+   in `.env` (or the Coolify environment). It is baked into the installer
+   one-liner and the agents' self-update URL. If unset, the Portal derives it
+   from `X-Forwarded-Proto` / `X-Forwarded-Host` — correct behind nginx
+   (option 2) and Traefik (option 3) as shipped, wrong on a bare `make dev`
+   where it would say `http://localhost:8088`.
+2. **Long-poll friendly reverse proxy.** `GET /agent/poll` holds the
+   connection up to 20 s. The shipped [docker/nginx.conf](../docker/nginx.conf)
+   has `proxy_read_timeout 1h` (needed for the browser terminal anyway);
+   Coolify/Traefik defaults are fine. Do not add an aggressive idle timeout
+   in front of `/agent/*`.
+3. **Persistence of `/app/data/agents/`.** The agent registry (`agents.json`
+   — names, key *hashes*, device bindings) and the restart mirror
+   (`agent_pool_state.json`) live there. The shipped compose files mount it:
+   `../data/agents:/app/data/agents` (Docker + nginx) and the
+   `flexedge-agents` volume (Coolify). **Upgrading an existing deployment:**
+   pull the new compose file and redeploy — the mount is new, so agents
+   enrolled before it existed (none, if you are upgrading from a release
+   without agents) would have lived in the container layer. Losing the
+   mount means every agent must be re-enrolled.
+4. **`/agent/*` reachable without authentication.** These routes authenticate
+   the *machine* (`X-Agent-Key` + `X-Agent-Device`) and are deliberately
+   outside the session + CSRF layer. `POST /agent/enroll`, `GET /agent/script`,
+   `/agent/version`, `/agent/install.sh` are public by design (the agent file
+   is open source; the enrollment token is the credential). Any auth
+   middleware or WAF rule in front of FlexEdge must let `/agent/*` through.
+
+5. **NetSight reachability (only if you use Switches).** The Site Engine is
+   queried either from the FlexEdge host itself or from an agent inside the
+   customer LAN. Declare which networks the host reaches under
+   *Admin → Agents → Settings*; anything else needs an agent whose
+   *reachable networks* cover it. A pinned certificate fingerprint is
+   mandatory on the NetSight connection (*Admin → NetSight*).
+
+Everything else (`/admin/agents`, `/api/agents*`) is Super Admin behind the
+normal Azure AD session. gunicorn runs `--threads 32` because each online
+agent parks one worker thread during its long-poll; `-w 1` stays mandatory.
+
 ## TLS Manager — certbot integration
 
 The TLS Manager feature (`/tls/*`, admin-only) automates TLS certificate deployment onto Forcepoint NGFW engines. It can either:

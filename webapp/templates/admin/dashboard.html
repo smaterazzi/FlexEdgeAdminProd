@@ -84,6 +84,38 @@
                 </div>
             </div>
         </div>
+        <div class="col-md-3">
+            <div class="card bg-dark border-secondary stat-card">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-muted" style="font-size:0.8rem;">Remote Agents</div>
+                            <h3 class="mb-0">{{ agent_count if agent_count is defined else '—' }}</h3>
+                        </div>
+                        <i class="bi bi-hdd-network text-info" style="font-size:2rem;"></i>
+                    </div>
+                    <a href="{{ url_for('agents_admin.agents_list') }}" class="btn btn-outline-info btn-sm mt-3 w-100">
+                        Manage Agents
+                    </a>
+                </div>
+            </div>
+        </div>
+        <div class="col-md-3">
+            <div class="card bg-dark border-secondary stat-card">
+                <div class="card-body">
+                    <div class="d-flex justify-content-between align-items-center">
+                        <div>
+                            <div class="text-muted" style="font-size:0.8rem;">NetSight</div>
+                            <h3 class="mb-0">{{ netsight_count if netsight_count is defined else '—' }}</h3>
+                        </div>
+                        <i class="bi bi-diagram-2 text-info" style="font-size:2rem;"></i>
+                    </div>
+                    <a href="{{ url_for('netsight_admin.netsight_list') }}" class="btn btn-outline-info btn-sm mt-3 w-100">
+                        Site Engine connections
+                    </a>
+                </div>
+            </div>
+        </div>
         {% endif %}
     </div>
 

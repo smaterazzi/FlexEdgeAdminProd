@@ -350,6 +350,12 @@
                             </a>
                         </li>
                         <li class="nav-item">
+                            <a class="nav-link {% if request.path.startswith('/switches') %}active{% endif %}"
+                               href="{{ url_for('switches.switches_list') }}">
+                                <i class="bi bi-hdd-network"></i> Switches
+                            </a>
+                        </li>
+                        <li class="nav-item">
                             <a class="nav-link {% if '/dhcp/credentials' in request.path %}active{% endif %}"
                                href="/dhcp/credentials">
                                 <i class="bi bi-key"></i> Credentials
@@ -429,10 +435,24 @@
                     <div class="section-label"><i class="bi bi-grip-vertical drag-handle"></i> Administration</div>
                     <ul class="nav flex-column mb-2">
                         <li class="nav-item">
-                            <a class="nav-link {% if '/admin' in request.path %}active{% endif %}" href="/admin/">
+                            <a class="nav-link {% if '/admin' in request.path and '/admin/agents' not in request.path and '/admin/netsight' not in request.path %}active{% endif %}" href="/admin/">
                                 <i class="bi bi-gear"></i> Admin Portal
                             </a>
                         </li>
+                        {% if is_super_admin %}
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/admin/agents' in request.path %}active{% endif %}"
+                               href="{{ url_for('agents_admin.agents_list') }}">
+                                <i class="bi bi-hdd-network"></i> Remote Agents
+                            </a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link {% if '/admin/netsight' in request.path %}active{% endif %}"
+                               href="{{ url_for('netsight_admin.netsight_list') }}">
+                                <i class="bi bi-diagram-2"></i> NetSight
+                            </a>
+                        </li>
+                        {% endif %}
                     </ul>
                 </div>
                 {%- endmacro %}

@@ -336,6 +336,30 @@ for _endpoint in ("tls.api_renew", "tls.api_check_renewals"):
     if _view is not None:
         csrf.exempt(_view)
 
+# ── Remote agents (docs/RemoteAgents.md, Phase A) ───────────────────────
+# /agent/* is MACHINE-authenticated (X-Agent-Key + X-Agent-Device, checked
+# by the kit's dispatcher) and must bypass both session auth and CSRF —
+# same posture as acme_challenge_bp. /api/agents* and /admin/agents* are
+# Super Admin via the normal session. `webapp.`-prefixed import on purpose
+# (see the dhcp_manager note above).
+from webapp.agents_manager import (
+    agents_machine_bp, agents_api_bp, agents_admin_bp, init_agents_manager,
+)
+app.register_blueprint(agents_machine_bp)
+csrf.exempt(agents_machine_bp)
+app.register_blueprint(agents_api_bp)
+app.register_blueprint(agents_admin_bp)
+init_agents_manager(app)
+
+# NetSight (Extreme Site Engine) connection per Domain — RA-B, Super Admin only.
+from webapp.netsight_manager import netsight_admin_bp, init_netsight_manager
+app.register_blueprint(netsight_admin_bp)
+init_netsight_manager(app)
+
+# Switches — NetSight-backed inventory per Domain (RA-C, Domain Admin+).
+from webapp.switches_manager import switches_bp
+app.register_blueprint(switches_bp)
+
 # ── Engines (clusters, credentials link, tools, terminal) ───────────────
 
 from engines_manager import engines_bp, init_engines_manager

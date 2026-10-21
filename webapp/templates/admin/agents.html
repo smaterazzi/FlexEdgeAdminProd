@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% block title %}Remote Agents{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item active">Remote Agents</li>
+        </ol>
+    </nav>
+    <div>
+        <a href="{{ url_for('agents_admin.agents_settings') }}" class="btn btn-outline-secondary btn-sm me-1" title="Networks reachable from the server + pool timings">
+            <i class="bi bi-gear me-1"></i>Settings
+        </a>
+        <a href="{{ url_for('agents_admin.agent_new') }}" class="btn btn-primary btn-sm">
+            <i class="bi bi-plus-circle me-1"></i>New agent
+        </a>
+    </div>
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, message in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ message }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    <p class="text-muted small mb-3">
+        <i class="bi bi-info-circle"></i>
+        A <strong>remote agent</strong> is a machine inside a customer network that dials out to
+        FlexEdge and runs allow-listed tasks on networks this server cannot reach. Each agent belongs
+        to exactly one Domain; the <em>reachable networks</em> list is what the router uses to decide
+        whether a task may be offloaded to it. Offline after {{ offline_after_s|int }}s without contact.
+        Agent script version served: <code>{{ script_version or '— (agent/remote_agent.py missing)' }}</code>.
+        Networks reachable from this server (local execution):
+        {% for n in server_networks %}<span class="badge bg-info text-dark me-1">{{ n }}</span>{% else %}<em>none declared</em>{% endfor %}
+        — <a href="{{ url_for('agents_admin.agents_settings') }}">edit</a>.
+    </p>
+
+    <div class="table-responsive">
+        <table class="table table-dark table-sm table-hover managed-table align-middle" id="agents-table"
+               data-export-name="remote-agents">
+            <thead>
+                <tr>
+                    <th>Name</th>
+                    <th>Display</th>
+                    <th>Domain</th>
+                    <th>Presence</th>
+                    <th>Reachable networks</th>
+                    <th data-sort-type="num">Queue</th>
+                    <th>Host / platform</th>
+                    <th>Capabilities</th>
+                    <th data-sort-type="date">Last seen</th>
+                    <th data-no-sort data-no-export style="width:230px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for it in items %}
+                {% set row = it.row %}{% set p = it.presence %}{% set live = it.live %}
+                <tr data-agent="{{ row.name }}" class="{% if live.revoked %}opacity-50{% endif %}">
+                    <td><code>{{ row.name }}</code>{% if live.revoked %} <span class="badge bg-danger">revoked</span>{% endif %}</td>
+                    <td>{{ row.display_name }}</td>
+                    <td>{% if row.domain %}<span class="badge bg-secondary">{{ row.domain.display_name }}</span>{% else %}—{% endif %}</td>
+                    <td class="presence-cell">
+                        {% if not live %}
+                        <span class="badge bg-warning text-dark" title="No pool record — registry out of sync">no pool record</span>
+                        {% elif p.moved %}
+                        <span class="badge bg-danger">moved</span>
+                        {% elif p.online %}
+                        <span class="badge bg-success">online</span>
+                        {% elif not live.enrolled %}
+                        <span class="badge bg-secondary">not enrolled</span>
+                        {% else %}
+                        <span class="badge bg-secondary">offline</span>
+                        {% endif %}
+                        {% if p.script_outdated %}<span class="badge bg-warning text-dark ms-1" title="agent runs {{ p.script_version }}">script outdated</span>{% endif %}
+                    </td>
+                    <td data-export-value="{{ row.reachable_networks|join(' ') }}">
+                        {% for n in row.reachable_networks %}<span class="badge bg-info text-dark me-1">{{ n }}</span>{% else %}<span class="text-muted">—</span>{% endfor %}
+                    </td>
+                    <td class="queue-cell">{{ p.queue or 0 }}</td>
+                    <td class="small">{{ p.host or '' }}{% if p.platform %}<br><span class="text-muted">{{ p.platform }}</span>{% endif %}</td>
+                    <td class="caps-cell small" data-export-value="{{ (p.capabilities or [])|join(' ') }}">
+                        {% for c in p.capabilities or [] %}<span class="badge bg-dark border border-secondary me-1">{{ c if c is string else c.id }}</span>{% endfor %}
+                    </td>
+                    <td class="small last-seen-cell" data-sort-value="{{ p.last_seen or '' }}">{{ p.last_seen_ago or (p.last_seen or '—') }}</td>
+                    <td>
+                        <div class="btn-group btn-group-sm">
+                            <button class="btn btn-outline-info" data-bs-toggle="modal" data-bs-target="#nets-{{ row.id }}" title="Edit reachable networks"><i class="bi bi-diagram-3"></i></button>
+                            <form method="POST" action="{{ url_for('agents_admin.agent_ping', agent_id=row.id) }}" class="d-inline">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-success" title="Ping — round-trip a test task through this agent" {% if not p.online %}disabled{% endif %}><i class="bi bi-broadcast"></i></button>
+                            </form>
+                            <form method="POST" action="{{ url_for('agents_admin.agent_enroll_token', agent_id=row.id) }}" class="d-inline">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-warning" title="New enrollment token (rotates the key on redeem)"><i class="bi bi-key"></i></button>
+                            </form>
+                            <form method="POST" action="{{ url_for('agents_admin.agent_rebind', agent_id=row.id) }}" class="d-inline" onsubmit="return confirm('Clear the device binding of {{ row.name }}? The next machine that contacts with its key becomes the bound one.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-secondary" title="Rebind (hardware changed)"><i class="bi bi-arrow-repeat"></i></button>
+                            </form>
+                            <form method="POST" action="{{ url_for('agents_admin.agent_revoke', agent_id=row.id) }}" class="d-inline" onsubmit="return confirm('Revoke {{ row.name }}? Its key stops working immediately.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-danger" title="Revoke" {% if live.revoked %}disabled{% endif %}><i class="bi bi-slash-circle"></i></button>
+                            </form>
+                            <form method="POST" action="{{ url_for('agents_admin.agent_delete', agent_id=row.id) }}" class="d-inline" onsubmit="return confirm('Delete {{ row.name }} from FlexEdge and the pool? This cannot be undone.');">
+                                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                                <button class="btn btn-outline-danger" title="Delete"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </div>
+                    </td>
+                </tr>
+                {% else %}
+                <tr><td colspan="10" class="text-center text-muted py-4">No agents yet — click <strong>New agent</strong> to enroll the first machine.</td></tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+</div>
+
+{% for it in items %}{% set row = it.row %}
+<div class="modal fade" id="nets-{{ row.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <form method="POST" action="{{ url_for('agents_admin.agent_networks', agent_id=row.id) }}" class="modal-content bg-dark border-secondary">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <div class="modal-header border-secondary">
+                <h5 class="modal-title">Reachable networks — <code>{{ row.name }}</code></h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <p class="small text-muted">One CIDR per line. Tasks whose targets all fall inside these networks may be routed to this agent when it is online.</p>
+                <textarea class="form-control bg-dark text-light border-secondary font-monospace" name="reachable_networks" rows="6">{{ row.reachable_networks|join('\n') }}</textarea>
+            </div>
+            <div class="modal-footer border-secondary">
+                <button type="button" class="btn btn-secondary btn-sm" data-bs-dismiss="modal">Cancel</button>
+                <button type="submit" class="btn btn-primary btn-sm">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+{% endfor %}
+
+<script>
+(function () {
+    // Live presence refresh — the pool knows who is online; the DB row doesn't.
+    // Everything from /api/agents that originates on the agent machine
+    // (script_version, host, platform…) is untrusted — escape before it
+    // touches innerHTML.
+    function esc(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c];
+        });
+    }
+    function badge(cls, text, title) {
+        return '<span class="badge ' + cls + '"' + (title ? ' title="' + esc(title) + '"' : '') + '>' + esc(text) + '</span>';
+    }
+    function render(a) {
+        var p = a.presence || {};
+        var html;
+        if (p.moved) html = badge('bg-danger', 'moved');
+        else if (p.online) html = badge('bg-success', 'online');
+        else if (!a.enrolled) html = badge('bg-secondary', 'not enrolled');
+        else html = badge('bg-secondary', 'offline');
+        if (p.script_outdated) html += ' ' + badge('bg-warning text-dark ms-1', 'script outdated', 'agent runs ' + (p.script_version || '?'));
+        return html;
+    }
+    function tick() {
+        fexFetch('/api/agents', {headers: {'Accept': 'application/json'}})
+            .then(function (r) { return r.ok ? r.json() : null; })
+            .then(function (data) {
+                if (!data || !data.agents) return;
+                data.agents.forEach(function (a) {
+                    var tr = document.querySelector('tr[data-agent="' + a.name + '"]');
+                    if (!tr) return;
+                    var p = a.presence || {};
+                    tr.querySelector('.presence-cell').innerHTML = render(a);
+                    tr.querySelector('.queue-cell').textContent = p.queue || 0;
+                    var ls = tr.querySelector('.last-seen-cell');
+                    if (ls) ls.textContent = p.last_seen_ago || p.last_seen || '—';
+                });
+            }).catch(function () {});
+    }
+    if (document.querySelector('tr[data-agent]')) setInterval(tick, 10000);
+})();
+</script>
+{% endblock %}

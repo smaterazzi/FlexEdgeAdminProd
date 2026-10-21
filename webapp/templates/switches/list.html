@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+{% block title %}Switches{% endblock %}
+
+{% block content %}
+<div class="p-4">
+    <div class="d-flex justify-content-between align-items-center mb-1">
+        <h4 class="mb-0"><i class="bi bi-hdd-network"></i> Switches</h4>
+        {% with refresh_url = url_for('switches.switches_list', refresh=1) %}
+        {% include "switches/_freshness.html" %}
+        {% endwith %}
+    </div>
+
+    <div class="text-muted small mb-3">
+      <i class="bi bi-funnel"></i>
+      Switches managed by the Extreme Site Engine of
+      <strong>{{ domain.display_name if domain else '—' }}</strong>.
+      Read via the Domain's NetSight connection — locally when this server reaches it,
+      otherwise through a remote agent whose reachable networks cover it.
+      <a href="{{ url_for('select_profile') }}" class="ms-1">Switch domain</a>
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ msg }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    {% with err = unavailable %}{% include "switches/_unavailable.html" %}{% endwith %}
+
+    {% if not unavailable %}
+    {% if not devices %}
+    <div class="alert alert-secondary">NetSight reports no managed devices for this Domain.</div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table table-sm table-dark table-hover align-middle managed-table"
+               id="switches-table" data-export-name="switches">
+            <thead>
+                <tr>
+                    <th data-sort-type="ip">IP</th>
+                    <th>Name</th>
+                    <th>Nickname</th>
+                    <th>Family</th>
+                    <th>Firmware</th>
+                    <th>Status</th>
+                    <th>Site</th>
+                    <th>Location</th>
+                    <th>Base MAC</th>
+                    <th data-no-sort data-no-export></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for d in devices %}
+                <tr>
+                    <td><a href="{{ url_for('switches.switch_detail', ip=d.ip) }}"><code>{{ d.ip }}</code></a></td>
+                    <td>{{ d.sysName or '—' }}</td>
+                    <td>{{ d.nickName or '' }}</td>
+                    <td>{{ d.deviceDisplayFamily or '' }}</td>
+                    <td class="small">{{ d.firmware or '' }}</td>
+                    <td data-export-value="{{ d.status or '' }}">
+                        {% if d.up %}<span class="badge bg-success">up</span>
+                        {% elif d.down %}<span class="badge bg-danger">down</span>
+                        {% else %}<span class="badge bg-secondary">{{ d.status or '?' }}</span>{% endif %}
+                    </td>
+                    <td class="small">{{ d.sitePath or '' }}</td>
+                    <td class="small">{{ d.sysLocation or '' }}</td>
+                    <td><code class="small">{{ d.baseMac or '' }}</code></td>
+                    <td class="text-end">
+                        <a href="{{ url_for('switches.switch_detail', ip=d.ip) }}"
+                           class="btn btn-sm btn-outline-info" title="Ports + VLANs">
+                            <i class="bi bi-diagram-3"></i>
+                        </a>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    <div class="text-muted small">{{ devices|length }} device{{ '' if devices|length == 1 else 's' }}</div>
+    {% endif %}
+    {% endif %}
+</div>
+{% endblock %}

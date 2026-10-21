@@ -5,7 +5,7 @@
 COMPOSE_BASE = docker compose -f docker/docker-compose.yml
 COMPOSE_PROD = $(COMPOSE_BASE) -f docker/docker-compose.prod.yml
 
-.PHONY: dev prod dev-raw prod-raw stop logs restart build cli setup update
+.PHONY: dev prod dev-raw prod-raw stop logs restart build cli setup update test-agents
 
 # Development: guided bootstrap (Docker check, .env setup, Azure AD prompt),
 #              then build + run foreground on port 8088 with live logs.
@@ -43,6 +43,10 @@ build:
 # Usage: make cli CMD="--tenant prod connect"
 cli:
 	$(COMPOSE_BASE) exec flexedge-web python /app/cli/connect.py $(CMD)
+
+# Remote-agent pool / dispatcher / agent tests (stdlib only, no server needed)
+test-agents:
+	$(if $(wildcard $(HOME)/.venvs/flexedgeadmin/bin/python),$(HOME)/.venvs/flexedgeadmin/bin/python,python3) -m unittest discover -s tests/agents -t .
 
 # First-time setup: create config files from templates
 setup:

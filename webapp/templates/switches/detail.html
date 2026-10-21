@@ -1,0 +1,192 @@
+{% extends "base.html" %}
+{% block title %}Switch {{ ip }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3 d-flex justify-content-between align-items-center">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('switches.switches_list') }}">Switches</a></li>
+            <li class="breadcrumb-item active">
+                {{ (device.sysName if device and device.sysName else sys_name) or ip }}
+            </li>
+        </ol>
+    </nav>
+    {% with refresh_url = url_for('switches.switch_detail', ip=ip, refresh=1) %}
+    {% include "switches/_freshness.html" %}
+    {% endwith %}
+</div>
+
+<div class="p-4">
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ msg }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    {# ── Header card ─────────────────────────────────────────────── #}
+    {% with err = device_error %}{% include "switches/_unavailable.html" %}{% endwith %}
+    {% if device %}
+    {% set dd = device.deviceData or {} %}
+    <div class="card bg-dark border-secondary mb-4">
+        <div class="card-body">
+            <div class="d-flex justify-content-between align-items-start flex-wrap gap-2">
+                <div>
+                    <h4 class="mb-0"><i class="bi bi-hdd-network"></i> {{ device.sysName or ip }}
+                        {% if device.nickName %}<small class="text-muted">· {{ device.nickName }}</small>{% endif %}
+                    </h4>
+                    <div class="text-muted small"><code>{{ ip }}</code>
+                        {% if device.sitePath %} · {{ device.sitePath }}{% endif %}</div>
+                </div>
+                <div>
+                    {% if device.up %}<span class="badge bg-success">up</span>
+                    {% elif device.down %}<span class="badge bg-danger">down</span>
+                    {% else %}<span class="badge bg-secondary">{{ device.status or '?' }}</span>{% endif %}
+                </div>
+            </div>
+            <div class="row mt-3 small">
+                <div class="col-md-3"><div class="text-muted">Family</div>{{ device.deviceDisplayFamily or '—' }}</div>
+                <div class="col-md-3"><div class="text-muted">Product</div>{{ dd.productName or '—' }}</div>
+                <div class="col-md-3"><div class="text-muted">Firmware</div>{{ device.firmware or '—' }}</div>
+                <div class="col-md-3"><div class="text-muted">Serial</div><code>{{ dd.serialNumber or '—' }}</code></div>
+                <div class="col-md-3 mt-2"><div class="text-muted">Base MAC</div><code>{{ device.baseMac or dd.macAddress or '—' }}</code></div>
+                <div class="col-md-3 mt-2"><div class="text-muted">Physical ports</div>{{ dd.physicalPortCount if dd.physicalPortCount is not none else '—' }}</div>
+                <div class="col-md-3 mt-2"><div class="text-muted">Location</div>{{ device.sysLocation or '—' }}</div>
+                <div class="col-md-3 mt-2"><div class="text-muted">Contact</div>{{ device.sysContact or '—' }}</div>
+                {% if dd.lastSeenTime %}
+                <div class="col-md-3 mt-2"><div class="text-muted">Last seen</div>{{ dd.lastSeenTime }}</div>
+                {% endif %}
+                {% if dd.sysDescr %}
+                <div class="col-12 mt-2"><div class="text-muted">sysDescr</div><span class="font-monospace">{{ dd.sysDescr }}</span></div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+    {% endif %}
+
+    {# ── Tabs ────────────────────────────────────────────────────── #}
+    <ul class="nav nav-tabs mb-3" role="tablist">
+        <li class="nav-item" role="presentation">
+            <button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-ports" type="button" role="tab">
+                <i class="bi bi-ethernet"></i> Ports
+                {% if ports is not none %}<span class="badge bg-secondary ms-1">{{ ports|length }}</span>{% endif %}
+            </button>
+        </li>
+        <li class="nav-item" role="presentation">
+            <button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-vlans" type="button" role="tab">
+                <i class="bi bi-layers"></i> VLANs
+                {% if vlans is not none %}<span class="badge bg-secondary ms-1">{{ vlans|length }}</span>{% endif %}
+            </button>
+        </li>
+    </ul>
+
+    <div class="tab-content">
+        {# ── Ports ── #}
+        <div class="tab-pane fade show active" id="tab-ports" role="tabpanel">
+            {% with err = ports_error %}{% include "switches/_unavailable.html" %}{% endwith %}
+            {% if ports is not none %}
+            {% if not ports %}
+            <div class="alert alert-secondary">NetSight reports no ports for this device.</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark table-hover align-middle managed-table"
+                       id="ports-table" data-export-name="switch-{{ ip }}-ports">
+                    <thead>
+                        <tr>
+                            <th>Port</th>
+                            <th>Alias</th>
+                            <th>Type</th>
+                            <th>Admin</th>
+                            <th data-sort-type="num">PVID</th>
+                            <th>Untagged</th>
+                            <th>Tagged</th>
+                            <th data-sort-type="ip">Neighbor</th>
+                            <th>Neighbor port</th>
+                            <th>Flags</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for p in ports %}
+                        <tr>
+                            <td><code>{{ p.portName or '' }}</code></td>
+                            <td>{{ p.portAlias or '' }}</td>
+                            <td class="small">{{ p.portType or '' }}</td>
+                            <td data-export-value="{{ p.portAdmin or '' }}">
+                                {% if p.portAdmin and p.portAdmin|lower in ('up', 'enabled', 'true') %}
+                                <span class="badge bg-success">{{ p.portAdmin }}</span>
+                                {% elif p.portAdmin %}
+                                <span class="badge bg-secondary">{{ p.portAdmin }}</span>
+                                {% endif %}
+                            </td>
+                            <td>{{ p.portPvid if p.portPvid is not none else '' }}</td>
+                            <td class="small">{{ p.untagged or '' }}</td>
+                            <td class="small">{{ p.tagged or '' }}</td>
+                            <td data-export-value="{{ p.portNeighborAddress or '' }}">
+                                {% if p.neighbor_is_switch %}
+                                <a href="{{ url_for('switches.switch_detail', ip=p.portNeighborAddress) }}"
+                                   title="LLDP neighbour — open that switch"><code>{{ p.portNeighborAddress }}</code></a>
+                                {% elif p.portNeighborAddress %}
+                                <code>{{ p.portNeighborAddress }}</code>
+                                {% endif %}
+                            </td>
+                            <td class="small">{{ p.portNeighborPortName or '' }}</td>
+                            <td data-export-value="{{ 'uplink ' if p.uplink }}{{ 'lag-master ' if p.isLagMaster }}{{ ('lag ' ~ p.lagId) if p.lagId }}">
+                                {% if p.uplink %}<span class="badge bg-info text-dark me-1">uplink</span>{% endif %}
+                                {% if p.isLagMaster %}<span class="badge bg-primary me-1">LAG master</span>{% endif %}
+                                {% if p.lagId %}<span class="badge bg-dark border border-secondary">lag {{ p.lagId }}</span>{% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+            {% endif %}
+        </div>
+
+        {# ── VLANs ── #}
+        <div class="tab-pane fade" id="tab-vlans" role="tabpanel">
+            {% with err = vlans_error %}{% include "switches/_unavailable.html" %}{% endwith %}
+            {% if vlans is not none %}
+            {% if not vlans %}
+            <div class="alert alert-secondary">NetSight reports no VLANs for this device.</div>
+            {% else %}
+            <div class="table-responsive">
+                <table class="table table-sm table-dark table-hover align-middle managed-table"
+                       id="vlans-table" data-export-name="switch-{{ ip }}-vlans">
+                    <thead>
+                        <tr>
+                            <th data-sort-type="num">VID</th>
+                            <th>Name</th>
+                            <th data-sort-type="ip">Primary IP</th>
+                            <th>Netmask</th>
+                            <th>VR</th>
+                            <th>Egress ports</th>
+                            <th>Untagged ports</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for v in vlans %}
+                        <tr>
+                            <td>{{ v.vid }}</td>
+                            <td>{{ v.name or '' }}</td>
+                            <td>{{ v.primaryIp or '' }}</td>
+                            <td class="small">{{ v.netmask or '' }}</td>
+                            <td class="small">{{ v.vrName or '' }}</td>
+                            <td class="small font-monospace" data-export-value="{{ v.egress_decoded }}"
+                                title="{{ v.dot1qVlanStaticEgressPorts or '' }}">{{ v.egress_decoded or '—' }}</td>
+                            <td class="small font-monospace" data-export-value="{{ v.untagged_decoded }}"
+                                title="{{ v.dot1qVlanStaticUntaggedPorts or '' }}">{{ v.untagged_decoded or '—' }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+            {% endif %}
+            {% endif %}
+        </div>
+    </div>
+</div>
+{% endblock %}

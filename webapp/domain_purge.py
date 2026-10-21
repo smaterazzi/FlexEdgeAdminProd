@@ -113,6 +113,9 @@ def purge_domain(domain: Domain) -> PurgeReport:
     scan_ids = [s.id for s in
                 EngineScanRecord.query.filter_by(domain_id=did).all()]
     sginfo_records = EngineSginfoCollection.query.filter_by(domain_id=did).all()
+    from webapp.models import RemoteAgent
+    agent_names = [a.name for a in
+                   RemoteAgent.query.filter_by(domain_id=did).all()]
 
     try:
         # 1) Indirect children first (deleted via parent-id lists) ────────
@@ -182,6 +185,9 @@ def purge_domain(domain: Domain) -> PurgeReport:
         report.rows_deleted["platform_logs (op)"] = _bulk_delete(
             PlatformLog.query.filter_by(domain_id=did, level="op"))
 
+        report.rows_deleted["remote_agents"] = _bulk_delete(
+            RemoteAgent.query.filter_by(domain_id=did))
+
         # 5) The Domain row itself. Surviving audit platform_logs get
         #    domain_id SET NULL via the FK at this point.
         report.rows_deleted["domains"] = _bulk_delete(
@@ -195,6 +201,16 @@ def purge_domain(domain: Domain) -> PurgeReport:
 
     # ── Best-effort filesystem cleanup (after commit) ────────────────────
     _wipe_sginfo_archives(sginfo_records, report)
+    # Remote agents: the pool registry (data/agents/agents.json) holds the
+    # key hashes + device bindings under the same names — drop those too.
+    if agent_names:
+        try:
+            from webapp.agents_manager import get_pool
+            pool = get_pool()
+            for name in agent_names:
+                pool.delete_agent(name)
+        except Exception:  # noqa: BLE001 — best-effort, DB purge already committed
+            log.exception("domain_purge: pool delete_agent failed for %s", agent_names)
 
     log.warning(
         "domain_purge COMPLETE — domain=%s (id=%s) rows_deleted=%d "

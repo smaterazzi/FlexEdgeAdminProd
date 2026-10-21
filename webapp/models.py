@@ -33,6 +33,7 @@ Multi-Domain Revamp — Phase A status (2026-04-29):
     every feature table — replaced by domain_id everywhere.
 """
 
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import TypeDecorator, Text
@@ -889,6 +890,94 @@ class EngineTerminalSession(db.Model):
 
     def __repr__(self):
         return f"<EngineTerminalSession #{self.id} user={self.user_id} {self.engine_name}/{self.node_index}>"
+
+
+class RemoteAgent(db.Model):
+    """
+    Domain-scoped identity of a remote agent (docs/RemoteAgents.md).
+
+    The runtime side (key hash, device binding, presence, queue) lives in
+    the kit's pool registry (`data/agents/agents.json`, shared/agent_pool.py)
+    under the same `name`. This row adds what FlexEdge needs on top: the
+    Domain the agent belongs to (1:1, decision 2) and the admin-declared
+    networks it may be used to reach (routing input, never advertised by
+    the agent itself).
+    """
+    __tablename__ = "remote_agents"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    name = db.Column(db.String(40), unique=True, nullable=False)   # = pool agent name
+    display_name = db.Column(db.String(128), default="", nullable=False)
+    reachable_networks_json = db.Column(db.Text, default="[]", nullable=False)
+    notes = db.Column(db.Text, default="", nullable=False)
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    domain = db.relationship("Domain", foreign_keys=[domain_id])
+    created_by = db.relationship("User", foreign_keys=[created_by_id])
+
+    @property
+    def reachable_networks(self) -> list:
+        try:
+            value = json.loads(self.reachable_networks_json or "[]")
+        except (TypeError, ValueError):
+            return []
+        return [str(v) for v in value] if isinstance(value, list) else []
+
+    @reachable_networks.setter
+    def reachable_networks(self, networks):
+        self.reachable_networks_json = json.dumps(list(networks or []))
+
+    def __repr__(self):
+        return f"<RemoteAgent #{self.id} {self.name} domain={self.domain_id}>"
+
+
+class NetSightConnection(db.Model):
+    """
+    One Extreme Site Engine (NetSight) per Domain (docs/RemoteAgents.md,
+    RA-B). The client secret is Fernet-encrypted at rest like `api_keys`;
+    it never travels in a task payload — RA-C hands agents a one-shot
+    `secret_ref` instead. The cert fingerprint is mandatory: Site Engine's
+    self-signed cert can't pass CA + hostname verification by IP, so pinning
+    is the only safe transport (no web equivalent of the CLI's --insecure).
+    """
+    __tablename__ = "netsight_connections"
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, unique=True)
+    host = db.Column(db.String(253), nullable=False)
+    port = db.Column(db.Integer, default=8443, nullable=False)
+    client_id = db.Column(db.String(128), nullable=False)
+    encrypted_client_secret = db.Column(EncryptedString, nullable=False)
+    cert_sha256 = db.Column(db.String(95), default="", nullable=False)   # lowercase hex, no colons
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+    updated_at = db.Column(db.DateTime, default=_utcnow, onupdate=_utcnow, nullable=False)
+    last_ok_at = db.Column(db.DateTime, nullable=True)
+    last_error = db.Column(db.Text, default="", nullable=False)
+
+    domain = db.relationship("Domain", foreign_keys=[domain_id])
+
+    @property
+    def client_secret(self) -> str:
+        return self.encrypted_client_secret  # EncryptedString handles decryption
+
+    @client_secret.setter
+    def client_secret(self, plaintext: str):
+        self.encrypted_client_secret = plaintext  # EncryptedString handles encryption
+
+    def set_cert_sha256(self, value: str):
+        self.cert_sha256 = (value or "").replace(":", "").replace(" ", "").strip().lower()
+
+    @property
+    def cert_sha256_short(self) -> str:
+        return f"{self.cert_sha256[:8]}…{self.cert_sha256[-8:]}" if self.cert_sha256 else ""
+
+    def __repr__(self):
+        return f"<NetSightConnection #{self.id} domain={self.domain_id} {self.host}:{self.port}>"
 
 
 class OptimizationSubmission(db.Model):

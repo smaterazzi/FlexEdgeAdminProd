@@ -1,0 +1,34 @@
+{# Operator-readable alert for a NetSightUnavailable. Expects `err` = {kind, reason}. #}
+{% if err %}
+  {% if err.kind == 'no_connection' %}
+  <div class="alert alert-secondary">
+    <i class="bi bi-plug"></i>
+    <strong>No NetSight connection for this Domain.</strong>
+    {% if is_super_admin %}
+      Configure one at <a href="{{ url_for('netsight_admin.netsight_list') }}">Admin → NetSight</a>.
+    {% else %}
+      Ask a Super Admin to configure the Site Engine connection for this Domain.
+    {% endif %}
+  </div>
+  {% elif err.kind == 'refused' %}
+  <div class="alert alert-warning">
+    <i class="bi bi-signpost-split"></i>
+    <strong>Nobody can reach NetSight right now.</strong> {{ err.reason }}
+  </div>
+  {% elif err.kind == 'timeout' %}
+  <div class="alert alert-warning">
+    <i class="bi bi-hourglass-split"></i>
+    <strong>NetSight did not answer in time.</strong> {{ err.reason }}
+  </div>
+  {% elif err.kind == 'no_domain' %}
+  <div class="alert alert-secondary">
+    <i class="bi bi-funnel"></i> {{ err.reason }}
+    <a href="{{ url_for('select_profile') }}" class="ms-1">Select a profile</a>.
+  </div>
+  {% else %}
+  <div class="alert alert-danger">
+    <i class="bi bi-x-octagon"></i>
+    <strong>NetSight query failed.</strong> {{ err.reason }}
+  </div>
+  {% endif %}
+{% endif %}

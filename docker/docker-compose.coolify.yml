@@ -41,6 +41,8 @@ services:
       # Persistent volume managed by Coolify (set in UI: Storages tab)
       - flexedge-config:/config
       - flexedge-data:/app/data/projects
+      # Remote-agent registry — must persist or agents re-enroll on every redeploy
+      - flexedge-agents:/app/data/agents
 
     environment:
       # Required — set these in the Coolify UI (Environment Variables tab)
@@ -65,4 +67,6 @@ volumes:
   flexedge-config:
     driver: local
   flexedge-data:
+    driver: local
+  flexedge-agents:
     driver: local

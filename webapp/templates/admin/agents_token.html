@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block title %}Enrollment token — {{ agent.name }}{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('admin.dashboard') }}">Admin</a></li>
+            <li class="breadcrumb-item"><a href="{{ url_for('agents_admin.agents_list') }}">Remote Agents</a></li>
+            <li class="breadcrumb-item active">{{ agent.name }} — enrollment token</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4" style="max-width: 900px;">
+    <div class="alert alert-warning">
+        <i class="bi bi-exclamation-triangle-fill me-1"></i>
+        <strong>This token is shown once.</strong> It is single-use and expires in {{ expires_min }} minutes.
+        Close this page and it is gone — issue a new one from the agents list if needed.
+        {% if reason == 'rotated' %}The current key of <code>{{ agent.name }}</code> keeps working until this token is redeemed, which rotates it.{% endif %}
+    </div>
+
+    <div class="card bg-dark border-secondary mb-3">
+        <div class="card-header"><i class="bi bi-key"></i> Agent <code>{{ agent.name }}</code>{% if agent.domain %} · {{ agent.domain.display_name }}{% endif %}</div>
+        <div class="card-body">
+            <label class="form-label small text-muted">Enrollment token</label>
+            <div class="input-group mb-3">
+                <input type="text" class="form-control bg-dark text-light border-secondary font-monospace" id="tok" value="{{ token }}" readonly>
+                <button class="btn btn-outline-secondary" type="button" onclick="copyField('tok', this)"><i class="bi bi-clipboard"></i> Copy</button>
+            </div>
+
+            <label class="form-label small text-muted">Install as a service on the agent machine (macOS LaunchAgent / Linux systemd --user) — paste in a shell there:</label>
+            <div class="input-group mb-3">
+                <textarea class="form-control bg-dark text-light border-secondary font-monospace small" id="launch" rows="3" readonly>{{ launch.launch }}</textarea>
+                <button class="btn btn-outline-secondary" type="button" onclick="copyField('launch', this)"><i class="bi bi-clipboard"></i> Copy</button>
+            </div>
+
+            <label class="form-label small text-muted">Development / one-off run (no service, foreground):</label>
+            <div class="input-group">
+                <textarea class="form-control bg-dark text-light border-secondary font-monospace small" id="launch_dev" rows="3" readonly>{{ launch.launch_dev }}</textarea>
+                <button class="btn btn-outline-secondary" type="button" onclick="copyField('launch_dev', this)"><i class="bi bi-clipboard"></i> Copy</button>
+            </div>
+        </div>
+    </div>
+
+    <p class="small text-muted">
+        The machine needs Python 3.9+ and outbound HTTPS to this server; no inbound port. The agent stores its key in the
+        macOS Keychain (or a <code>0600</code> file) and binds to the hardware it first runs on — the <strong>Rebind</strong>
+        action is for a hardware change, <strong>Revoke</strong> for a lost machine.
+    </p>
+
+    <a href="{{ url_for('agents_admin.agents_list') }}" class="btn btn-primary"><i class="bi bi-check2 me-1"></i>Done — back to agents</a>
+</div>
+
+<script>
+function copyField(id, btn) {
+    var el = document.getElementById(id);
+    navigator.clipboard.writeText(el.value).then(function () {
+        var old = btn.innerHTML; btn.innerHTML = '<i class="bi bi-check2"></i> Copied';
+        setTimeout(function () { btn.innerHTML = old; }, 1500);
+    });
+}
+</script>
+{% endblock %}

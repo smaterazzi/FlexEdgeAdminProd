@@ -8,8 +8,11 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Virtual environment path (at project root)
-VENV_PATH="$PROJECT_ROOT/venv"
+# Virtual environment: fea_sync.py builds it outside the synced tree
+# (~/.venvs/flexedgeadmin); an in-tree ./venv is the legacy location.
+VENV_PATH="${FEA_VENV:-$HOME/.venvs/flexedgeadmin}"
+[ -f "$VENV_PATH/bin/activate" ] || VENV_PATH="$PROJECT_ROOT/venv"
+PYTHON="python3"
 
 # Ensure shared module is importable
 export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
@@ -27,8 +30,9 @@ print_color() {
 
 # Activate venv if present
 activate_venv() {
-    if [ -d "$VENV_PATH" ]; then
+    if [ -f "$VENV_PATH/bin/activate" ]; then
         source "$VENV_PATH/bin/activate"
+        PYTHON="python"
     fi
 }
 
@@ -75,6 +79,15 @@ show_help() {
     echo "    upload --name NAME       Upload policy"
     echo "    pending --name NAME      View pending changes"
     echo ""
+    echo "  netsight <subcommand>      Query Extreme Site Engine (NetSight), read-only"
+    echo "    connect                  Test login + NBI section access"
+    echo "    devices                  List managed switches"
+    echo "    device --ip IP           Show one switch"
+    echo "    ports --ip IP            Ports with VLANs + LLDP neighbours"
+    echo "    vlans --ip IP            VLANs on a switch"
+    echo "    schema --roots|--type T  Explore the GraphQL schema"
+    echo "    (credentials: config/xiqse.env — no --tenant needed)"
+    echo ""
     print_color "$GREEN" "Quick Examples:"
     echo ""
     echo "  SMC_API_KEY=xxx ./smc.sh --tenant prod connect"
@@ -86,6 +99,7 @@ show_help() {
     echo "  ./smc.sh help connect      Show connect.py guide"
     echo "  ./smc.sh help inquiry      Show inquiry.py guide"
     echo "  ./smc.sh help firewall     Show firewall.py guide"
+    echo "  ./smc.sh help netsight     Show netsight.py guide"
     echo ""
 }
 
@@ -103,7 +117,7 @@ show_module_help() {
         fi
     else
         print_color "$RED" "Error: Documentation not found for '$module'"
-        echo "Available: connect, inquiry, firewall"
+        echo "Available: connect, inquiry, firewall, netsight"
     fi
 }
 
@@ -119,17 +133,22 @@ case "$1" in
 
     "connect")
         activate_venv
-        python "$SCRIPT_DIR/connect.py" "${TENANT_ARGS[@]}" "${@:2}"
+        "$PYTHON" "$SCRIPT_DIR/connect.py" "${TENANT_ARGS[@]}" "${@:2}"
         ;;
 
     "inquiry")
         activate_venv
-        python "$SCRIPT_DIR/inquiry.py" "${TENANT_ARGS[@]}" "${@:2}"
+        "$PYTHON" "$SCRIPT_DIR/inquiry.py" "${TENANT_ARGS[@]}" "${@:2}"
         ;;
 
     "firewall"|"fw")
         activate_venv
-        python "$SCRIPT_DIR/firewall.py" "${TENANT_ARGS[@]}" "${@:2}"
+        "$PYTHON" "$SCRIPT_DIR/firewall.py" "${TENANT_ARGS[@]}" "${@:2}"
+        ;;
+
+    "netsight"|"ns")
+        activate_venv
+        "$PYTHON" "$SCRIPT_DIR/netsight.py" "${@:2}"
         ;;
 
     "setup")

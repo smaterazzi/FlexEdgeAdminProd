@@ -33,6 +33,9 @@ services:
       - ../config:/config
       # Migration project data — bind mount for persistence
       - ../data/projects:/app/data/projects
+      # Remote-agent registry (key hashes, device bindings, restart mirror) — must
+      # persist or every agent has to re-enroll after each redeploy
+      - ../data/agents:/app/data/agents
       # FortiGate config files (optional — for migration reference)
       - ../conf-files:/config/conf-files:ro
       # Let's Encrypt — for TLS Manager feature (certbot-managed certificates)

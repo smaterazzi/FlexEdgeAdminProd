@@ -19,6 +19,7 @@ COPY shared/ ./shared/
 COPY webapp/  ./webapp/
 COPY cli/     ./cli/
 COPY scripts/ ./scripts/
+COPY agent/   ./agent/
 
 # Optional: .version.json is stamped by pack-release.sh into FlexEdgeAdminProd
 # and serves as the version source for Coolify/CI deploys that don't set
@@ -27,7 +28,7 @@ COPY CHANGELOG.md ./CHANGELOG.md
 COPY .version.jso[n] ./
 
 # Create runtime directories
-RUN mkdir -p /app/data/projects /config
+RUN mkdir -p /app/data/projects /app/data/agents /config
 
 # Ensure shared module is importable from everywhere
 ENV PYTHONPATH=/app
@@ -94,9 +95,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
 #   * the browser SSH terminal + Flask-Sock sessions.
 # The SMC SDK session is a module-level singleton serialised process-wide
 # by shared/smc_lock.py anyway, so a second worker bought little for this
-# admin-scale tool while breaking the scan feature. `--threads 16` keeps
-# the same 16-concurrent-socket budget the terminal feature was sized for,
-# now all in one process with correct shared state.
-CMD ["gunicorn", "--preload", "-w", "1", "-k", "gthread", "--threads", "16", \
+# admin-scale tool while breaking the scan feature. `--threads 32` (was 16,
+# raised 2026-10-21 for remote agents): every ONLINE remote agent parks one
+# thread for up to poll_wait_max_s (20 s) in its /agent/poll long-poll, so
+# the 16-socket terminal budget needs headroom on top. The agent pool
+# (shared/agent_pool.py) is also process-local state — one more reason
+# for `-w 1`.
+CMD ["gunicorn", "--preload", "-w", "1", "-k", "gthread", "--threads", "32", \
      "-b", "0.0.0.0:8088", "--timeout", "360", \
      "--chdir", "/app/webapp", "app:app"]
