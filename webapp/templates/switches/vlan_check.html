@@ -1,0 +1,288 @@
+{% extends "base.html" %}
+{% block title %}VLAN check{% endblock %}
+
+{% block content %}
+<div class="filter-bar px-4 py-3">
+    <nav aria-label="breadcrumb">
+        <ol class="breadcrumb mb-0">
+            <li class="breadcrumb-item"><a href="{{ url_for('switches.switches_list') }}">Switches</a></li>
+            <li class="breadcrumb-item active">VLAN check</li>
+        </ol>
+    </nav>
+</div>
+
+<div class="p-4">
+    <div class="d-flex justify-content-between align-items-center mb-1 flex-wrap gap-2">
+        <h4 class="mb-0"><i class="bi bi-ui-checks-grid"></i> VLAN consistency check</h4>
+        <div class="d-flex gap-2">
+            {% if domain and not unavailable and not job %}
+            <form method="POST" action="{{ url_for('switches.vlan_check_discover') }}" class="d-inline">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <button class="btn btn-sm btn-outline-info"
+                        title="Read every switch's ports from NetSight and link firewall interfaces whose address shows up as an LLDP neighbour.">
+                    <i class="bi bi-broadcast"></i> Discover LLDP links
+                </button>
+            </form>
+            {% endif %}
+            <a href="{{ url_for('switches.vlan_check', refresh=1) }}" class="btn btn-sm btn-outline-secondary"
+               title="Re-read the firewall inventory from SMC and the linked switch ports from NetSight.">
+                <i class="bi bi-arrow-clockwise"></i> Refresh from SMC + NetSight
+            </a>
+        </div>
+    </div>
+
+    <div class="text-muted small mb-3">
+        Compares the VLANs each firewall interface tags with the VLANs carried on the switch port it is
+        plugged into, for <strong>{{ domain.display_name if domain else '—' }}</strong>.
+        Links come from LLDP when the firewall interface sends it (Forcepoint's default is
+        <code>disabled</code> — set <code>send_only</code> in SMC to enable discovery) or are pinned by hand with
+        <i class="bi bi-link-45deg"></i>.
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+    {% for category, msg in messages %}
+    <div class="alert alert-{{ category }} alert-dismissible fade show" role="alert">
+        {{ msg }}
+        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+    </div>
+    {% endfor %}
+    {% endwith %}
+
+    {% with err = unavailable %}{% include "switches/_unavailable.html" %}{% endwith %}
+
+    {% if job %}
+    <div class="card bg-dark border-info mb-3" id="lldp-watcher" data-status-url="{{ url_for('switches.vlan_check_job', job_id=job.scan_id) }}"
+         data-done-url="{{ url_for('switches.vlan_check', job=job.scan_id) }}">
+        <div class="card-header"><i class="bi bi-broadcast"></i> LLDP discovery running…</div>
+        <div class="card-body">
+            <div class="progress mb-2" style="height: 18px;">
+                <div class="progress-bar progress-bar-striped progress-bar-animated" id="lldp-bar" style="width: 0%">0%</div>
+            </div>
+            <pre class="small text-muted mb-0" id="lldp-log" style="max-height: 12em; overflow:auto;"></pre>
+        </div>
+    </div>
+    {% endif %}
+
+    {% if smc_error %}
+    <div class="alert alert-danger"><i class="bi bi-x-octagon"></i> <strong>SMC inventory unavailable.</strong> {{ smc_error }}</div>
+    {% endif %}
+    {% if fw_errors %}
+    <div class="alert alert-warning small"><i class="bi bi-exclamation-triangle"></i> Skipped: {{ fw_errors|join('; ') }}</div>
+    {% endif %}
+
+    {% if domain and not smc_error %}
+    <div class="d-flex gap-2 flex-wrap mb-2 small">
+        <span class="badge bg-success">{{ counts.ok }} consistent</span>
+        <span class="badge bg-danger">{{ counts.missing }} missing VLANs</span>
+        <span class="badge bg-warning text-dark">{{ counts.extra }} extra on switch</span>
+        {% if counts.no_port %}<span class="badge bg-danger">{{ counts.no_port }} stale link</span>{% endif %}
+        {% if counts.unknown %}<span class="badge bg-secondary">{{ counts.unknown }} switch unreadable</span>{% endif %}
+        <span class="badge bg-secondary">{{ counts.unmapped }} not linked</span>
+        <div class="form-check form-switch ms-2 mb-0">
+            <input class="form-check-input" type="checkbox" id="only-linked">
+            <label class="form-check-label" for="only-linked">Only linked interfaces</label>
+        </div>
+    </div>
+
+    {% if not rows %}
+    <div class="alert alert-secondary">No firewall interfaces in this Domain's SMC inventory.</div>
+    {% else %}
+    <div class="table-responsive">
+        <table class="table table-sm table-dark table-hover align-middle managed-table"
+               id="vlan-check-table" data-export-name="vlan-check">
+            <thead>
+                <tr>
+                    <th>Firewall</th>
+                    <th data-sort-type="num">Node</th>
+                    <th>Interface</th>
+                    <th>Zone</th>
+                    <th>LLDP</th>
+                    <th>Firewall VLANs</th>
+                    <th>Switch port</th>
+                    <th>Switch VLANs</th>
+                    <th>Result</th>
+                    <th data-no-sort data-no-export></th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in rows %}
+                {% set fw = r.fw %}
+                <tr data-linked="{{ 1 if r.link else 0 }}">
+                    <td>{{ fw.engine }}</td>
+                    <td>{{ fw.node_index }}{% if fw.node_name %} <span class="text-muted small">{{ fw.node_name }}</span>{% endif %}</td>
+                    <td><code>{{ fw.interface_id }}</code>
+                        {% if fw.addresses %}<div class="text-muted small">{{ fw.addresses|join(', ') }}</div>{% endif %}</td>
+                    <td class="small">{{ fw.zones|join(', ') }}</td>
+                    <td class="small">
+                        {% if fw.lldp_mode in ('send_only', 'send_and_receive') %}<span class="badge bg-info text-dark">{{ fw.lldp_mode }}</span>
+                        {% elif fw.lldp_mode %}<span class="text-muted">{{ fw.lldp_mode }}</span>
+                        {% else %}<span class="text-muted" title="Not in the cached inventory — Refresh from SMC">—</span>{% endif %}
+                    </td>
+                    <td class="small" data-export-value="{{ fw.vlans|join(',') }}{% if fw.untagged %} +untagged{% endif %}">
+                        {{ fw.vlans|join(', ') or '—' }}{% if fw.untagged %} <span class="badge bg-secondary">untagged</span>{% endif %}
+                    </td>
+                    <td class="small" data-export-value="{{ (r.link.switch_ip ~ ' ' ~ r.link.port_name) if r.link else '' }}">
+                        {% if r.link %}
+                            <a href="{{ url_for('switches.switch_detail', ip=r.link.switch_ip) }}">{{ r.switch_name }}</a>
+                            <code>{{ r.link.port_name }}</code>
+                            <span class="badge {{ 'bg-info text-dark' if r.link.source == 'lldp' else 'bg-secondary' }}">{{ r.link.source }}</span>
+                            {% if r.switch_error %}<div class="text-warning">{{ r.switch_error }}</div>{% endif %}
+                        {% else %}<span class="text-muted">not linked</span>{% endif %}
+                    </td>
+                    <td class="small">
+                        {% if r.switch_port %}
+                            {{ r.switch_port.vlans or '—' }}
+                            {% if r.switch_port.untag %}<div class="text-muted">untagged {{ r.switch_port.untag }}</div>{% endif %}
+                        {% endif %}
+                    </td>
+                    <td class="small" data-export-value="{{ r.result.status if r.result else ('unreadable' if r.link else 'not linked') }}">
+                        {% if r.result %}
+                            {% if r.result.status == 'ok' %}<span class="badge bg-success">consistent</span>
+                            {% elif r.result.status == 'missing' %}<span class="badge bg-danger">missing</span>
+                            {% elif r.result.status == 'extra' %}<span class="badge bg-warning text-dark">extra on switch</span>
+                            {% else %}<span class="badge bg-danger">stale link</span>{% endif %}
+                            {% if r.result.missing %}<div>not on switch: <strong>{{ r.result.missing|join(', ') }}</strong></div>{% endif %}
+                            {% if r.result.extra %}<div class="text-muted">not on firewall: {{ r.result.extra|join(', ') }}</div>{% endif %}
+                            {% for n in r.result.notes %}<div class="text-warning">{{ n }}</div>{% endfor %}
+                        {% elif r.link %}<span class="badge bg-secondary">switch unreadable</span>{% endif %}
+                    </td>
+                    <td class="text-end text-nowrap">
+                        {% if not unavailable %}
+                        <button type="button" class="btn btn-sm btn-outline-info js-map" title="Link to a switch port"
+                                data-engine="{{ fw.engine }}" data-node="{{ fw.node_index }}" data-iface="{{ fw.interface_id }}"
+                                data-switch="{{ r.link.switch_ip if r.link else '' }}" data-port="{{ r.link.port_name if r.link else '' }}">
+                            <i class="bi bi-link-45deg"></i>
+                        </button>
+                        {% endif %}
+                        {% if r.link %}
+                        <form method="POST" action="{{ url_for('switches.vlan_check_link_delete', link_id=r.link.id) }}" class="d-inline js-unlink"
+                              data-name="{{ fw.engine }} node {{ fw.node_index }} interface {{ fw.interface_id }}">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                            <button class="btn btn-sm btn-outline-danger" title="Remove link"><i class="bi bi-x-lg"></i></button>
+                        </form>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% endif %}
+    {% endif %}
+</div>
+
+<div class="modal fade" id="map-modal" tabindex="-1">
+    <div class="modal-dialog">
+        <form method="POST" action="{{ url_for('switches.vlan_check_link_save') }}" class="modal-content bg-dark border-secondary">
+            <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+            <input type="hidden" name="engine_name" id="map-engine">
+            <input type="hidden" name="node_index" id="map-node">
+            <input type="hidden" name="interface_id" id="map-iface">
+            <div class="modal-header">
+                <h6 class="modal-title"><i class="bi bi-link-45deg"></i> Link <span id="map-title"></span></h6>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+            </div>
+            <div class="modal-body">
+                <div class="mb-3">
+                    <label class="form-label">Switch</label>
+                    <select class="form-select bg-dark text-light border-secondary" name="switch_ip" id="map-switch" required>
+                        <option value="">— pick a switch —</option>
+                        {% for d in devices %}
+                        <option value="{{ d.ip }}">{{ d.sysName or d.ip }} ({{ d.ip }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="mb-1">
+                    <label class="form-label">Port</label>
+                    <select class="form-select bg-dark text-light border-secondary font-monospace" name="port_name" id="map-port" required>
+                        <option value="">pick a switch first</option>
+                    </select>
+                    <div class="form-text" id="map-port-status"></div>
+                </div>
+                <div class="form-text">A manual link replaces an LLDP one and is never changed by discovery.</div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                <button class="btn btn-primary"><i class="bi bi-link-45deg"></i> Save link</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+(function () {
+    // Map dialog — every value read from data-* and written with textContent / .value only.
+    var modalEl = document.getElementById("map-modal");
+    var portsBase = "{{ url_for('switches.vlan_check_ports', ip='0.0.0.0') }}".replace(/0\.0\.0\.0$/, "");
+    var sw = document.getElementById("map-switch"), port = document.getElementById("map-port");
+    var portStatus = document.getElementById("map-port-status"), seq = 0;
+
+    function loadPorts(selected) {
+        var ip = sw.value, my = ++seq;
+        port.textContent = "";
+        if (!ip) { port.add(new Option("pick a switch first", "")); return; }
+        port.add(new Option("loading…", ""));
+        portStatus.textContent = "";
+        fetch(portsBase + encodeURIComponent(ip), {headers: {"Accept": "application/json"}})
+            .then(function (r) { return r.json(); })
+            .then(function (d) {
+                if (my !== seq) return;
+                port.textContent = "";
+                if (!d.ok) { port.add(new Option("unavailable", "")); portStatus.textContent = d.error || ""; return; }
+                port.add(new Option("— pick a port —", ""));
+                d.ports.forEach(function (p) {
+                    var label = p.name + (p.alias ? " (" + p.alias + ")" : "")
+                        + (p.tagged ? " · tagged " + p.tagged : "") + (p.untagged ? " · untagged " + p.untagged : "");
+                    port.add(new Option(label, p.name, false, p.name === selected));
+                });
+            })
+            .catch(function () { if (my === seq) portStatus.textContent = "Could not load ports."; });
+    }
+
+    document.querySelectorAll(".js-map").forEach(function (btn) {
+        btn.addEventListener("click", function () {
+            document.getElementById("map-engine").value = btn.dataset.engine;
+            document.getElementById("map-node").value = btn.dataset.node;
+            document.getElementById("map-iface").value = btn.dataset.iface;
+            document.getElementById("map-title").textContent =
+                btn.dataset.engine + " node " + btn.dataset.node + " interface " + btn.dataset.iface;
+            sw.value = btn.dataset.switch || "";
+            loadPorts(btn.dataset.port || "");
+            bootstrap.Modal.getOrCreateInstance(modalEl).show();
+        });
+    });
+    if (sw) sw.addEventListener("change", function () { loadPorts(""); });
+
+    document.querySelectorAll(".js-unlink").forEach(function (f) {
+        f.addEventListener("submit", function (e) {
+            if (!confirm("Remove the link for " + f.dataset.name + "?")) e.preventDefault();
+        });
+    });
+
+    var only = document.getElementById("only-linked");
+    if (only) only.addEventListener("change", function () {
+        document.querySelectorAll("#vlan-check-table tbody tr[data-linked]").forEach(function (tr) {
+            FERowFilter.set(tr, "vlanLinked", !only.checked || tr.dataset.linked === "1");
+        });
+    });
+
+    // LLDP discovery watcher.
+    var watcher = document.getElementById("lldp-watcher");
+    if (watcher) {
+        var bar = document.getElementById("lldp-bar"), logEl = document.getElementById("lldp-log");
+        (function poll() {
+            fetch(watcher.dataset.statusUrl, {headers: {"Accept": "application/json"}})
+                .then(function (r) { return r.json(); })
+                .then(function (d) {
+                    if (!d.ok || d.state !== "running") { window.location = watcher.dataset.doneUrl; return; }
+                    var pct = d.total ? Math.round(100 * d.progress / d.total) : 0;
+                    bar.style.width = pct + "%"; bar.textContent = d.progress + " / " + d.total;
+                    logEl.textContent = (d.log_tail || []).join("\n");
+                    setTimeout(poll, 1000);
+                })
+                .catch(function () { setTimeout(poll, 3000); });
+        })();
+    }
+})();
+</script>
+{% endblock %}

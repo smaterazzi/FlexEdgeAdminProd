@@ -980,6 +980,43 @@ class NetSightConnection(db.Model):
         return f"<NetSightConnection #{self.id} domain={self.domain_id} {self.host}:{self.port}>"
 
 
+class SwitchPortLink(db.Model):
+    """
+    Which switch port a firewall node's physical interface is plugged into
+    (NS2 VLAN consistency check, webapp/vlan_check.py). `source='manual'`
+    rows are pinned by an operator and never touched by discovery;
+    `source='lldp'` rows are written by the LLDP discovery job (a switch port
+    whose LLDP neighbour address is the node's address) and refreshed or
+    dropped on every run. Forcepoint ships `lldp_mode=disabled`, so most
+    links start out manual.
+    """
+    __tablename__ = "switch_port_links"
+    __table_args__ = (
+        db.UniqueConstraint("domain_id", "engine_name", "node_index", "interface_id",
+                            name="uq_switch_port_link_fw_port"),
+    )
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    domain_id = db.Column(db.Integer, db.ForeignKey("domains.id", ondelete="CASCADE"),
+                          nullable=False, index=True)
+    engine_name = db.Column(db.String(255), nullable=False)
+    node_index = db.Column(db.Integer, nullable=False, default=1)   # SMC nodeid, 1-based
+    interface_id = db.Column(db.String(32), nullable=False)          # physical, e.g. "1"
+    switch_ip = db.Column(db.String(45), nullable=False)
+    port_name = db.Column(db.String(64), nullable=False)             # NetSight portName, e.g. "1:27"
+    source = db.Column(db.String(8), nullable=False, default="manual")  # manual | lldp
+    last_seen_at = db.Column(db.DateTime, nullable=True)             # lldp: last discovery hit
+    created_by_id = db.Column(db.Integer, db.ForeignKey("users.id", ondelete="SET NULL"),
+                              nullable=True)
+    created_at = db.Column(db.DateTime, default=_utcnow, nullable=False)
+
+    domain = db.relationship("Domain", foreign_keys=[domain_id])
+
+    def __repr__(self):
+        return (f"<SwitchPortLink #{self.id} {self.engine_name} n{self.node_index} "
+                f"if{self.interface_id} → {self.switch_ip} {self.port_name} ({self.source})>")
+
+
 class OptimizationSubmission(db.Model):
     """
     Rule-optimizer finding snapshot submitted by an operator for admin review.

@@ -150,6 +150,7 @@ def _iface_to_dict(i: InterfaceInfo) -> dict:
              "nodeid": a.nodeid}
             for a in (i.addresses or [])
         ],
+        "lldp_mode": i.lldp_mode,
     }
 
 
@@ -176,6 +177,7 @@ def _project_iface(d: dict) -> InterfaceInfo:
                 nodeid=a.get("nodeid"),
             ) for a in (d.get("addresses") or [])
         ],
+        lldp_mode=d.get("lldp_mode", "") or "",
     )
 
 

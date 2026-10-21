@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [2.2.0-dev] - 2026-04-29 → 2026-07-22
 
+### Switches — VLAN consistency check + LLDP link discovery (NS2 / NS3, 2026-10-21)
+
+New page **Engines → Switches → VLAN check** (`/switches/vlan-check`, Domain Admin+). For each firewall node's physical interface it compares the VLANs the firewall tags with the VLANs NetSight reports on the switch port it is plugged into, and flags **missing** VLANs (traffic won't pass), **extra** VLANs on the switch (trunk pruning candidates), untagged mismatches, admin-down and stale ports. Operator guide: [docs/Switches-VLANCheck.md](docs/Switches-VLANCheck.md); flow: [docs/flows/switch-vlan-check.mmd](docs/flows/switch-vlan-check.mmd).
+
+- **Why links can be manual.** A lab walk before building found that Forcepoint engines don't send LLDP: per-interface `lldp_mode` defaults to `disabled` (81 switches, 247 LLDP-neighbour ports, no firewall). Operator decision: auto + manual fallback. **Discover LLDP links** (background job on `scan_jobs`) re-reads every up switch and links an interface when a port's LLDP neighbour is that node's address; everything else is pinned with the Map dialog (switch → port picked from NetSight, validated server-side). Manual links are never changed by discovery; conflicts are counted in the summary.
+- **New table `switch_port_links`** (`SwitchPortLink`: domain-scoped, one row per firewall port, `source` manual | lldp). Cascades with the Domain, so Domain hard-delete and Factory Reset clean it up.
+- **`lldp_mode` is now read from SMC** into `InterfaceInfo` and the `cluster` cache dict (shown per row; `—` until the cluster cache is refreshed).
+- Modules: [webapp/vlan_check.py](webapp/vlan_check.py) (pure: `firewall_ports`, `lldp_links`, `compare`), [webapp/vlan_check_jobs.py](webapp/vlan_check_jobs.py) (`collect_firewall_ports`, `start_discovery`, `apply_discovery`), routes in [webapp/switches_manager.py](webapp/switches_manager.py), template `switches/vlan_check.html`. Audit `netsight`: `lldp.discover`, `link.map`, `link.unmap`.
+- Tests: `tests/agents/test_vlan_check.py` (+12, 100 total). End-to-end against the lab Site Engine with a fake firewall primed into the SMC cache: 12/12 — discovery read 81 switches in 7 s and linked the fake interface; missing / extra matched the linked port; bad port and unknown firewall port refused; manual link kept over LLDP on a rerun with the conflict reported; audit rows present.
+
 ### Remote agents — deleting an agent now kills its key; backup + factory reset cover the registry (2026-10-21)
 
 - **Security fix: Delete left the agent's key working.** The kit's `AgentPool.delete_agent` refuses an agent that isn't revoked (`"revoke the agent first"`), and the admin **Delete** button, Domain hard-delete (`domain_purge`) and the create-rollback path all called it without revoking and ignored the refusal. Result: the `remote_agents` row disappeared from the UI while the pool record — and the key — kept authenticating on `/agent/*`. New `webapp.agents_manager.retire_agent(name)` (revoke → delete → drop pending secret refs, idempotent) is now the only removal path.

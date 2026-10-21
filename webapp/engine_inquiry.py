@@ -48,6 +48,7 @@ class InterfaceInfo:
     vlan_id: str = ""           # "" for non-VLAN parent interface
     zone: str = ""
     addresses: list[InterfaceAddress] = field(default_factory=list)
+    lldp_mode: str = ""         # physical interface's LLDP mode (SMC >= 6.6); "" = unknown
 
 
 @dataclass
@@ -146,6 +147,7 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                         vlan_id="",
                         zone=str(pi_data.get("zone_ref", "") or ""),
                         addresses=top_addrs,
+                        lldp_mode=str(pi_data.get("lldp_mode", "") or ""),
                     ))
                 # VLAN sub-interfaces. The SDK encodes the VLAN id INSIDE
                 # the entry's interface_id (e.g. "1.42") — there is no
@@ -156,6 +158,7 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                 #   - wrapped: [{"physical_interface": {"interface_id": "1.42", ...}}]
                 # Snake_case key (vlan_interfaces) also seen on some builds.
                 parent_iid = str(pi_data.get("interface_id", "") or "")
+                lldp_mode = str(pi_data.get("lldp_mode", "") or "")
                 vlan_list = (pi_data.get("vlanInterfaces")
                              or pi_data.get("vlan_interfaces")
                              or [])
@@ -176,6 +179,7 @@ def _walk_interfaces(engine) -> list[InterfaceInfo]:
                         vlan_id=vlan_part,
                         zone=str(vlan.get("zone_ref", "") or ""),
                         addresses=_addresses_from_iface_payload(vlan),
+                        lldp_mode=lldp_mode,   # LLDP is set on the physical parent
                     ))
             except Exception as exc:
                 log.debug("interface walk failed for one PI: %s", exc)
@@ -201,6 +205,7 @@ def _node_interfaces(all_ifaces: list[InterfaceInfo], nodeid: int) -> list[Inter
             vlan_id=iface.vlan_id,
             zone=iface.zone,
             addresses=node_addrs,
+            lldp_mode=iface.lldp_mode,
         ))
     return out
 
